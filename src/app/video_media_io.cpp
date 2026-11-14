@@ -1,0 +1,502 @@
+#include "video_media_io.h"
+
+#include <limits.h>
+#include <string.h>
+
+#include "audio/decoders/flac_decoder.h"
+#include "esp_heap_caps.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "storage_io.h"
+
+// 当前 AVI/FVIX 偏移契约为 uint32_t；FSIZE_t 不能宽于该契约，
+// 否则文件尺寸转换前必须同步升级 Demuxer、Extractor 与索引格式。
+static_assert(sizeof(FSIZE_t) <= sizeof(uint32_t),
+    "VideoMediaIo requires FSIZE_t to fit the current 32-bit AVI offset contract");
+
+namespace VideoMediaIo
+{
+namespace
+{
+
+static const char *TAG = "VideoIO";
+
+static constexpr uint32_t kMaxReadSliceBytes = 4096U;
+// Video独占播放（Music已挂起）时使用更大的切片，减少fread调用次数和锁竞争开销。
+static constexpr uint32_t kMaxReadSliceBytesExclusive = 16U * 1024U;
+static constexpr uint32_t kFlacSafePercent = 90U;
+static constexpr TickType_t kFlacGatePollTicks = pdMS_TO_TICKS(10);
+// R.40.2 的 50ms 一次性 timeout 会把正常的 TF mutex 争用直接升级成
+// ESP_EXTRACTOR_ERR_READ。R.40.2.3 改成短片抢锁 + generation/window 重检。
+static constexpr TickType_t kStorageLockSlice = pdMS_TO_TICKS(25);
+static constexpr TickType_t kStorageRetryYieldTicks = pdMS_TO_TICKS(2);
+static constexpr uint32_t kStorageLockFatalWaitMs = 1500U;
+static constexpr uint32_t kStorageRetryLogIntervalMs = 250U;
+static constexpr TickType_t kOpenLockTimeout = pdMS_TO_TICKS(250);
+
+static bool generation_current(const Context *io)
+{
+    return io != nullptr &&
+        (io->generation_check == nullptr || io->generation_check(io->generation));
+}
+
+static int32_t flac_ring_percent()
+{
+    FlacStorageWindowSnapshot window = {};
+    if (!flac_decoder_get_storage_window(&window) || !window.active ||
+        !window.storage_competes || window.capacity_bytes == 0U) {
+        return -1;
+    }
+    return static_cast<int32_t>(
+        (static_cast<uint64_t>(window.buffered_bytes) * 100ULL + window.capacity_bytes / 2ULL) /
+        window.capacity_bytes);
+}
+
+static bool wait_for_storage_window(Context *io)
+{
+    if (io == nullptr) return false;
+    // Video独占播放时Music已挂起，FLAC storage window不活跃，直接跳过水位门控。
+    if (io->skip_flac_gate) return true;
+    int64_t wait_started_us = 0;
+    while (generation_current(io)) {
+        FlacStorageWindowSnapshot window = {};
+        if (!flac_decoder_get_storage_window(&window) || !window.active ||
+            !window.storage_competes || window.capacity_bytes == 0U) {
+            break;
+        }
+        const uint32_t percent = static_cast<uint32_t>(
+            (static_cast<uint64_t>(window.buffered_bytes) * 100ULL + window.capacity_bytes / 2ULL) /
+            window.capacity_bytes);
+        if (percent >= kFlacSafePercent) break;
+        if (wait_started_us == 0) wait_started_us = esp_timer_get_time();
+        vTaskDelay(kFlacGatePollTicks);
+    }
+    if (!generation_current(io)) return false;
+    if (wait_started_us != 0) {
+        const uint64_t waited = static_cast<uint64_t>(esp_timer_get_time() - wait_started_us);
+        io->gate_wait_us_total += waited;
+        ++io->gate_wait_count;
+    }
+    return true;
+}
+
+static uint32_t elapsed_ms(int64_t started_us)
+{
+    if (started_us <= 0) return 0U;
+    const int64_t delta = esp_timer_get_time() - started_us;
+    return delta > 0 ? static_cast<uint32_t>(delta / 1000LL) : 0U;
+}
+
+static void log_cancelled(const char *op, const Context *io, uint32_t request_or_position)
+{
+    ESP_LOGW(TAG, "%s取消：generation=%lu value=%lu read_calls=%lu",
+        op,
+        static_cast<unsigned long>(io != nullptr ? io->generation : 0U),
+        static_cast<unsigned long>(request_or_position),
+        static_cast<unsigned long>(io != nullptr ? io->read_calls : 0U));
+}
+
+} // namespace
+
+void configure(Context *io, uint32_t generation, GenerationCheck generation_check, bool skip_flac_gate)
+{
+    if (io == nullptr) return;
+    *io = {};
+    io->generation = generation;
+    io->generation_check = generation_check;
+    io->skip_flac_gate = skip_flac_gate;
+}
+
+int read_cb(void *buffer, uint32_t size, void *ctx)
+{
+    Context *io = static_cast<Context *>(ctx);
+    if (io == nullptr || io->file == nullptr || buffer == nullptr) {
+        ESP_LOGE(TAG, "READ参数错误：io=%p file=%p buffer=%p size=%lu",
+            static_cast<void *>(io),
+            io != nullptr ? static_cast<void *>(io->file) : nullptr,
+            buffer,
+            static_cast<unsigned long>(size));
+        return -1;
+    }
+    if (size == 0U) return 0;
+    // 回调返回类型为 int，单次读取不能超过 INT_MAX；实际 AVI 读取按 4/16KB 切片执行。
+    if (size > static_cast<uint32_t>(INT_MAX)) {
+        ESP_LOGE(TAG, "READ请求超过回调返回值范围：size=%lu", static_cast<unsigned long>(size));
+        return -1;
+    }
+    if (!generation_current(io)) {
+        log_cancelled("READ", io, size);
+        return -1;
+    }
+    if (!wait_for_storage_window(io)) {
+        log_cancelled("READ_GATE", io, size);
+        return -1;
+    }
+
+    // Video独占时用16KB切片减少锁竞争和f_read调用；Music播放时保持4KB切片快速让路。
+    const uint32_t slice_bytes = io->skip_flac_gate ? kMaxReadSliceBytesExclusive : kMaxReadSliceBytes;
+
+    const int64_t started_us = esp_timer_get_time();
+    uint32_t total = 0U;
+    uint32_t zero_progress = 0U;
+    uint8_t *out = static_cast<uint8_t *>(buffer);
+
+    auto finish_read = [&](int result) -> int {
+        const uint32_t elapsed_us = static_cast<uint32_t>(esp_timer_get_time() - started_us);
+        io->read_us_total += elapsed_us;
+        if (elapsed_us > io->read_us_max) io->read_us_max = elapsed_us;
+        io->read_bytes += total;
+        ++io->read_calls;
+        return result;
+    };
+
+    if (size > slice_bytes) {
+        ++io->aggregate_read_requests;
+        if (io->aggregate_read_requests == 1U) {
+            ESP_LOGI(TAG,
+                "READ_AGGREGATE：extractor_request=%luB，底层按%luB TF切片补齐；每片释放storage锁并重检FLAC水位",
+                static_cast<unsigned long>(size),
+                static_cast<unsigned long>(slice_bytes));
+        }
+    }
+
+    while (total < size) {
+        if (!generation_current(io)) {
+            log_cancelled("READ_FILL", io, size);
+            return finish_read(-1);
+        }
+        if (!wait_for_storage_window(io)) {
+            log_cancelled("READ_FILL_GATE", io, size);
+            return finish_read(-1);
+        }
+
+        const uint32_t remaining = size - total;
+        const uint32_t request = remaining > slice_bytes ? slice_bytes : remaining;
+        const int64_t lock_wait_started_us = esp_timer_get_time();
+        uint32_t retries = 0U;
+        uint32_t last_log_ms = 0U;
+
+        while (generation_current(io)) {
+            bool slice_done = false;
+            {
+                StorageSdLockGuard guard(kStorageLockSlice);
+                if (guard) {
+                    const FSIZE_t pos_before = f_tell(io->file);
+                    UINT got = 0U;
+                    const FRESULT fatfs_ret = f_read(
+                        io->file, out + total, static_cast<UINT>(request), &got);
+                    const int eof_flag = f_eof(io->file);
+                    const int error_flag = f_error(io->file);
+                    total += static_cast<uint32_t>(got);
+
+                    if (fatfs_ret != FR_OK || error_flag != 0) {
+                        ++io->read_errors;
+                        ESP_LOGE(TAG,
+                            "READ_FATFS_ERROR：pos=%llu callback=%lu slice=%lu got=%lu total=%lu fr=%d ferr=%d retries=%lu wait=%lums ring=%ld%%",
+                            static_cast<unsigned long long>(pos_before),
+                            static_cast<unsigned long>(size),
+                            static_cast<unsigned long>(request),
+                            static_cast<unsigned long>(got),
+                            static_cast<unsigned long>(total),
+                            static_cast<int>(fatfs_ret), error_flag,
+                            static_cast<unsigned long>(retries),
+                            static_cast<unsigned long>(elapsed_ms(lock_wait_started_us)),
+                            static_cast<long>(flac_ring_percent()));
+                        return finish_read(-1);
+                    }
+
+                    if (retries != 0U) {
+                        ++io->lock_recoveries;
+                        ESP_LOGW(TAG,
+                            "READ_LOCK_RECOVERED：pos=%llu callback=%lu slice=%lu got=%lu total=%lu retries=%lu wait=%lums ring=%ld%%",
+                            static_cast<unsigned long long>(pos_before),
+                            static_cast<unsigned long>(size),
+                            static_cast<unsigned long>(request),
+                            static_cast<unsigned long>(got),
+                            static_cast<unsigned long>(total),
+                            static_cast<unsigned long>(retries),
+                            static_cast<unsigned long>(elapsed_ms(lock_wait_started_us)),
+                            static_cast<long>(flac_ring_percent()));
+                    }
+
+                    if (got == 0U) {
+                        if (eof_flag != 0) return finish_read(static_cast<int>(total));
+                        ++zero_progress;
+                        if (zero_progress >= 3U) {
+                            ++io->read_errors;
+                            ESP_LOGE(TAG,
+                                "READ_ZERO_PROGRESS：callback=%lu total=%lu pos=%llu 连续=%lu ring=%ld%%",
+                                static_cast<unsigned long>(size),
+                                static_cast<unsigned long>(total),
+                                static_cast<unsigned long long>(pos_before),
+                                static_cast<unsigned long>(zero_progress),
+                                static_cast<long>(flac_ring_percent()));
+                            return finish_read(-1);
+                        }
+                    } else {
+                        zero_progress = 0U;
+                    }
+
+                    if (got < request && eof_flag != 0) {
+                        return finish_read(static_cast<int>(total));
+                    }
+                    if (got < request && got != 0U) {
+                        ESP_LOGW(TAG,
+                            "READ_FATFS_SHORT：callback=%lu slice=%lu got=%lu total=%lu eof=0；继续补齐",
+                            static_cast<unsigned long>(size),
+                            static_cast<unsigned long>(request),
+                            static_cast<unsigned long>(got),
+                            static_cast<unsigned long>(total));
+                    }
+                    slice_done = true;
+                }
+            }
+
+            if (slice_done) break;
+
+            ++retries;
+            ++io->lock_retry_count;
+            const uint32_t waited_ms = elapsed_ms(lock_wait_started_us);
+            if (waited_ms >= kStorageLockFatalWaitMs) {
+                ++io->lock_fatal_timeouts;
+                ESP_LOGE(TAG,
+                    "READ_LOCK_TIMEOUT：callback=%lu slice=%lu total=%lu retries=%lu wait=%lums read_calls=%lu bytes=%llu ring=%ld%%",
+                    static_cast<unsigned long>(size),
+                    static_cast<unsigned long>(request),
+                    static_cast<unsigned long>(total),
+                    static_cast<unsigned long>(retries),
+                    static_cast<unsigned long>(waited_ms),
+                    static_cast<unsigned long>(io->read_calls),
+                    static_cast<unsigned long long>(io->read_bytes),
+                    static_cast<long>(flac_ring_percent()));
+                return finish_read(-1);
+            }
+            if (last_log_ms == 0U || waited_ms - last_log_ms >= kStorageRetryLogIntervalMs) {
+                last_log_ms = waited_ms;
+                ESP_LOGW(TAG,
+                    "READ_LOCK_BUSY：callback=%lu slice=%lu total=%lu retries=%lu wait=%lums ring=%ld%%；继续让路重试",
+                    static_cast<unsigned long>(size),
+                    static_cast<unsigned long>(request),
+                    static_cast<unsigned long>(total),
+                    static_cast<unsigned long>(retries),
+                    static_cast<unsigned long>(waited_ms),
+                    static_cast<long>(flac_ring_percent()));
+            }
+            if (!wait_for_storage_window(io)) {
+                log_cancelled("READ_RETRY_GATE", io, size);
+                return finish_read(-1);
+            }
+            vTaskDelay(kStorageRetryYieldTicks);
+        }
+
+        if (!generation_current(io)) {
+            log_cancelled("READ_RETRY", io, size);
+            return finish_read(-1);
+        }
+        if (total < size) taskYIELD();
+    }
+
+    return finish_read(static_cast<int>(total));
+}
+
+int seek_cb(uint32_t position, void *ctx)
+{
+    Context *io = static_cast<Context *>(ctx);
+    if (io == nullptr || io->file == nullptr || position > io->size) {
+        ESP_LOGE(TAG, "SEEK参数错误：io=%p file=%p pos=%lu size=%lu",
+            static_cast<void *>(io),
+            io != nullptr ? static_cast<void *>(io->file) : nullptr,
+            static_cast<unsigned long>(position),
+            static_cast<unsigned long>(io != nullptr ? io->size : 0U));
+        return -1;
+    }
+    if (!generation_current(io) || !wait_for_storage_window(io)) {
+        log_cancelled("SEEK", io, position);
+        return -1;
+    }
+
+    const int64_t lock_wait_started_us = esp_timer_get_time();
+    uint32_t retries = 0U;
+    uint32_t last_log_ms = 0U;
+    while (generation_current(io)) {
+        {
+            StorageSdLockGuard guard(kStorageLockSlice);
+            if (guard) {
+                // FatFs 的 FSIZE_t 在当前 FAT32 配置下是无符号 32 位，可直接定位到 2GB 以上。
+                const FRESULT ret = f_lseek(io->file, static_cast<FSIZE_t>(position));
+                if (ret != FR_OK) {
+                    ++io->seek_errors;
+                    ESP_LOGE(TAG,
+                        "SEEK_FATFS_ERROR：pos=%lu fr=%d retries=%lu wait=%lums ring=%ld%%",
+                        static_cast<unsigned long>(position), static_cast<int>(ret),
+                        static_cast<unsigned long>(retries),
+                        static_cast<unsigned long>(elapsed_ms(lock_wait_started_us)),
+                        static_cast<long>(flac_ring_percent()));
+                    return -1;
+                }
+                if (retries != 0U) {
+                    ++io->lock_recoveries;
+                    ESP_LOGW(TAG,
+                        "SEEK_LOCK_RECOVERED：pos=%lu retries=%lu wait=%lums ring=%ld%%",
+                        static_cast<unsigned long>(position),
+                        static_cast<unsigned long>(retries),
+                        static_cast<unsigned long>(elapsed_ms(lock_wait_started_us)),
+                        static_cast<long>(flac_ring_percent()));
+                }
+                return 0;
+            }
+        }
+
+        ++retries;
+        ++io->lock_retry_count;
+        const uint32_t waited_ms = elapsed_ms(lock_wait_started_us);
+        if (waited_ms >= kStorageLockFatalWaitMs) {
+            ++io->lock_fatal_timeouts;
+            ESP_LOGE(TAG,
+                "SEEK_LOCK_TIMEOUT：pos=%lu retries=%lu wait=%lums ring=%ld%%",
+                static_cast<unsigned long>(position),
+                static_cast<unsigned long>(retries),
+                static_cast<unsigned long>(waited_ms),
+                static_cast<long>(flac_ring_percent()));
+            return -1;
+        }
+        if (last_log_ms == 0U || waited_ms - last_log_ms >= kStorageRetryLogIntervalMs) {
+            last_log_ms = waited_ms;
+            ESP_LOGW(TAG,
+                "SEEK_LOCK_BUSY：pos=%lu retries=%lu wait=%lums ring=%ld%%；继续让路重试",
+                static_cast<unsigned long>(position),
+                static_cast<unsigned long>(retries),
+                static_cast<unsigned long>(waited_ms),
+                static_cast<long>(flac_ring_percent()));
+        }
+        if (!wait_for_storage_window(io)) {
+            log_cancelled("SEEK_RETRY_GATE", io, position);
+            return -1;
+        }
+        vTaskDelay(kStorageRetryYieldTicks);
+    }
+
+    log_cancelled("SEEK_RETRY", io, position);
+    return -1;
+}
+
+uint32_t size_cb(void *ctx)
+{
+    Context *io = static_cast<Context *>(ctx);
+    return io != nullptr ? io->size : 0U;
+}
+
+esp_err_t open(const char *path, Context *io)
+{
+    if (path == nullptr || io == nullptr) return ESP_ERR_INVALID_ARG;
+    if (!generation_current(io) || !wait_for_storage_window(io)) return ESP_ERR_INVALID_STATE;
+
+    // FatFs 低层 API 使用挂载点内的相对路径；不要把 /sdcard VFS 前缀传给 f_open。
+    static constexpr char kMountPrefix[] = "/sdcard";
+    constexpr size_t kMountPrefixBytes = sizeof(kMountPrefix) - 1U;
+    if (strncmp(path, kMountPrefix, kMountPrefixBytes) != 0 ||
+        (path[kMountPrefixBytes] != '/' && path[kMountPrefixBytes] != '\0')) {
+        ESP_LOGE(TAG, "AVI路径不在 /sdcard 挂载点内：%s", path);
+        return ESP_ERR_INVALID_ARG;
+    }
+    const char *fatfs_path = path + kMountPrefixBytes;
+    if (fatfs_path[0] == '\0') fatfs_path = "/";
+
+    // FIL 内含 FatFs 扇区缓存，放入 PSRAM，避免为 2GB+ 文件支持额外占用内部 RAM。
+    FIL *file = static_cast<FIL *>(heap_caps_calloc(
+        1U, sizeof(FIL), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (file == nullptr) {
+        ESP_LOGE(TAG, "分配 AVI FatFs 文件句柄失败：%uB PSRAM不足", static_cast<unsigned>(sizeof(FIL)));
+        return ESP_ERR_NO_MEM;
+    }
+
+    FRESULT open_result = FR_OK;
+    FSIZE_t file_size = 0U;
+    bool file_size_invalid = false;
+    {
+        StorageSdLockGuard guard(kOpenLockTimeout);
+        if (!guard) {
+            ESP_LOGE(TAG, "OPEN_LOCK_TIMEOUT：path=%s timeout=250ms ring=%ld%%",
+                path, static_cast<long>(flac_ring_percent()));
+            heap_caps_free(file);
+            return ESP_ERR_TIMEOUT;
+        }
+        if (!generation_current(io)) {
+            heap_caps_free(file);
+            return ESP_ERR_INVALID_STATE;
+        }
+
+        open_result = f_open(file, fatfs_path, FA_READ);
+        if (open_result == FR_OK) {
+            file_size = f_size(file);
+            // 当前 FatFs 配置下 FSIZE_t 为无符号 32 位；大于 UINT32_MAX 不可能成立。
+            // 只需拒绝小于 AVI 最小 RIFF 头长度的文件，2GB 以上偏移保持有效。
+            if (file_size < 12U) {
+                file_size_invalid = true;
+                const FRESULT close_result = f_close(file);
+                if (close_result != FR_OK) {
+                    ESP_LOGW(TAG, "关闭尺寸非法的AVI句柄失败：fr=%d", static_cast<int>(close_result));
+                }
+            }
+        }
+    }
+
+    if (open_result != FR_OK) {
+        heap_caps_free(file);
+        ESP_LOGE(TAG, "FatFs打开AVI失败：path=%s fr=%d", fatfs_path, static_cast<int>(open_result));
+        return (open_result == FR_NO_FILE || open_result == FR_NO_PATH)
+            ? ESP_ERR_NOT_FOUND : ESP_FAIL;
+    }
+    if (file_size_invalid) {
+        heap_caps_free(file);
+        ESP_LOGE(TAG, "AVI文件长度小于最小RIFF头尺寸：size=%llu",
+            static_cast<unsigned long long>(file_size));
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    io->file = file;
+    io->size = static_cast<uint32_t>(file_size);
+    ESP_LOGI(TAG, "AVI使用FatFs原生句柄：size=%llu bytes；绕过stdio 2GB有符号偏移限制",
+        static_cast<unsigned long long>(file_size));
+    return ESP_OK;
+}
+
+void close(Context *io)
+{
+    if (io == nullptr || io->file == nullptr) return;
+    StorageSdLockGuard guard(portMAX_DELAY);
+    if (!guard) {
+        ESP_LOGE(TAG, "关闭AVI FatFs句柄失败：无法取得Storage锁");
+        return;
+    }
+
+    FIL *file = io->file;
+    const FRESULT close_result = f_close(file);
+    io->file = nullptr;
+    io->size = 0U;
+    heap_caps_free(file);
+    if (close_result != FR_OK) {
+        ESP_LOGW(TAG, "关闭AVI FatFs句柄返回错误：fr=%d", static_cast<int>(close_result));
+    }
+}
+
+esp_err_t map_extractor_error(esp_extractor_err_t err)
+{
+    switch (err) {
+        case ESP_EXTRACTOR_ERR_OK: return ESP_OK;
+        case ESP_EXTRACTOR_ERR_INV_ARG: return ESP_ERR_INVALID_ARG;
+        case ESP_EXTRACTOR_ERR_NO_MEM: return ESP_ERR_NO_MEM;
+        case ESP_EXTRACTOR_ERR_NOT_SUPPORTED: return ESP_ERR_NOT_SUPPORTED;
+        case ESP_EXTRACTOR_ERR_NOT_FOUND: return ESP_ERR_NOT_FOUND;
+        case ESP_EXTRACTOR_ERR_WRONG_HEADER: return ESP_ERR_INVALID_RESPONSE;
+        // READ 已不再等价于 50ms lock timeout；真正原因由 VideoIO 的细分日志给出。
+        case ESP_EXTRACTOR_ERR_READ: return ESP_FAIL;
+        case ESP_EXTRACTOR_ERR_ABORTED: return ESP_ERR_INVALID_STATE;
+        case ESP_EXTRACTOR_ERR_SKIPPED: return ESP_ERR_INVALID_SIZE;
+        default: return ESP_FAIL;
+    }
+}
+
+} // namespace VideoMediaIo

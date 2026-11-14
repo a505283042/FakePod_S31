@@ -1,0 +1,817 @@
+#include "player_transport.h"
+
+#include <atomic>
+#include <string.h>
+
+#include "esp_log.h"
+#include "esp_random.h"
+#include "esp_heap_caps.h"
+#include "audio_service.h"
+#include "media_library.h"
+#include "nas_catalog_service.h"
+#include "wifi_service.h"
+#include "player_state.h"
+#include "app_diag_config.h"
+
+static const char *TAG = "播放传输";
+
+static std::atomic<uint8_t> g_loop_mode{
+    static_cast<uint8_t>(PlayerLoopMode::Sequential)
+};
+static uint32_t g_last_audio_state_revision = 0U;
+static uint32_t g_last_finished_playback_revision = 0U;
+static uint32_t g_last_track_error_playback_revision = 0U;
+static uint32_t g_track_error_skip_count = 0U;
+static constexpr uint32_t TRACK_ERROR_AUTO_SKIP_MAX = 8U;
+
+// R46.0.91：Wi-Fi 开机/重连尚未业务 READY 时，只保留最后一次 NAS 起播意图。
+// 仅保存 Track 索引；URL/认证仍在真正起播时现取，避免跨层持有网络资源。
+static constexpr uint32_t kNoDeferredNasTrack = UINT32_MAX;
+static std::atomic<uint32_t> g_deferred_nas_track{kNoDeferredNasTrack};
+
+// P1.5.3.2R.8：随机播放只维护一个很小的“实际播放历史”，不生成整张 Shuffle Bag。
+// 这样不会按曲库规模分配内存；上一曲可以回到随机模式下真正听过的上一首。
+constexpr uint8_t kShuffleHistoryCapacity = 16U;
+struct ShuffleHistory
+{
+    bool valid = false;
+    PlayerFolderScope preferred_scope = PlayerFolderScope::All;
+    PlayerFolderScope effective_scope = PlayerFolderScope::All;
+    uint32_t catalog_generation = 0U;
+    uint32_t context_id = 0U;
+    uint32_t track_count = 0U;
+    uint32_t positions[kShuffleHistoryCapacity] = {};
+    uint8_t count = 0U;
+};
+
+static ShuffleHistory g_shuffle_history = {};
+
+// Round 23：随机模式允许资源预热提前“看见”下一首。
+// Reservation 只保存队列 position，不改变 PlayerState；真正执行下一曲时再消费。
+struct ShuffleNextReservation
+{
+    bool valid = false;
+    uint32_t catalog_generation = 0U;
+    uint32_t context_id = 0U;
+    uint32_t track_count = 0U;
+    uint32_t current_position = 0U;
+    uint32_t current_track = UINT32_MAX;
+    bool current_in_queue = false;
+    uint32_t next_position = 0U;
+};
+
+static ShuffleNextReservation g_shuffle_next_reservation = {};
+
+static void player_transport_shuffle_clear_reservation()
+{
+    g_shuffle_next_reservation = {};
+}
+
+static bool player_transport_shuffle_reservation_matches(
+    const PlayerFolderQueueSnapshot &list)
+{
+    return g_shuffle_next_reservation.valid &&
+        g_shuffle_next_reservation.catalog_generation == list.catalog_generation &&
+        g_shuffle_next_reservation.context_id == list.context_id &&
+        g_shuffle_next_reservation.track_count == list.track_count &&
+        g_shuffle_next_reservation.current_position == list.position &&
+        g_shuffle_next_reservation.current_track == list.track_index &&
+        g_shuffle_next_reservation.current_in_queue == list.current_in_queue &&
+        g_shuffle_next_reservation.next_position < list.track_count;
+}
+
+static bool player_transport_shuffle_context_matches(const PlayerFolderQueueSnapshot &list)
+{
+    return g_shuffle_history.valid &&
+        g_shuffle_history.preferred_scope == list.preferred_scope &&
+        g_shuffle_history.effective_scope == list.effective_scope &&
+        g_shuffle_history.catalog_generation == list.catalog_generation &&
+        g_shuffle_history.context_id == list.context_id &&
+        g_shuffle_history.track_count == list.track_count;
+}
+
+static void player_transport_shuffle_reset(const PlayerFolderQueueSnapshot *list = nullptr)
+{
+    g_shuffle_history = {};
+    player_transport_shuffle_clear_reservation();
+    if (list == nullptr || !list->ready) {
+        return;
+    }
+    g_shuffle_history.valid = true;
+    g_shuffle_history.preferred_scope = list->preferred_scope;
+    g_shuffle_history.effective_scope = list->effective_scope;
+    g_shuffle_history.catalog_generation = list->catalog_generation;
+    g_shuffle_history.context_id = list->context_id;
+    g_shuffle_history.track_count = list->track_count;
+}
+
+static void player_transport_shuffle_ensure_context(const PlayerFolderQueueSnapshot &list)
+{
+    if (!player_transport_shuffle_context_matches(list)) {
+        player_transport_shuffle_reset(&list);
+    }
+}
+
+static bool player_transport_shuffle_history_contains(uint32_t position)
+{
+    for (uint8_t i = 0U; i < g_shuffle_history.count; ++i) {
+        if (g_shuffle_history.positions[i] == position) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void player_transport_shuffle_push(uint32_t position)
+{
+    if (g_shuffle_history.count > 0U &&
+        g_shuffle_history.positions[g_shuffle_history.count - 1U] == position) {
+        return;
+    }
+
+    if (g_shuffle_history.count >= kShuffleHistoryCapacity) {
+        for (uint8_t i = 1U; i < kShuffleHistoryCapacity; ++i) {
+            g_shuffle_history.positions[i - 1U] = g_shuffle_history.positions[i];
+        }
+        g_shuffle_history.count = kShuffleHistoryCapacity - 1U;
+    }
+    g_shuffle_history.positions[g_shuffle_history.count++] = position;
+}
+
+static bool player_transport_shuffle_pop(uint32_t *out_position)
+{
+    if (out_position == nullptr || g_shuffle_history.count == 0U) {
+        return false;
+    }
+    --g_shuffle_history.count;
+    *out_position = g_shuffle_history.positions[g_shuffle_history.count];
+    return true;
+}
+
+static uint32_t player_transport_shuffle_choose_position(const PlayerFolderQueueSnapshot &list)
+{
+    if (list.track_count <= 1U) {
+        return 0U;
+    }
+
+    // R2 刚选择新目录且当前歌曲不在该目录时，没有“当前队列位置”需要避开；
+    // 此时随机可以从全部候选中任选。
+    if (!list.current_in_queue) {
+        for (uint8_t attempt = 0U; attempt < 12U; ++attempt) {
+            const uint32_t candidate = esp_random() % list.track_count;
+            if (!player_transport_shuffle_history_contains(candidate)) {
+                return candidate;
+            }
+        }
+        return esp_random() % list.track_count;
+    }
+
+    // 优先避开“当前首 + 最近随机历史”。列表很小时若历史占满候选，再退化为只避开当前首。
+    for (uint8_t attempt = 0U; attempt < 12U; ++attempt) {
+        const uint32_t candidate = esp_random() % list.track_count;
+        if (candidate != list.position && !player_transport_shuffle_history_contains(candidate)) {
+            return candidate;
+        }
+    }
+    for (uint8_t attempt = 0U; attempt < 12U; ++attempt) {
+        const uint32_t candidate = esp_random() % list.track_count;
+        if (candidate != list.position) {
+            return candidate;
+        }
+    }
+
+    // 理论上只在极端随机碰撞时走到这里；保证不会立即重复当前首。
+    return (list.position + 1U + (esp_random() % (list.track_count - 1U))) % list.track_count;
+}
+
+static uint32_t player_transport_shuffle_reserve_position(
+    const PlayerFolderQueueSnapshot &list)
+{
+    if (player_transport_shuffle_reservation_matches(list)) {
+        return g_shuffle_next_reservation.next_position;
+    }
+
+    const uint32_t next_position = player_transport_shuffle_choose_position(list);
+    g_shuffle_next_reservation.valid = true;
+    g_shuffle_next_reservation.catalog_generation = list.catalog_generation;
+    g_shuffle_next_reservation.context_id = list.context_id;
+    g_shuffle_next_reservation.track_count = list.track_count;
+    g_shuffle_next_reservation.current_position = list.position;
+    g_shuffle_next_reservation.current_track = list.track_index;
+    g_shuffle_next_reservation.current_in_queue = list.current_in_queue;
+    g_shuffle_next_reservation.next_position = next_position;
+    return next_position;
+}
+
+const char *player_transport_loop_mode_name(PlayerLoopMode mode)
+{
+    switch (mode) {
+        case PlayerLoopMode::Sequential: return "顺序";
+        case PlayerLoopMode::ListRepeat: return "列表循环";
+        case PlayerLoopMode::SingleRepeat: return "单曲循环";
+        case PlayerLoopMode::Shuffle: return "随机";
+    }
+    return "未知";
+}
+
+PlayerLoopMode player_transport_get_loop_mode()
+{
+    const uint8_t raw = g_loop_mode.load(std::memory_order_relaxed);
+    if (raw > static_cast<uint8_t>(PlayerLoopMode::Shuffle)) {
+        return PlayerLoopMode::Sequential;
+    }
+    return static_cast<PlayerLoopMode>(raw);
+}
+
+bool player_transport_set_loop_mode(PlayerLoopMode mode)
+{
+    if (static_cast<uint8_t>(mode) > static_cast<uint8_t>(PlayerLoopMode::Shuffle)) {
+        return false;
+    }
+
+    const PlayerLoopMode previous = player_transport_get_loop_mode();
+    g_loop_mode.store(static_cast<uint8_t>(mode), std::memory_order_relaxed);
+    g_track_error_skip_count = 0U;
+
+    if (mode == PlayerLoopMode::Shuffle && previous != PlayerLoopMode::Shuffle) {
+        PlayerFolderQueueSnapshot list = {};
+        player_transport_shuffle_reset(
+            player_state_get_folder_queue_snapshot(&list) ? &list : nullptr);
+    } else if (mode != PlayerLoopMode::Shuffle) {
+        player_transport_shuffle_reset();
+    }
+
+    ESP_LOGI(TAG, "播放模式：%s", player_transport_loop_mode_name(mode));
+    return true;
+}
+
+PlayerLoopMode player_transport_cycle_loop_mode()
+{
+    PlayerLoopMode next = PlayerLoopMode::Sequential;
+    switch (player_transport_get_loop_mode()) {
+        case PlayerLoopMode::Sequential:
+            next = PlayerLoopMode::ListRepeat;
+            break;
+        case PlayerLoopMode::ListRepeat:
+            next = PlayerLoopMode::SingleRepeat;
+            break;
+        case PlayerLoopMode::SingleRepeat:
+            next = PlayerLoopMode::Shuffle;
+            break;
+        case PlayerLoopMode::Shuffle:
+            next = PlayerLoopMode::Sequential;
+            break;
+    }
+    player_transport_set_loop_mode(next);
+    return next;
+}
+
+static bool wifi_can_still_become_ready(const WifiServiceSnapshot &wifi)
+{
+    if (!wifi.ready || !wifi.configured) return false;
+    switch (wifi.state) {
+        case WifiServiceState::WaitingBleOff:
+        case WifiServiceState::SavingCredentials:
+        case WifiServiceState::WifiInit:
+        case WifiServiceState::Connecting:
+            return true;
+        case WifiServiceState::ConfiguredIdle:
+            // ConnectSaved worker 刚创建、尚未来得及切 WaitingBleOff 的极短窗口。
+            return wifi.transition_running;
+        default:
+            return false;
+    }
+}
+
+static void defer_nas_play_until_wifi_ready(uint32_t track_index)
+{
+    const uint32_t previous = g_deferred_nas_track.exchange(track_index, std::memory_order_acq_rel);
+    if (previous == track_index) return;
+    ESP_LOGI(TAG,
+        "NAS播放等待Wi-Fi业务READY：track=%u，%s一次性播放请求",
+        static_cast<unsigned>(track_index),
+        previous == kNoDeferredNasTrack ? "已挂起" : "已更新");
+}
+
+void player_transport_cancel_deferred_nas_play(const char *reason)
+{
+    const uint32_t previous = g_deferred_nas_track.exchange(
+        kNoDeferredNasTrack, std::memory_order_acq_rel);
+    if (previous == kNoDeferredNasTrack) return;
+    ESP_LOGI(TAG, "待处理NAS播放已取消：track=%u reason=%s",
+        static_cast<unsigned>(previous),
+        reason != nullptr ? reason : "上下文变化");
+}
+
+static bool player_transport_play_current_internal(const char *reason)
+{
+    if (nas_catalog_service_is_server_switching()) {
+        ESP_LOGW(TAG, "NAS服务器切换期间暂停新播放请求");
+        return false;
+    }
+    if (!player_state_is_ready()) {
+        ESP_LOGW(TAG, "播放当前歌曲失败：Player 尚未就绪");
+        return false;
+    }
+
+    const char *path = player_state_get_path();
+    if (path == nullptr || path[0] == '\0') {
+        ESP_LOGW(TAG, "播放当前歌曲失败：当前列表没有有效歌曲");
+        return false;
+    }
+
+    const size_t track_index = player_state_get_index();
+    MediaTechnicalInfo technical = {};
+    const bool has_technical_info = player_state_get_technical_info(&technical);
+    const PlayerMediaSource source = player_state_get_source();
+
+#if APP_DIAG_PLAYER_TRANSPORT
+    ESP_LOGI(TAG, "播放当前歌曲：原因=%s source=%s track=%u 路径=%s",
+        reason != nullptr ? reason : "显式播放",
+        player_media_source_name(source),
+        static_cast<unsigned>(track_index),
+        path);
+#else
+    (void)reason;
+#endif
+
+    if (source == PlayerMediaSource::Local) {
+        player_transport_cancel_deferred_nas_play("切换本地播放");
+        return audio_service_play_track(
+            static_cast<uint32_t>(track_index),
+            path,
+            player_state_get_format(),
+            has_technical_info ? &technical : nullptr,
+            false);
+    }
+
+    const MediaFormat nas_format = player_state_get_format();
+    if (nas_format != MediaFormat::MP3 && nas_format != MediaFormat::FLAC) {
+        ESP_LOGW(TAG, "NAS当前阶段仅开放MP3/FLAC：track=%u format=%s",
+            static_cast<unsigned>(track_index), media_format_name(nas_format));
+        return false;
+    }
+
+    WifiServiceSnapshot wifi = {};
+    const bool has_wifi_snapshot = wifi_service_get_snapshot(&wifi);
+    const bool wifi_ready = has_wifi_snapshot && wifi.connected &&
+        !wifi.transition_running && wifi.state == WifiServiceState::Connected;
+    if (!wifi_ready) {
+        if (has_wifi_snapshot && wifi_can_still_become_ready(wifi)) {
+            defer_nas_play_until_wifi_ready(static_cast<uint32_t>(track_index));
+            return true;
+        }
+        player_transport_cancel_deferred_nas_play("Wi-Fi未处于启动/恢复过程");
+        ESP_LOGW(TAG,
+            "NAS播放不可用：Wi-Fi业务未启动 connected=%u transition=%u state=%s",
+            wifi.connected ? 1U : 0U,
+            wifi.transition_running ? 1U : 0U,
+            wifi_service_state_name(wifi.state));
+        return false;
+    }
+
+    // 用户在 READY 后再次点播时，显式请求覆盖此前的待处理请求。
+    g_deferred_nas_track.store(kNoDeferredNasTrack, std::memory_order_release);
+
+    NasPlaybackEndpoint endpoint = {};
+    const esp_err_t endpoint_ret = nas_catalog_service_get_playback_endpoint(&endpoint);
+    if (endpoint_ret != ESP_OK) {
+        ESP_LOGW(TAG, "NAS播放端点不可用：%s", esp_err_to_name(endpoint_ret));
+        return false;
+    }
+    static constexpr size_t kUrlMax = 4096U;
+    char *url = static_cast<char *>(heap_caps_malloc(kUrlMax, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    if (url == nullptr) return false;
+    const esp_err_t url_ret = nas_catalog_service_build_track_url(&endpoint, path, url, kUrlMax);
+    if (url_ret != ESP_OK) {
+        heap_caps_free(url);
+        ESP_LOGW(TAG, "NAS播放URL构造失败：%s", esp_err_to_name(url_ret));
+        return false;
+    }
+    ESP_LOGI(TAG, "NAS播放URL：mode=%s len=%u track=%lu",
+        endpoint.track_base_url[0] != '\0' ? "SHORT_ID" : "DIRECT_PATH",
+        static_cast<unsigned>(strlen(url)),
+        static_cast<unsigned long>(track_index));
+    const bool ok = audio_service_play_nas_track(
+        static_cast<uint32_t>(track_index), url, nas_format, endpoint.username, endpoint.password,
+        has_technical_info ? &technical : nullptr, false);
+    heap_caps_free(url);
+    return ok;
+}
+
+bool player_transport_play_current(const char *reason)
+{
+    // 显式用户起播开启新的容错窗口；自动 EOF/坏曲跳过走 internal，不会把连续坏曲计数清零。
+    g_track_error_skip_count = 0U;
+    return player_transport_play_current_internal(reason);
+}
+
+static void player_transport_update_deferred_nas_play()
+{
+    const uint32_t pending_track = g_deferred_nas_track.load(std::memory_order_acquire);
+    if (pending_track == kNoDeferredNasTrack) return;
+
+    if (!player_state_is_ready() || player_state_get_source() != PlayerMediaSource::Nas ||
+        player_state_get_index() != pending_track) {
+        player_transport_cancel_deferred_nas_play("Player选择已变化");
+        return;
+    }
+
+    WifiServiceSnapshot wifi = {};
+    if (!wifi_service_get_snapshot(&wifi)) return;
+
+    const bool wifi_ready = wifi.connected && !wifi.transition_running &&
+        wifi.state == WifiServiceState::Connected;
+    if (!wifi_ready) {
+        if (!wifi_can_still_become_ready(wifi)) {
+            player_transport_cancel_deferred_nas_play("Wi-Fi启动/恢复已结束但未READY");
+        }
+        return;
+    }
+
+    uint32_t expected = pending_track;
+    if (!g_deferred_nas_track.compare_exchange_strong(
+            expected, kNoDeferredNasTrack,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "Wi-Fi业务READY：执行待处理NAS播放 track=%u",
+        static_cast<unsigned>(pending_track));
+    if (!player_transport_play_current_internal("Wi-Fi READY待处理NAS播放")) {
+        ESP_LOGW(TAG, "Wi-Fi业务READY后NAS自动起播失败：track=%u",
+            static_cast<unsigned>(pending_track));
+    }
+}
+
+static bool player_transport_shuffle_next(const char *reason)
+{
+    PlayerFolderQueueSnapshot list = {};
+    if (!player_state_get_folder_queue_snapshot(&list) || list.track_count == 0U) {
+        ESP_LOGW(TAG, "随机下一首：当前目录播放范围不可用");
+        return false;
+    }
+
+    player_transport_shuffle_ensure_context(list);
+    if (list.track_count == 1U) {
+        if (!list.current_in_queue && !player_state_select_folder_queue_position(0U)) {
+            return false;
+        }
+        return player_transport_play_current_internal(reason != nullptr ? reason : "随机单曲重播");
+    }
+
+    const uint32_t next_position = player_transport_shuffle_reserve_position(list);
+    player_transport_shuffle_clear_reservation();
+    if (list.current_in_queue) {
+        player_transport_shuffle_push(list.position);
+    }
+    if (!player_state_select_folder_queue_position(next_position)) {
+        ESP_LOGW(TAG, "随机下一首：选择目录队列 position=%lu 失败",
+            static_cast<unsigned long>(next_position));
+        return false;
+    }
+    return player_transport_play_current_internal(reason != nullptr ? reason : "随机下一首");
+}
+
+bool player_transport_previous()
+{
+    g_track_error_skip_count = 0U;
+    AudioStateSnapshot snapshot = {};
+    const bool has_audio = audio_service_get_snapshot(&snapshot) && snapshot.ready;
+    const size_t current_track = player_state_get_index();
+    const AudioPlaybackSource expected_source = player_state_get_source() == PlayerMediaSource::Nas
+        ? AudioPlaybackSource::NasHttp : AudioPlaybackSource::Local;
+
+    // Stage 11.0 后，>3 秒上一曲直接回到曲首；NAS 顺序 HTTP 当前用重开同一 Track 代替 Seek。
+    // AudioTask 内部仍通过 pop-free 重建 pipeline，避免在 I2S 正在运行时硬改 Source。
+    if (
+        has_audio &&
+        snapshot.source == expected_source && snapshot.track_index == current_track &&
+        (snapshot.state == AudioPlaybackState::Playing || snapshot.state == AudioPlaybackState::Paused) &&
+        snapshot.position_ms >= 3000ULL
+    ) {
+#if APP_DIAG_PLAYER_TRANSPORT
+        ESP_LOGI(TAG, "手动上一曲：当前已播放超过3秒，回到曲首 source=%s",
+            player_media_source_name(player_state_get_source()));
+#endif
+        return player_state_get_source() == PlayerMediaSource::Nas
+            ? player_transport_play_current_internal("NAS上一曲回曲首")
+            : player_transport_seek_ms(0);
+    }
+
+    // 只有真正要切换曲目时才作废下一首预留；>3秒 Seek(0) 不改变队列。
+    player_transport_shuffle_clear_reservation();
+
+    if (player_transport_get_loop_mode() == PlayerLoopMode::Shuffle) {
+        PlayerFolderQueueSnapshot list = {};
+        if (!player_state_get_folder_queue_snapshot(&list) || list.track_count == 0U) {
+            return false;
+        }
+        player_transport_shuffle_ensure_context(list);
+
+        uint32_t previous_position = 0U;
+        if (player_transport_shuffle_pop(&previous_position)) {
+            if (!player_state_select_folder_queue_position(previous_position)) {
+                ESP_LOGW(TAG, "随机上一首：目录队列历史 position=%lu 已不可用",
+                    static_cast<unsigned long>(previous_position));
+                return false;
+            }
+            return player_transport_play_current_internal("随机上一首历史");
+        }
+        // 本次随机会话还没有历史时，保留传统“上一首”的可预测回退。
+    }
+
+    if (!player_state_previous()) {
+        ESP_LOGW(TAG, "手动上一曲：当前播放列表无法移动");
+        return false;
+    }
+    return player_transport_play_current_internal("手动上一曲");
+}
+
+bool player_transport_next()
+{
+    g_track_error_skip_count = 0U;
+    if (player_transport_get_loop_mode() == PlayerLoopMode::Shuffle) {
+        return player_transport_shuffle_next("手动随机下一首");
+    }
+
+    if (!player_state_next()) {
+        ESP_LOGW(TAG, "手动下一曲：当前播放列表无法移动");
+        return false;
+    }
+    return player_transport_play_current_internal("手动下一曲");
+}
+
+
+bool player_transport_peek_next_track(uint32_t *out_track_index)
+{
+    if (out_track_index == nullptr || !player_state_is_ready()) {
+        return false;
+    }
+    *out_track_index = UINT32_MAX;
+
+    PlayerFolderQueueSnapshot list = {};
+    if (!player_state_get_folder_queue_snapshot(&list) || !list.ready || list.track_count == 0U) {
+        return false;
+    }
+
+    const PlayerLoopMode mode = player_transport_get_loop_mode();
+    uint32_t next_position = 0U;
+
+    if (mode == PlayerLoopMode::SingleRepeat) {
+        if (!list.current_in_queue) return false;
+        next_position = list.position;
+    } else if (mode == PlayerLoopMode::Shuffle) {
+        player_transport_shuffle_ensure_context(list);
+        next_position = player_transport_shuffle_reserve_position(list);
+    } else if (!list.current_in_queue) {
+        next_position = 0U;
+    } else if (list.position + 1U < list.track_count) {
+        next_position = list.position + 1U;
+    } else if (mode == PlayerLoopMode::ListRepeat) {
+        next_position = 0U;
+    } else {
+        // 顺序播放自然 EOF 在列表末尾停止，因此不做无意义的下一首预热。
+        return false;
+    }
+
+    size_t track_index = 0U;
+    if (!player_state_get_folder_queue_track_index_at_position(next_position, &track_index)) {
+        return false;
+    }
+    *out_track_index = static_cast<uint32_t>(track_index);
+    return true;
+}
+
+bool player_transport_seek_ms(uint64_t target_ms)
+{
+    if (!player_state_is_ready()) {
+        return false;
+    }
+    const char *path = player_state_get_path();
+    if (path == nullptr || path[0] == '\0') {
+        return false;
+    }
+    const bool nas = player_state_get_source() == PlayerMediaSource::Nas;
+    const size_t track_index = player_state_get_index();
+    MediaTechnicalInfo technical = {};
+    const bool has_technical = player_state_get_technical_info(&technical);
+#if APP_DIAG_AUDIO_SEEK
+    ESP_LOGI(TAG, "SEEK_TRACE: Player请求 track=%u target=%llums",
+        static_cast<unsigned>(track_index),
+        static_cast<unsigned long long>(target_ms));
+#endif
+    if (nas) {
+        NasPlaybackEndpoint endpoint = {};
+        if (nas_catalog_service_get_playback_endpoint(&endpoint) != ESP_OK) return false;
+        static constexpr size_t kUrlMax = 4096U;
+        char *url = static_cast<char *>(heap_caps_malloc(
+            kUrlMax, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        if (url == nullptr) return false;
+        const bool built = nas_catalog_service_build_track_url(
+            &endpoint, path, url, kUrlMax) == ESP_OK;
+        const bool ok = built && audio_service_seek_nas_track(
+            static_cast<uint32_t>(track_index), url, player_state_get_format(),
+            endpoint.username, endpoint.password,
+            has_technical ? &technical : nullptr, target_ms, false);
+        heap_caps_free(url);
+        return ok;
+    }
+    return audio_service_seek_track(
+        static_cast<uint32_t>(track_index),
+        path,
+        player_state_get_format(),
+        has_technical ? &technical : nullptr,
+        target_ms,
+        false);
+}
+
+void player_transport_handle_finished_event(const AudioStateSnapshot &audio)
+{
+    if (
+        audio.playback_revision == 0U ||
+        audio.playback_revision == g_last_finished_playback_revision
+    ) {
+        return;
+    }
+    g_last_finished_playback_revision = audio.playback_revision;
+    g_track_error_skip_count = 0U;
+
+    PlayerFolderQueueSnapshot list = {};
+    if (!player_state_get_folder_queue_snapshot(&list) || list.track_count == 0U) {
+        ESP_LOGW(TAG, "AUTO_NEXT_TRACE: EOF 后目录播放范围不可用，停止自动续播");
+        return;
+    }
+
+    // 若用户刚好在 EOF 边沿切换了 UI 列表，旧 AudioTask 的 Finished 不能推进新列表。
+    const AudioPlaybackSource expected_source = player_state_get_source() == PlayerMediaSource::Nas
+        ? AudioPlaybackSource::NasHttp : AudioPlaybackSource::Local;
+    if (audio.source != expected_source || audio.track_index == UINT32_MAX || audio.track_index != list.track_index) {
+#if APP_DIAG_PLAYER_TRANSPORT
+        ESP_LOGI(TAG,
+            "AUTO_NEXT_TRACE: 忽略过期 EOF audio_track=%lu list_track=%lu generation=%lu",
+            static_cast<unsigned long>(audio.track_index),
+            static_cast<unsigned long>(list.track_index),
+            static_cast<unsigned long>(list.catalog_generation));
+#endif
+        return;
+    }
+
+    const PlayerLoopMode mode = player_transport_get_loop_mode();
+#if APP_DIAG_PLAYER_TRANSPORT
+    ESP_LOGI(TAG,
+        "AUTO_NEXT_TRACE: EOF mode=%s scope=%s effective=%s pos=%lu/%lu in_queue=%u track=%lu playback_rev=%lu",
+        player_transport_loop_mode_name(mode),
+        player_playlist_folder_scope_name(list.preferred_scope),
+        player_playlist_folder_scope_name(list.effective_scope),
+        static_cast<unsigned long>(list.current_in_queue ? list.position + 1U : 0U),
+        static_cast<unsigned long>(list.track_count),
+        list.current_in_queue ? 1U : 0U,
+        static_cast<unsigned long>(list.track_index),
+        static_cast<unsigned long>(audio.playback_revision));
+#endif
+
+    if (mode == PlayerLoopMode::SingleRepeat) {
+        if (!player_transport_play_current_internal("单曲循环 EOF")) {
+            ESP_LOGE(TAG, "AUTO_NEXT_TRACE: 单曲循环重播请求失败");
+        }
+        return;
+    }
+
+    if (mode == PlayerLoopMode::Shuffle) {
+        if (!player_transport_shuffle_next("随机播放 EOF")) {
+            ESP_LOGE(TAG, "AUTO_NEXT_TRACE: 随机下一首请求失败");
+        }
+        return;
+    }
+
+    if (mode == PlayerLoopMode::Sequential &&
+        list.current_in_queue && list.position + 1U >= list.track_count) {
+#if APP_DIAG_PLAYER_TRANSPORT
+        ESP_LOGI(TAG, "AUTO_NEXT_TRACE: 顺序播放已到列表末尾，保持 Finished");
+#endif
+        return;
+    }
+
+    if (!player_state_next()) {
+        ESP_LOGE(TAG, "AUTO_NEXT_TRACE: EOF 推进下一首失败");
+        return;
+    }
+
+    if (!player_transport_play_current_internal(
+            mode == PlayerLoopMode::ListRepeat ? "列表循环 EOF" : "顺序播放 EOF")) {
+        ESP_LOGE(TAG, "AUTO_NEXT_TRACE: 下一首播放请求失败");
+    }
+}
+
+static void player_transport_handle_track_error(const AudioStateSnapshot &audio)
+{
+    if (audio.playback_revision == 0U ||
+        audio.playback_revision == g_last_track_error_playback_revision) {
+        return;
+    }
+    g_last_track_error_playback_revision = audio.playback_revision;
+
+    PlayerFolderQueueSnapshot list = {};
+    if (!player_state_get_folder_queue_snapshot(&list) || list.track_count == 0U) {
+        ESP_LOGW(TAG, "坏曲跳过失败：当前目录播放范围不可用，保持 Error");
+        return;
+    }
+    const AudioPlaybackSource expected_source = player_state_get_source() == PlayerMediaSource::Nas
+        ? AudioPlaybackSource::NasHttp : AudioPlaybackSource::Local;
+    if (audio.source != expected_source || audio.track_index == UINT32_MAX || audio.track_index != list.track_index) {
+        return;
+    }
+
+    if (audio.failure_scope != AudioFailureScope::Track) {
+        g_track_error_skip_count = 0U;
+        ESP_LOGW(TAG,
+            "NAS/系统播放故障不自动跳歌：track=%lu err=%s scope=%u，保持 Error 等待网络恢复或用户重新点播",
+            static_cast<unsigned long>(audio.track_index),
+            esp_err_to_name(audio.last_error),
+            static_cast<unsigned>(audio.failure_scope));
+        return;
+    }
+
+    const PlayerLoopMode mode = player_transport_get_loop_mode();
+    if (mode == PlayerLoopMode::SingleRepeat) {
+        ESP_LOGW(TAG, "单曲循环遇到不可播放曲目：track=%lu err=%s，保持 Error 等待用户处理",
+            static_cast<unsigned long>(audio.track_index),
+            esp_err_to_name(audio.last_error));
+        return;
+    }
+
+    ++g_track_error_skip_count;
+    const uint32_t skip_limit = list.track_count < TRACK_ERROR_AUTO_SKIP_MAX
+        ? list.track_count
+        : TRACK_ERROR_AUTO_SKIP_MAX;
+    if (g_track_error_skip_count >= skip_limit) {
+        ESP_LOGE(TAG, "连续不可播放曲目已达保护上限：count=%lu limit=%lu，停止继续尝试",
+            static_cast<unsigned long>(g_track_error_skip_count),
+            static_cast<unsigned long>(skip_limit));
+        return;
+    }
+
+    ESP_LOGW(TAG,
+        "当前曲不可播放，自动跳过：track=%lu err=%s mode=%s skip=%lu/%lu",
+        static_cast<unsigned long>(audio.track_index),
+        esp_err_to_name(audio.last_error),
+        player_transport_loop_mode_name(mode),
+        static_cast<unsigned long>(g_track_error_skip_count),
+        static_cast<unsigned long>(list.track_count));
+
+    if (mode == PlayerLoopMode::Shuffle) {
+        if (!player_transport_shuffle_next("坏曲自动跳过")) {
+            ESP_LOGE(TAG, "坏曲自动跳过：随机下一首请求失败");
+        }
+        return;
+    }
+
+    if (mode == PlayerLoopMode::Sequential &&
+        list.current_in_queue && list.position + 1U >= list.track_count) {
+        ESP_LOGW(TAG, "顺序播放末尾曲目不可播放，保持 Error");
+        return;
+    }
+
+    if (!player_state_next()) {
+        ESP_LOGE(TAG, "坏曲自动跳过：推进下一首失败");
+        return;
+    }
+    if (!player_transport_play_current_internal("坏曲自动跳过")) {
+        ESP_LOGE(TAG, "坏曲自动跳过：下一首播放请求失败");
+    }
+}
+
+bool player_transport_update(AudioStateSnapshot *out_finished)
+{
+    if (out_finished != nullptr) {
+        *out_finished = {};
+    }
+
+    // Wi-Fi READY 与 AudioTask state_revision 无关；必须每拍先检查一次性 NAS 待播放请求。
+    player_transport_update_deferred_nas_play();
+
+    AudioStateSnapshot snapshot = {};
+    if (!audio_service_get_snapshot(&snapshot) || !snapshot.ready) {
+        return false;
+    }
+
+    if (snapshot.state_revision == g_last_audio_state_revision) {
+        return false;
+    }
+    g_last_audio_state_revision = snapshot.state_revision;
+
+    if (snapshot.state == AudioPlaybackState::Finished) {
+        if (out_finished != nullptr) {
+            *out_finished = snapshot;
+            return true;
+        }
+        return false;
+    }
+
+    if (snapshot.state == AudioPlaybackState::Error &&
+        snapshot.failure_scope == AudioFailureScope::Track) {
+        player_transport_handle_track_error(snapshot);
+    }
+    return false;
+}

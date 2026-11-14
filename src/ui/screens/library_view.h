@@ -1,0 +1,47 @@
+#pragma once
+
+#include <stdint.h>
+#include <stddef.h>
+
+#include "lvgl.h"
+#include "device_settings.h"
+
+// P1.3.5.4：460x460 方屏曲库覆盖层。
+// 顶层左右滑切歌曲/歌手/专辑/年代；列表由 CST820 原始坐标直驱，抬手后追加轻量惯性并显示右侧位置条。
+// 搜索页复用同一虚拟列表；底部 2x5 键盘按字母组连续输入，多位 query 匹配运行时 initials SearchKey。
+void library_view_create(lv_obj_t *screen);
+void library_view_open(bool show = true);
+// R46.0.73：NAS 只作为同一曲库 UI 的第二数据源；搜索/列表/手势/分类完全复用 library_view。
+bool library_view_open_nas(DeviceMusicListScope scope, bool show = true);
+bool library_view_is_nas_source();
+void library_view_close_nas();
+// 由 NAS 同步 worker 调用：只标记已提交的 TF 索引待刷新；LVGL 定时器负责安全重载。
+void library_view_request_nas_index_reload();
+// 只在 LVGL 线程调用；返回 false 表示有 NAS 异步加载正在执行，禁止替换 TF 索引。
+bool library_view_prepare_nas_server_switch();
+// 只在 LVGL 线程调用；使用新索引打开 NAS，不恢复上一个服务器的浏览缓存。
+void library_view_finish_nas_server_switch();
+// R46.0.76：设置保存曲库来源后同步回收非当前 NAS 索引；
+// NAS 选中时 Catalog 跨 UI 关闭常驻，避免每次主页下拉重新读 1.17MB。
+void library_view_on_library_source_changed(DeviceMusicLibrarySource source);
+bool library_view_is_visible();
+void library_view_request_playback_focus();
+
+// APP 切换专用：仅隐藏曲库并停止惯性，不调用 HomeResume，避免 Music 已进入后台时反向唤醒主页。
+void library_view_suspend_for_app_switch();
+// PreserveBackground 返回 Music 时原样恢复浏览模式、搜索条件与滚动位置。
+// 若设置中的曲库来源已改变，则不恢复旧曲库而回到主页。
+bool library_view_resume_after_app_switch();
+
+// 由 ui_manager 的 CST820 原始指针路径旁路观察：
+// 普通曲库负责横向分类 + 纵向整行步进；搜索模式只允许结果区纵向滚动，键盘区域交给 LVGL Button。
+void library_view_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t tick_ms);
+
+// R.30 性能审计只读状态。
+bool library_view_search_is_active();
+
+// R146: Wi-Fi mailbox. Requests are copied; all catalog/UI work runs on LVGL.
+bool library_view_remote_submit(const uint8_t *request, size_t size);
+bool library_view_remote_take_frame(uint8_t *frame, size_t *size);
+void library_view_remote_reset();
+bool library_view_remote_pending();

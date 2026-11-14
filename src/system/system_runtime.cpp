@@ -1,0 +1,398 @@
+#include "system_runtime.h"
+
+#include "esp_err.h"
+#include "esp_log.h"
+
+#include "audio_service.h"
+#include "app_manager.h"
+#include "music_app_adapter.h"
+#include "settings_app.h"
+#include "ebook_app.h"
+#include "visual_music_app.h"
+#include "video_app.h"
+#include "picture_app.h"
+#include "sdcard.h"
+#include "media_catalog_v2.h"
+#include "artwork_loader.h"
+#include "cover_surface_cache.h"
+#include "lyrics/lyrics_service.h"
+#include "power_service.h"
+#include "gpio0_service.h"
+#include "device_settings.h"
+#include "ble_remote_service.h"
+#include "wifi_service.h"
+#include "nas_catalog_service.h"
+#include "nas_library_source.h"
+#include "battery_service.h"
+#include "motion_service.h"
+#include "screen_lock_simple.h"
+#include "usb_storage_service.h"
+
+static const char *TAG = "运行期";
+
+static bool g_ready_published = false;
+static bool g_background_start_attempted = false;
+// 只由本次开机保存的 Wi-Fi 恢复任务置位；手动打开 Wi-Fi 不触发自动 NAS 检查。
+static bool g_boot_nas_sync_pending = false;
+static bool g_boot_nas_sync_deferred_logged = false;
+static TickType_t g_boot_nas_sync_due_tick = 0;
+static constexpr TickType_t BOOT_NAS_SYNC_POLL_INTERVAL = pdMS_TO_TICKS(1000);
+
+// READY 后的一次性启动若碰到 NO_MEM/I2C 瞬态错误，不应让可选服务永久失效。
+// 这里只补启动已证明幂等的轻量服务；App 注册、GPIO按键等带注册副作用的模块不在此重试。
+static constexpr TickType_t OPTIONAL_SERVICE_HEALTH_INTERVAL = pdMS_TO_TICKS(2000);
+static TickType_t g_optional_service_health_due_tick = 0;
+
+static bool runtime_tick_due(TickType_t now, TickType_t due)
+{
+    return static_cast<int32_t>(now - due) >= 0;
+}
+
+static void runtime_optional_service_health_update()
+{
+    const TickType_t now = xTaskGetTickCount();
+    if (g_optional_service_health_due_tick != 0 &&
+        !runtime_tick_due(now, g_optional_service_health_due_tick)) {
+        return;
+    }
+    g_optional_service_health_due_tick = now + OPTIONAL_SERVICE_HEALTH_INTERVAL;
+
+    esp_err_t battery_ret = ESP_OK;
+    esp_err_t motion_ret = ESP_OK;
+    esp_err_t lyrics_ret = ESP_OK;
+    bool attempted = false;
+
+    if (!battery_service_is_ready()) {
+        attempted = true;
+        battery_ret = battery_service_init();
+    }
+    if (!motion_service_is_ready()) {
+        attempted = true;
+        motion_ret = motion_service_init();
+    }
+    if (!usb_storage_service_blocks_normal_runtime() &&
+        sdcard_is_mounted() && media_catalog_v2_ready() && !lyrics_service_is_ready()) {
+        attempted = true;
+        lyrics_ret = lyrics_service_start();
+    }
+
+    if (!attempted) {
+        return;
+    }
+
+    if (battery_ret != ESP_OK || motion_ret != ESP_OK || lyrics_ret != ESP_OK) {
+        ESP_LOGW(TAG,
+            "可选服务补启动未完成：Battery=%s Motion=%s Lyrics=%s；2秒后重试",
+            esp_err_to_name(battery_ret),
+            esp_err_to_name(motion_ret),
+            esp_err_to_name(lyrics_ret));
+        return;
+    }
+
+    ESP_LOGI(TAG, "可选服务健康恢复完成：Battery/Motion/Lyrics 已按当前可用依赖补齐");
+}
+
+static void runtime_boot_nas_sync_update()
+{
+    if (!g_boot_nas_sync_pending || usb_storage_service_blocks_normal_runtime()) return;
+    const TickType_t now = xTaskGetTickCount();
+    if (g_boot_nas_sync_due_tick != 0 && !runtime_tick_due(now, g_boot_nas_sync_due_tick)) {
+        return;
+    }
+    g_boot_nas_sync_due_tick = now + BOOT_NAS_SYNC_POLL_INTERVAL;
+
+    WifiServiceSnapshot wifi = {};
+    if (!wifi_service_get_snapshot(&wifi) || wifi.transition_running) return;
+    if (!wifi.connected) {
+        g_boot_nas_sync_pending = false;
+        ESP_LOGI(TAG, "开机NAS检查跳过：Wi-Fi恢复失败，本次开机不再自动检查");
+        return;
+    }
+
+    NasCatalogSnapshot nas = {};
+    if (!nas_catalog_service_get_snapshot(&nas) || !nas.configured) {
+        g_boot_nas_sync_pending = false;
+        ESP_LOGI(TAG, "开机NAS检查跳过：未配置NAS曲库");
+        return;
+    }
+    if (nas.syncing || nas.state == NasCatalogState::Updated || nas.state == NasCatalogState::UpToDate) {
+        // 用户已经手动发起/完成同步，不再启动第二次。
+        g_boot_nas_sync_pending = false;
+        return;
+    }
+    // NAS Catalog 常驻不阻止网络校验；真正提交后由曲库 LVGL 任务在安全空闲期热重载。
+
+    const esp_err_t ret = nas_catalog_service_request_sync();
+    if (ret == ESP_ERR_INVALID_STATE) {
+        // 和用户手动点击恰好交错时，若同步已开始则视为本次检查已完成。
+        NasCatalogSnapshot current = {};
+        if (nas_catalog_service_get_snapshot(&current) && current.syncing) {
+            g_boot_nas_sync_pending = false;
+        } else if (!g_boot_nas_sync_deferred_logged) {
+            ESP_LOGI(TAG, "开机NAS索引检查等待：播放尚未停止，空闲后再检查");
+            g_boot_nas_sync_deferred_logged = true;
+        }
+        return;  // 音乐播放中或瞬时状态变化，等待下一次安全空闲。
+    }
+    g_boot_nas_sync_pending = false;           // 成功启动或出错都只发起一次。
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "开机NAS索引检查已启动（本次开机不重复发起）");
+    } else {
+        ESP_LOGW(TAG, "开机NAS索引检查未启动：%s（本次开机不重试）", esp_err_to_name(ret));
+    }
+}
+
+static AudioOutputMode runtime_audio_output_mode(DeviceAudioOutputMode mode)
+{
+    switch (mode) {
+        case DeviceAudioOutputMode::HighImpedanceHeadphones:
+            return AudioOutputMode::HighImpedanceHeadphones;
+        case DeviceAudioOutputMode::LineOut:
+            return AudioOutputMode::LineOut;
+        case DeviceAudioOutputMode::NormalHeadphones:
+        default:
+            return AudioOutputMode::NormalHeadphones;
+    }
+}
+
+void system_ready_publish()
+{
+    // Boot 与 system_loop 当前都运行在 loopTask；这里只发布轻量边界，
+    // 不在 UI 初始化调用栈里创建任何后台任务。
+    g_ready_published = true;
+}
+
+void system_runtime_update()
+{
+    if (!g_ready_published) {
+        return;
+    }
+    if (g_background_start_attempted) {
+        wifi_service_update();
+        ble_remote_service_update();
+        runtime_boot_nas_sync_update();
+        runtime_optional_service_health_update();
+        return;
+    }
+
+    // 先置位，保证即使某个可选服务失败也不会每 10ms 重复创建任务。
+    g_background_start_attempted = true;
+
+    const esp_err_t app_ret = app_manager_init();
+    if (app_ret != ESP_OK) {
+        ESP_LOGW(TAG, "App Manager 初始化失败：%s；继续沿用Legacy Music前台", esp_err_to_name(app_ret));
+    }
+    const esp_err_t music_adapter_ret = app_ret == ESP_OK
+        ? music_app_adapter_bind()
+        : ESP_ERR_INVALID_STATE;
+    if (music_adapter_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Music Lifecycle Adapter 绑定失败：%s；继续保持Legacy保护",
+            esp_err_to_name(music_adapter_ret));
+    }
+    const esp_err_t ebook_ret = app_ret == ESP_OK
+        ? ebook_app_register()
+        : ESP_ERR_INVALID_STATE;
+    if (ebook_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Ebook APP 注册失败：%s；Launcher仍保持选择但不会进入",
+            esp_err_to_name(ebook_ret));
+    }
+    const esp_err_t visual_music_ret = app_ret == ESP_OK
+        ? visual_music_app_register()
+        : ESP_ERR_INVALID_STATE;
+    if (visual_music_ret != ESP_OK) {
+        ESP_LOGW(TAG, "电子音流 APP 注册失败：%s；Launcher仍保持选择但不会进入",
+            esp_err_to_name(visual_music_ret));
+    }
+    const esp_err_t video_ret = app_ret == ESP_OK
+        ? video_app_register()
+        : ESP_ERR_INVALID_STATE;
+    if (video_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Video APP 注册失败：%s；Launcher仍保持选择但不会进入",
+            esp_err_to_name(video_ret));
+    }
+    const esp_err_t picture_ret = app_ret == ESP_OK
+        ? picture_app_register()
+        : ESP_ERR_INVALID_STATE;
+    if (picture_ret != ESP_OK) {
+        ESP_LOGW(TAG, "图片APP注册失败：%s；Launcher仍保持选择但不会进入",
+            esp_err_to_name(picture_ret));
+    }
+
+    const esp_err_t device_settings_ret = device_settings_init();
+    WifiServiceSnapshot boot_wifi = {};
+    const bool wifi_prepared_during_boot = wifi_service_get_snapshot(&boot_wifi);
+    const esp_err_t ble_ret = ble_remote_service_init();
+    const esp_err_t wifi_ret = wifi_service_init();
+    const esp_err_t nas_catalog_ret = nas_catalog_service_init();
+    if (ble_ret != ESP_OK && ble_ret != ESP_ERR_NOT_SUPPORTED) {
+        ESP_LOGW(TAG, "BLE Foundation初始化失败：%s；保持关闭并由运行期恢复",
+            esp_err_to_name(ble_ret));
+    }
+    if (device_settings_ret != ESP_OK) {
+        ESP_LOGW(TAG, "设备设置NVS初始化失败：%s；Settings仍使用RAM默认值",
+            esp_err_to_name(device_settings_ret));
+    }
+    if (wifi_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Wi-Fi服务初始化失败：%s；本次不启动Wi-Fi", esp_err_to_name(wifi_ret));
+    }
+    if (nas_catalog_ret != ESP_OK) {
+        ESP_LOGW(TAG, "NAS Catalog Foundation初始化失败：%s；本地TF曲库不受影响",
+            esp_err_to_name(nas_catalog_ret));
+    }
+    if (device_settings_ret == ESP_OK) {
+        DeviceSettingsSnapshot settings_snapshot = {};
+        if (device_settings_get_snapshot(&settings_snapshot)) {
+            // 旧版没有显式 Wi-Fi 开关键时，保存过的 Wi-Fi 凭据不再代表用户要求开机联网。
+            // 新默认策略为 BLE=ON / Wi-Fi=OFF；仅迁移缺少 Wi-Fi 开关键的旧配置，明确保存新默认。
+            if (wifi_ret == ESP_OK && !device_settings_wifi_enabled_is_explicit() &&
+                wifi_service_has_credentials()) {
+                const esp_err_t migrate_ret = device_settings_set_wireless_enabled(true, false);
+                if (migrate_ret == ESP_OK) {
+                    (void)device_settings_get_snapshot(&settings_snapshot);
+                    ESP_LOGI(TAG, "无线设置迁移：旧版未明确选择无线模式 -> BLE=开 Wi-Fi=关");
+                } else {
+                    // NVS 写入失败时本次仍按新默认运行，不因旧 Wi-Fi 凭据自动联网。
+                    settings_snapshot.ble_enabled = true;
+                    settings_snapshot.wifi_enabled = false;
+                    ESP_LOGW(TAG, "无线设置迁移保存失败：%s；本次临时使用BLE=开 Wi-Fi=关",
+                        esp_err_to_name(migrate_ret));
+                }
+            }
+
+            wifi_service_set_ble_fallback_enabled(settings_snapshot.ble_enabled);
+            if (settings_snapshot.wifi_enabled) {
+                if (wifi_prepared_during_boot) {
+                    WifiServiceSnapshot current_wifi = {};
+                    (void)wifi_service_get_snapshot(&current_wifi);
+                    if (current_wifi.connected) {
+                        ESP_LOGI(TAG,
+                            "开机无线策略：NAS启动恢复阶段已完成Wi-Fi连接和索引预检；不重复连接/不重复检查");
+                    } else {
+                        ESP_LOGW(TAG,
+                            "开机无线策略：NAS启动恢复阶段已完成本次Wi-Fi尝试但未连接；不在READY后重复尝试");
+                    }
+                } else if (wifi_ret == ESP_OK && wifi_service_has_credentials()) {
+                    const esp_err_t connect_ret = wifi_service_connect_saved(true);
+                    if (connect_ret == ESP_OK) {
+                        g_boot_nas_sync_pending = true;
+                        ESP_LOGI(TAG, "开机无线策略：保存状态 Wi-Fi=开 BLE=关，启动Wi-Fi；NAS索引将在Wi-Fi就绪后检查一次");
+                    } else {
+                        ESP_LOGW(TAG, "开机Wi-Fi任务启动失败：%s；保持保存状态，不自动开启BLE",
+                            esp_err_to_name(connect_ret));
+                    }
+                } else {
+                    ESP_LOGW(TAG, "开机无线策略：Wi-Fi=开但尚无有效凭据；BLE保持关闭");
+                }
+            } else {
+                ble_remote_service_set_mode(settings_snapshot.ble_enabled
+                    ? settings_snapshot.bluetooth_mode : DeviceBluetoothMode::Off);
+                ESP_LOGI(TAG, "开机无线策略：Wi-Fi=关 BLE=%s",
+                    settings_snapshot.ble_enabled ? "开" : "关");
+            }
+
+            const esp_err_t brightness_ret =
+                screen_lock_simple_set_normal_brightness(settings_snapshot.brightness_level);
+            if (brightness_ret != ESP_OK) {
+                ESP_LOGW(TAG, "恢复屏幕亮度失败：level=%u %s",
+                    static_cast<unsigned>(settings_snapshot.brightness_level),
+                    esp_err_to_name(brightness_ret));
+            }
+
+            screen_lock_simple_configure_auto_off(
+                settings_snapshot.auto_screen_off_seconds,
+                settings_snapshot.aod_enabled);
+
+            if (!audio_service_set_output_mode(
+                    runtime_audio_output_mode(settings_snapshot.audio_output_mode), true)) {
+                ESP_LOGW(TAG, "恢复CS43131输出档失败：%s；继续使用普通耳机安全档",
+                    device_settings_audio_output_mode_name(settings_snapshot.audio_output_mode));
+            }
+            if (!audio_service_set_nsf_gain_compensation_db(
+                    settings_snapshot.nsf_gain_compensation_db)) {
+                ESP_LOGW(TAG, "恢复NSF数字衰减补偿失败：+%udB；继续使用默认+3dB",
+                    static_cast<unsigned>(settings_snapshot.nsf_gain_compensation_db));
+            }
+        }
+    }
+
+    wifi_service_update();
+    ble_remote_service_update();
+
+    const esp_err_t settings_ret = app_ret == ESP_OK
+        ? settings_app_register()
+        : ESP_ERR_INVALID_STATE;
+    if (settings_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Settings APP 注册失败：%s；Launcher仍保持选择但不会进入",
+            esp_err_to_name(settings_ret));
+    }
+
+    const esp_err_t battery_ret = battery_service_init();
+    if (battery_ret != ESP_OK) {
+        ESP_LOGW(TAG, "AXP2101 电池服务初始化失败：%s；暂不提供电量数据", esp_err_to_name(battery_ret));
+    }
+
+    const esp_err_t motion_ret = motion_service_init();
+    if (motion_ret != ESP_OK) {
+        ESP_LOGW(TAG, "QMI8658运动控制初始化失败：%s；翻转切歌/双击功能关闭", esp_err_to_name(motion_ret));
+    }
+
+    const esp_err_t power_ret = power_service_init();
+    if (power_ret != ESP_OK) {
+        ESP_LOGW(TAG, "AXP2101 电源键不可用：%s；关机保存功能关闭", esp_err_to_name(power_ret));
+    }
+
+    const esp_err_t auxkey_ret = gpio0_service_init();
+    if (auxkey_ret != ESP_OK) {
+        ESP_LOGW(TAG, "GPIO0 辅助键（音量/切歌 + 锁/AOD/熄屏长按）不可用：%s", esp_err_to_name(auxkey_ret));
+    }
+
+    // R46.0.67：SpectrumFFT 继续按需创建；离开频谱页后进入2秒 Grace 复用窗口，
+    // UI立即返回主视图，快速重进直接复用；超时后后台自行释放4KB Internal栈。
+
+    esp_err_t artwork_ret = ESP_ERR_INVALID_STATE;
+    esp_err_t surface_ret = ESP_ERR_INVALID_STATE;
+    esp_err_t lyrics_ret = ESP_ERR_INVALID_STATE;
+    const bool storage_services_available = sdcard_is_mounted() && media_catalog_v2_ready();
+
+    if (storage_services_available) {
+        artwork_ret = artwork_loader_start();
+        if (artwork_ret == ESP_OK) {
+            surface_ret = cover_surface_cache_start();
+        } else {
+            ESP_LOGW(TAG, "ArtworkTask 启动失败，继续无封面运行：%s", esp_err_to_name(artwork_ret));
+        }
+
+        if (artwork_ret == ESP_OK && surface_ret != ESP_OK) {
+            ESP_LOGW(TAG, "CoverSurfaceTask 启动失败，保留压缩图回退：%s", esp_err_to_name(surface_ret));
+        }
+
+        lyrics_ret = lyrics_service_start();
+        if (lyrics_ret != ESP_OK) {
+            ESP_LOGW(TAG, "LyricsTask 启动失败，歌词功能降级：%s", esp_err_to_name(lyrics_ret));
+        }
+    }
+
+    g_optional_service_health_due_tick = xTaskGetTickCount() + OPTIONAL_SERVICE_HEALTH_INTERVAL;
+
+    ESP_LOGI(
+        TAG,
+        "READY 后台服务：Apps=%s MusicAdapter=%s Ebook=%s VisualMusic=%s Video=%s DeviceSettings=%s BLE=%s WiFi=%s NASCatalog=%s Settings=%s Battery=%s Motion=%s PowerKey=%s AuxKey=%s Spectrum=ON_DEMAND Artwork=%s CoverSurface=%s Lyrics=%s",
+        esp_err_to_name(app_ret),
+        esp_err_to_name(music_adapter_ret),
+        esp_err_to_name(ebook_ret),
+        esp_err_to_name(visual_music_ret),
+        esp_err_to_name(video_ret),
+        esp_err_to_name(device_settings_ret),
+        ble_ret == ESP_ERR_NOT_SUPPORTED ? "SDKCONFIG_OFF" : esp_err_to_name(ble_ret),
+        esp_err_to_name(wifi_ret),
+        esp_err_to_name(nas_catalog_ret),
+        esp_err_to_name(settings_ret),
+        esp_err_to_name(battery_ret),
+        esp_err_to_name(motion_ret),
+        esp_err_to_name(power_ret),
+        esp_err_to_name(auxkey_ret),
+        storage_services_available ? esp_err_to_name(artwork_ret) : "SKIPPED",
+        storage_services_available && artwork_ret == ESP_OK ? esp_err_to_name(surface_ret) : "SKIPPED",
+        storage_services_available ? esp_err_to_name(lyrics_ret) : "SKIPPED"
+    );
+}

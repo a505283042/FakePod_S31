@@ -1,0 +1,253 @@
+#pragma once
+
+#include <stdint.h>
+#include "esp_err.h"
+#include "audio_types.h"
+#include "nsf_synth.h"
+
+// CS43131 模拟输出档位。运行期切换仍由 AudioTask 串行执行，UI不得直接写DAC寄存器。
+enum class AudioOutputMode : uint8_t {
+    NormalHeadphones = 0,
+    HighImpedanceHeadphones,
+    LineOut,
+};
+
+// 启动唯一的 AudioTask。运行期所有 DAC/I2S 控制都必须由该任务执行。
+esp_err_t audio_service_start();
+
+// 判断 AudioTask 是否已经完成硬件初始化。
+bool audio_service_is_ready();
+
+// 获取 AudioTask 发布的只读状态快照。
+bool audio_service_get_snapshot(AudioStateSnapshot *out_snapshot);
+
+// R.36.2.2：获取最近一次真实播放故障的 RAM 快照。
+// 快照会保留到下一次故障或重启，便于偶发停播后再接串口读取。
+bool audio_service_get_last_fault(AudioFaultSnapshot *out_snapshot);
+void audio_service_log_last_fault();
+
+// P1.5.2R.3：获取低优先级 SpectrumFFT 任务发布的 16 路真实频率 band。
+// UI 只能读取快照，不能直接访问 PCM/decoder/I2S。
+bool audio_service_get_spectrum_snapshot(AudioSpectrumSnapshot *out_snapshot);
+
+// 频谱页面显示/隐藏时启停旁路分析。这里只控制观察者，不改变音频 pipeline。
+void audio_service_set_spectrum_enabled(bool enabled);
+
+// 请求播放指定曲目。路径和技术索引都会复制到请求对象，避免跨任务悬空指针。
+// Stage 10.1 只传递/校验索引快照，decoder 仍以实际文件解析结果作为播放真值。
+bool audio_service_play_track(
+    uint32_t track_index,
+    const char *path,
+    MediaFormat format,
+    const MediaTechnicalInfo *technical_info,
+    bool wait = false
+);
+
+// NAS 顺序流播放。url 已由 NAS Catalog path 构造成 HTTP URL；Basic Auth 可为空。
+// R46.0.92：开放 MP3/FLAC，共用 NasStream；当前不开放网络 Seek。
+bool audio_service_play_nas_track(
+    uint32_t track_index,
+    const char *url,
+    MediaFormat format,
+    const char *username,
+    const char *password,
+    const MediaTechnicalInfo *technical_info = nullptr,
+    bool wait = false
+);
+
+// 停止、暂停和恢复均通过 AudioTask 串行执行。
+bool audio_service_stop(bool wait = true);
+bool audio_service_pause(bool wait = true);
+bool audio_service_resume(bool wait = true);
+
+// R46.0.37：Video / NSF 共用同一套 Music Deep Suspend。
+// owner 只用于保护“谁挂起谁恢复”；仅对当前实例可安全 Seek 回原位置的曲目启用。
+// suspend 会关闭 Music decoder/read-ahead/source 并释放共享 decode workspace；
+// restore 只重建到 Paused，不会自行恢复播放，由各 APP 生命周期决定是否 resume。
+enum class AudioMusicSuspendOwner : uint8_t
+{
+    Video = 1U,
+    Nsf,
+};
+
+bool audio_service_music_deep_suspend(
+    AudioMusicSuspendOwner owner,
+    uint32_t track_index,
+    const char *path,
+    MediaFormat format,
+    const MediaTechnicalInfo *technical_info,
+    bool wait = true
+);
+bool audio_service_music_deep_restore(
+    AudioMusicSuspendOwner owner,
+    bool wait = true
+);
+
+// NAS recovery runs on AudioTask; UI never waits for HTTP reconnect.
+// A new Play/Seek supersedes it; resume is committed only after restore succeeds.
+bool audio_service_music_deep_restore_async(AudioMusicSuspendOwner owner, bool resume);
+
+// R.40.4.1：AVI 内 MP3 临时接管 AudioTask 的 PCM/I2S/CS43131 输出。
+// 浅暂停路径在 Video MP3 stop 后恢复 Paused Music 硬件；Deep Suspend 路径则由
+// Video 生命周期先通过共用恢复核心重建 Music decoder/硬件再 resume。Video/Extractor 不直接操作 I2S/DAC。
+bool audio_service_video_mp3_start(
+    uint32_t sample_rate_hz,
+    uint8_t channels,
+    uint8_t bits_per_sample,
+    bool wait = true
+);
+
+// R.40.4.3：A/V Start Barrier。prepare 只完成 MP3 decoder + I2S/DAC 预备并保持静音零PCM，
+// 不消费/提交真实 PCM；Dedicated Presenter 在首帧窗口和黑场准备完成后调用 release_start，
+// 让首个真实 PCM 与首个视频帧从同一启动边界并行前进。
+bool audio_service_video_mp3_prepare(
+    uint32_t sample_rate_hz,
+    uint8_t channels,
+    uint8_t bits_per_sample,
+    bool wait = true
+);
+bool audio_service_video_mp3_release_start(bool wait = true);
+bool audio_service_video_mp3_pause(bool wait = true);
+bool audio_service_video_mp3_resume(bool wait = true);
+bool audio_service_video_mp3_stop(bool wait = true);
+// 视频专属音量：只改变 AVI MP3 输出，不修改 Music 的全局音量；范围 0~100。
+bool audio_service_video_mp3_set_volume(uint8_t percent);
+bool audio_service_video_mp3_get_volume(uint8_t *out_percent);
+
+// R.40.4.2：Video Presenter / PreDecode 只读的 AVI MP3 PCM 主时钟快照。
+// position_us 来自“真实已成功提交到 I2S DMA”的 PCM sample 数；Video 永远只读，
+// 不得通过该接口控制 AudioTask / I2S / DAC。
+struct AudioVideoClockSnapshot
+{
+    bool active = false;
+    bool eof = false;
+    bool start_released = true;
+    bool paused = false;
+    uint32_t revision = 0U;
+    uint32_t sample_rate_hz = 0U;
+    uint64_t submitted_frames = 0ULL;
+    uint64_t decoder_frames = 0ULL;
+    uint64_t position_us = 0ULL;
+};
+bool audio_service_video_mp3_get_clock(AudioVideoClockSnapshot *out_snapshot);
+// seek 时在 AudioTask 内：静音 DAC、排空 DMA 旧 PCM、丢弃解码器残留数据、
+// 把视频音频时钟对齐到 base_ms，并让新位置首块 PCM 淡入后再解除静音。
+bool audio_service_video_mp3_seek(uint32_t base_ms, bool wait = true);
+
+// R6：传统 NESM NSF 只由唯一后台 6502 Sequencer 执行 INIT/PLAY；AudioTask
+// 消费同源 APU/Bank Event Timeline，经轻量 2A03 Renderer 产出 48kHz stereo PCM。
+// prg 会复制到音频服务自有内存；当前仍只支持 NTSC + 基础五通道。
+bool audio_service_nsf_start(
+    const uint8_t *prg,
+    size_t prg_size,
+    const NsfSynthConfig *config,
+    bool wait = true);
+bool audio_service_nsf_pause(bool wait = true);
+bool audio_service_nsf_resume(bool wait = true);
+bool audio_service_nsf_set_track(uint8_t track, bool wait = true);
+// restore_music_hardware=false 用于同一 NSF Session 内切文件/Subsong。
+// Deep Suspend 时 NSF stop 只释放自己的硬件，Music 由共用 Deep Restore 在真正离开 APP 时重建。
+bool audio_service_nsf_stop(bool restore_music_hardware = true, bool wait = true);
+
+// NSF 专用数字衰减补偿。0~6dB，仅减少 CS43131 PCM 衰减并在 0dB 封顶；
+// 不改变 UI 的 0~100 音量，也不切换 OUT_FS 模拟输出档。
+bool audio_service_set_nsf_gain_compensation_db(uint8_t db);
+
+enum class AudioNsfDurationState : uint8_t
+{
+    Unknown = 0U,
+    Estimated,
+    Confirmed, // Strict Loop已确认显示时长；Audio Timeline仍可在后台线性构建
+    Final,
+};
+
+struct AudioNsfClockSnapshot
+{
+    bool active = false;
+    bool paused = false;
+    bool eof = false;
+    bool failed = false;
+    uint32_t revision = 0U;
+    uint32_t sample_rate_hz = 0U;
+    uint64_t submitted_frames = 0ULL;
+    uint64_t position_ms = 0ULL;
+    uint64_t duration_ms = 0ULL;
+    // Estimated=估算；Confirmed=Strict Loop已确认、UI可立即显示精确时长；
+    // Final=AudioTask已采用结束计划。只有 Final 可用于 EOF 判断。
+    AudioNsfDurationState duration_state = AudioNsfDurationState::Unknown;
+    uint8_t track = 0U;       // 0-based
+    uint8_t track_count = 0U;
+};
+bool audio_service_nsf_get_clock(AudioNsfClockSnapshot *out_snapshot);
+
+enum class AudioNsfVisualVoice : uint8_t
+{
+    Pulse1 = 0U,
+    Pulse2,
+    Triangle,
+    Noise,
+    Dmc,
+};
+
+struct AudioNsfVisualEvent
+{
+    uint32_t start_ms = 0U;
+    uint32_t end_ms = 0U;
+    uint8_t note = 0U;   // Pulse/Triangle 使用MIDI音高；Noise/DMC忽略
+    uint8_t level = 0U;  // 0~127
+    AudioNsfVisualVoice voice = AudioNsfVisualVoice::Pulse1;
+    uint8_t reserved = 0U;
+};
+static_assert(sizeof(AudioNsfVisualEvent) == 12U, "AudioNsfVisualEvent must remain compact");
+
+// R6：复制唯一 NSF Sequencer 生成的可视事件时间线。PCM Renderer 与瀑布消费同一扫描结果，
+// 因此“当前/刚播过”不再由另一套 6502/视觉捕获链重复计算。
+size_t audio_service_nsf_copy_visual_events(
+    uint8_t track,
+    uint32_t window_start_ms,
+    uint32_t window_end_ms,
+    AudioNsfVisualEvent *out_events,
+    size_t capacity);
+
+// 兼容接口：复制同一个 NSF Sequencer 的可视事件。Strict Loop 后只保存 Intro + canonical Loop，
+// 查询更远未来时按绝对毫秒临时映射；UI 始终以真实 I2S position_ms 对齐。
+size_t audio_service_nsf_copy_lookahead_events(
+    uint8_t track,
+    uint32_t window_start_ms,
+    uint32_t window_end_ms,
+    AudioNsfVisualEvent *out_events,
+    size_t capacity);
+
+// Stage 11.x：对当前选中 Track 发起 Seek。Play/Seek 共用 latest-intent 单槽；
+// 路径/技术索引仍复制进请求，AudioTask 会核对 track + playback_revision，并丢弃被更新意图覆盖的旧请求。
+bool audio_service_seek_track(
+    uint32_t track_index,
+    const char *path,
+    MediaFormat format,
+    const MediaTechnicalInfo *technical_info,
+    uint64_t target_ms,
+    bool wait = false
+);
+
+// R145.6：NAS SEEK 必须携带真实 HTTP URL 与认证；与本地 SEEK 共用 AudioTask 单槽。
+bool audio_service_seek_nas_track(
+    uint32_t track_index,
+    const char *url,
+    MediaFormat format,
+    const char *username,
+    const char *password,
+    const MediaTechnicalInfo *technical_info,
+    uint64_t target_ms,
+    bool wait = false);
+
+// 用户音量/静音同样只能通过 AudioTask 命令队列改变。
+// percent 范围 0~100；R.13 默认 50%≈-18dB，保持接近旧版 80%=-20dB 的启动实际响度。
+bool audio_service_set_volume(uint8_t percent, bool wait = false);
+
+// 设置 CS43131 模拟输出档。若当前正在输出，AudioTask 会软静音后执行 pop-free 安全切档；
+// 若当前未播放，仅更新下一次输出使用的档位。
+bool audio_service_set_output_mode(AudioOutputMode mode, bool wait = true);
+bool audio_service_set_mute(bool mute, bool wait = false);
+
+// 当前播放世代。播放新曲或停止时递增，用于后续取消过期异步操作。
+uint32_t audio_service_playback_revision();

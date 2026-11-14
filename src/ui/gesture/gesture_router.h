@@ -1,0 +1,88 @@
+#pragma once
+
+#include <stdint.h>
+
+// P1.3：播放器首页统一手势仲裁。这里只识别动作，不直接操作 LVGL 页面，
+// 页面层通过 take_action() 在自己的 LVGL timer 中消费结果。
+enum class UiGestureAction : uint8_t
+{
+    None = 0,
+    SwipeLeft,
+    SwipeRight,
+    // R.35.1：非顶部/底部边缘起手的明确纵向 Flick。
+    // 页面层决定是否将其映射为上一曲/下一曲；Router 本身不直接操作 Player。
+    SwipeUpTrack,
+    SwipeDownTrack,
+    PullDownFromTop,
+    PullUpFromBottom,
+    // 原地双击（两次轻点，间隔与落点都在容差内）。播放页用它切换暂停/继续。
+    DoubleTap,
+    // 视频播放页的单击：显示/操作亮度与音量浮层；其它页面不启用。
+    SingleTap,
+};
+
+void gesture_router_reset();
+
+// 视频播放页启用短距离、慢速 SEEK；false 时恢复其他页面原有横向手势门槛。
+void gesture_router_set_video_seek_mode(bool enabled);
+// 仅视频播放页启用单击动作，避免改变其它页面的轻点行为。
+void gesture_router_set_single_tap_enabled(bool enabled);
+// 视频控制胶囊显示期间临时禁止横向手势；胶囊隐藏后恢复。
+void gesture_router_set_horizontal_swipe_enabled(bool enabled);
+// 胶囊显示/调节期间禁止双击：每个轻点都按单击即时处理，避免误触暂停。
+void gesture_router_set_double_tap_enabled(bool enabled);
+
+// 由 CST820 -> LVGL 输入桥接层喂入原始指针状态。
+void gesture_router_feed_pointer(bool pressed, int16_t x, int16_t y, uint32_t tick_ms);
+// 在没有新触摸事件时推进单击判定，等待双击窗口结束后再发布 SingleTap。
+// tick_ms 必须与 feed_pointer 的 tick_ms 同源（RTOS 毫秒），否则窗口判断会因时钟偏移失效。
+void gesture_router_tick(uint32_t tick_ms);
+
+// 控件优先：Slider / Button 在 PRESSED~RELEASED 生命周期内占有本次触摸，
+// GestureRouter 不会把拖动控件误判为页面手势。
+void gesture_router_set_control_capture(bool captured);
+
+// Overlay 纵向调节通道：启用后，任意控件/背景上的明显纵向拖动都优先被识别为
+// “连续调节手势”。它只发布位移，不直接修改音量；页面层负责预览，并在 RELEASE 后提交一次。
+struct UiVerticalAdjustSnapshot
+{
+    bool active = false;
+    bool released = false;
+    int16_t delta_y = 0;
+    uint32_t sequence = 0U;
+};
+
+void gesture_router_set_vertical_adjust_enabled(bool enabled);
+// 设置页等滚动页面可保留顶部/底部边缘给全局导航，避免连续纵向拖动抢走Launcher手势。
+void gesture_router_set_vertical_adjust_edges_reserved(bool reserved);
+bool gesture_router_get_vertical_adjust(UiVerticalAdjustSnapshot *out_snapshot);
+bool gesture_router_vertical_adjust_is_engaged();
+void gesture_router_ack_vertical_adjust_release(uint32_t sequence);
+
+// 页面手势一旦成立，本次 RELEASE 后 LVGL 可能仍产生 CLICKED；页面/按钮回调
+// 用这个标记丢弃该次 click，避免“滑一下顺便点了一次”。新一轮按下会自动清除。
+bool gesture_router_should_suppress_click();
+
+// P1.5.3.2R.11：严格区分“点击”和“短距离滑动”。
+// max_move_px 表示从按下起点开始，整个触摸生命周期允许的最大横/纵偏移；
+// 即使手指最后又回到起点，只要中途移动超过阈值，也不会被当成 Tap。
+bool gesture_router_press_was_tap(int16_t max_move_px);
+
+// 返回最近一轮触摸按下时的原始坐标是否位于给定闭区间内。
+// RELEASE 后仍保留该起点，供 LVGL 随后产生的 CLICKED 回调判断“触摸从哪里开始”。
+// 这样顶部/底部/左右边缘可以永久留给页面手势，而不会因为抬手落到中央被误判成 Overlay Tap。
+bool gesture_router_press_started_in_rect(
+    int16_t left, int16_t top, int16_t right, int16_t bottom);
+
+// 返回最近一次触摸的最终位移（相对按下起点）。播放页用它把滑动距离映射成 seek 目标。
+// 新一轮按下后刷新；同一次动作在 take_action() 消费时读取有效。
+bool gesture_router_last_displacement(int16_t *out_dx, int16_t *out_dy);
+
+// 播放页 seek 实时预览：返回触摸是否仍在按下拖动中（未抬手、未被控件捕获、未进入纵向调节），
+// 以及相对按下起点的实时位移。只用于拖动过程的预览，最终动作仍由 take_action() 在抬手后给出。
+bool gesture_router_current_drag(int16_t *out_dx, int16_t *out_dy);
+
+// latest-wins 单槽动作。调用方应在 LVGL task/timer 上下文消费。
+bool gesture_router_take_action(UiGestureAction *out_action);
+
+const char *gesture_router_action_name(UiGestureAction action);

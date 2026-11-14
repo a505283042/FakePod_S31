@@ -1,0 +1,900 @@
+#include "device_settings.h"
+
+#include <stdio.h>
+#include <string.h>
+
+#include "esp_log.h"
+#include "nvs.h"
+
+static const char *TAG = "设备设置";
+
+namespace {
+
+static constexpr uint16_t kSchemaVersion = 1U;
+static constexpr const char *kNamespace = "device_cfg";
+
+static DeviceSettingsSnapshot g_settings = {};
+static DeviceMusicListSelection g_music_selection[2] = {};
+static DeviceMusicBrowseState g_music_browse_state[2] = {};
+static bool g_wifi_setting_explicit = false;
+
+struct PersistedMusicBrowseV1 {
+    uint8_t version = 1U;
+    uint8_t valid = 0U;
+    uint8_t browse_mode = 0U;
+    uint8_t folder_view = 0U;
+    int32_t top_scroll_y[4] = {};
+    int32_t folder_scroll_y[3] = {};
+};
+
+static size_t music_source_index(DeviceMusicLibrarySource source)
+{
+    return source == DeviceMusicLibrarySource::Nas ? 1U : 0U;
+}
+
+static DeviceMusicListSelection &music_selection_for_source(DeviceMusicLibrarySource source)
+{
+    return g_music_selection[music_source_index(source)];
+}
+
+static DeviceMusicBrowseState &music_browse_for_source(DeviceMusicLibrarySource source)
+{
+    return g_music_browse_state[music_source_index(source)];
+}
+
+static const char *music_scope_key(DeviceMusicLibrarySource source)
+{
+    return source == DeviceMusicLibrarySource::Nas ? "nmscope" : "lmscope";
+}
+
+static const char *music_level1_key(DeviceMusicLibrarySource source)
+{
+    return source == DeviceMusicLibrarySource::Nas ? "nml1" : "lml1";
+}
+
+static const char *music_level2_key(DeviceMusicLibrarySource source)
+{
+    return source == DeviceMusicLibrarySource::Nas ? "nml2" : "lml2";
+}
+
+static const char *music_browse_key(DeviceMusicLibrarySource source)
+{
+    return source == DeviceMusicLibrarySource::Nas ? "nmbrowse" : "lmbrowse";
+}
+
+static DeviceMusicListSelection make_music_selection_defaults()
+{
+    DeviceMusicListSelection defaults = {};
+    defaults.scope = DeviceMusicListScope::All;
+    return defaults;
+}
+
+static DeviceSettingsSnapshot make_defaults()
+{
+    DeviceSettingsSnapshot defaults = {};
+    defaults.ready = false;
+    defaults.loaded_from_nvs = false;
+    defaults.usb_mode = DeviceUsbMode::Serial;
+    defaults.ble_enabled = true;
+    defaults.bluetooth_mode = DeviceBluetoothMode::PhoneRemote;
+    defaults.wifi_enabled = false;
+    defaults.audio_output_mode = DeviceAudioOutputMode::NormalHeadphones;
+    defaults.brightness_level = 60U;
+    defaults.aux_key_mode = DeviceAuxKeyMode::Volume;
+    defaults.auto_screen_off_seconds = 0U;
+    defaults.aod_enabled = true;
+    defaults.animation_mode = DeviceAnimationMode::Auto;
+    defaults.music_list_scope = DeviceMusicListScope::All;
+    defaults.music_library_source = DeviceMusicLibrarySource::Local;
+    defaults.cassette_dynamic_tint_enabled = true;
+    defaults.motion_controls_enabled = false;
+    defaults.nsf_gain_compensation_db = 3U;
+    defaults.remember_volume = true;
+    snprintf(defaults.ui_font_file, sizeof(defaults.ui_font_file), "%s", "思源粗黑.bin");
+    return defaults;
+}
+
+static bool usb_mode_valid(uint8_t raw)
+{
+    return raw <= static_cast<uint8_t>(DeviceUsbMode::TfCard);
+}
+
+static bool audio_output_mode_valid(uint8_t raw)
+{
+    return raw <= static_cast<uint8_t>(DeviceAudioOutputMode::HighImpedanceHeadphones);
+}
+
+static bool aux_key_mode_valid(uint8_t raw)
+{
+    return raw <= static_cast<uint8_t>(DeviceAuxKeyMode::Track);
+}
+
+static bool auto_screen_off_valid(uint16_t seconds)
+{
+    switch (seconds) {
+        case 0U:
+        case 10U:
+        case 30U:
+        case 60U:
+        case 120U:
+        case 180U:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool animation_mode_valid(uint8_t raw)
+{
+    return raw <= static_cast<uint8_t>(DeviceAnimationMode::Eco);
+}
+
+static bool music_list_scope_valid(uint8_t raw)
+{
+    return raw <= static_cast<uint8_t>(DeviceMusicListScope::Level2);
+}
+
+static bool music_library_source_valid(uint8_t raw)
+{
+    return raw <= static_cast<uint8_t>(DeviceMusicLibrarySource::Nas);
+}
+
+static bool nsf_gain_compensation_valid(uint8_t db)
+{
+    return db <= 6U;
+}
+
+static bool load_music_selection_from_nvs(
+    nvs_handle_t handle, DeviceMusicLibrarySource source, DeviceMusicListSelection *out_selection)
+{
+    if (out_selection == nullptr) return false;
+    DeviceMusicListSelection loaded = make_music_selection_defaults();
+    uint8_t raw_scope = 0U;
+    if (nvs_get_u8(handle, music_scope_key(source), &raw_scope) != ESP_OK ||
+        !music_list_scope_valid(raw_scope)) {
+        return false;
+    }
+    loaded.scope = static_cast<DeviceMusicListScope>(raw_scope);
+    size_t bytes = sizeof(loaded.level1_path);
+    if (nvs_get_str(handle, music_level1_key(source), loaded.level1_path, &bytes) != ESP_OK) {
+        loaded.level1_path[0] = '\0';
+    }
+    bytes = sizeof(loaded.level2_path);
+    if (nvs_get_str(handle, music_level2_key(source), loaded.level2_path, &bytes) != ESP_OK) {
+        loaded.level2_path[0] = '\0';
+    }
+    *out_selection = loaded;
+    return true;
+}
+
+static void load_music_browse_from_nvs(
+    nvs_handle_t handle, DeviceMusicLibrarySource source, DeviceMusicBrowseState *out_state)
+{
+    if (out_state == nullptr) return;
+    *out_state = {};
+    PersistedMusicBrowseV1 stored = {};
+    size_t bytes = sizeof(stored);
+    if (nvs_get_blob(handle, music_browse_key(source), &stored, &bytes) != ESP_OK ||
+        bytes != sizeof(stored) || stored.version != 1U || stored.valid == 0U ||
+        stored.browse_mode > 3U || stored.folder_view > 3U) {
+        return;
+    }
+    out_state->valid = true;
+    out_state->browse_mode = stored.browse_mode;
+    out_state->folder_view = stored.folder_view;
+    memcpy(out_state->top_scroll_y, stored.top_scroll_y, sizeof(out_state->top_scroll_y));
+    memcpy(out_state->folder_scroll_y, stored.folder_scroll_y, sizeof(out_state->folder_scroll_y));
+}
+
+static esp_err_t open_rw(nvs_handle_t *out_handle)
+{
+    if (out_handle == nullptr || !g_settings.ready) return ESP_ERR_INVALID_STATE;
+    return nvs_open(kNamespace, NVS_READWRITE, out_handle);
+}
+
+static esp_err_t commit_u8(const char *key, uint8_t value)
+{
+    nvs_handle_t handle = 0;
+    esp_err_t ret = open_rw(&handle);
+    if (ret != ESP_OK) return ret;
+    ret = nvs_set_u16(handle, "schema", kSchemaVersion);
+    if (ret == ESP_OK) ret = nvs_set_u8(handle, key, value);
+    if (ret == ESP_OK) ret = nvs_commit(handle);
+    nvs_close(handle);
+    return ret;
+}
+
+static esp_err_t commit_u16(const char *key, uint16_t value)
+{
+    nvs_handle_t handle = 0;
+    esp_err_t ret = open_rw(&handle);
+    if (ret != ESP_OK) return ret;
+    ret = nvs_set_u16(handle, "schema", kSchemaVersion);
+    if (ret == ESP_OK) ret = nvs_set_u16(handle, key, value);
+    if (ret == ESP_OK) ret = nvs_commit(handle);
+    nvs_close(handle);
+    return ret;
+}
+
+static void log_commit_failure(const char *key, esp_err_t ret)
+{
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "保存设置失败：key=%s ret=%s", key, esp_err_to_name(ret));
+    }
+}
+
+} // namespace
+
+esp_err_t device_settings_init()
+{
+    if (g_settings.ready) return ESP_OK;
+    g_settings = make_defaults();
+    g_music_selection[0] = make_music_selection_defaults();
+    g_music_selection[1] = make_music_selection_defaults();
+    g_music_browse_state[0] = {};
+    g_music_browse_state[1] = {};
+    g_wifi_setting_explicit = false;
+
+    nvs_handle_t handle = 0;
+    esp_err_t ret = nvs_open(kNamespace, NVS_READONLY, &handle);
+    if (ret == ESP_ERR_NVS_NOT_FOUND) {
+        g_settings.ready = true;
+        ESP_LOGI(TAG, "Settings V1 尚无NVS数据，使用默认值");
+        return ESP_OK;
+    }
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "打开Settings NVS失败：%s；本轮只使用RAM默认值", esp_err_to_name(ret));
+        return ret;
+    }
+
+    uint16_t schema = 0U;
+    ret = nvs_get_u16(handle, "schema", &schema);
+    if (ret != ESP_OK || schema != kSchemaVersion) {
+        nvs_close(handle);
+        g_settings.ready = true;
+        ESP_LOGI(TAG, "Settings NVS无有效schema，保持V1默认值");
+        return ESP_OK;
+    }
+
+    uint8_t u8 = 0U;
+    uint16_t u16 = 0U;
+    if (nvs_get_u8(handle, "usb", &u8) == ESP_OK && usb_mode_valid(u8)) {
+        g_settings.usb_mode = static_cast<DeviceUsbMode>(u8);
+    }
+    if (nvs_get_u8(handle, "ble", &u8) == ESP_OK && u8 <= 1U) {
+        g_settings.ble_enabled = u8 != 0U;
+        g_settings.bluetooth_mode = u8 != 0U
+            ? DeviceBluetoothMode::PhoneRemote : DeviceBluetoothMode::Off;
+    }
+    if (nvs_get_u8(handle, "blemode", &u8) == ESP_OK && u8 <= 2U) {
+        g_settings.bluetooth_mode = static_cast<DeviceBluetoothMode>(u8);
+        g_settings.ble_enabled = g_settings.bluetooth_mode != DeviceBluetoothMode::Off;
+    }
+    if (nvs_get_u8(handle, "wifi", &u8) == ESP_OK && u8 <= 1U) {
+        g_settings.wifi_enabled = u8 != 0U;
+        g_wifi_setting_explicit = true;
+    }
+    if (nvs_get_u8(handle, "audioout", &u8) == ESP_OK && audio_output_mode_valid(u8)) {
+        g_settings.audio_output_mode = static_cast<DeviceAudioOutputMode>(u8);
+    }
+    if (nvs_get_u8(handle, "bright", &u8) == ESP_OK && u8 >= 5U && u8 <= 100U) {
+        g_settings.brightness_level = u8;
+    }
+    if (nvs_get_u8(handle, "aux", &u8) == ESP_OK && aux_key_mode_valid(u8)) {
+        g_settings.aux_key_mode = static_cast<DeviceAuxKeyMode>(u8);
+    }
+    if (nvs_get_u16(handle, "screenoff", &u16) == ESP_OK) {
+        if (auto_screen_off_valid(u16)) {
+            g_settings.auto_screen_off_seconds = u16;
+        } else if (u16 == 300U || u16 == 600U) {
+            // 旧版允许 5/10 分钟；新版最长 3 分钟，加载时平滑收敛到 180 秒。
+            g_settings.auto_screen_off_seconds = 180U;
+        }
+    }
+    if (nvs_get_u8(handle, "aod", &u8) == ESP_OK && u8 <= 1U) {
+        g_settings.aod_enabled = u8 != 0U;
+    }
+    if (nvs_get_u8(handle, "anim", &u8) == ESP_OK && animation_mode_valid(u8)) {
+        g_settings.animation_mode = static_cast<DeviceAnimationMode>(u8);
+    }
+    if (nvs_get_u8(handle, "musrc", &u8) == ESP_OK && music_library_source_valid(u8)) {
+        g_settings.music_library_source = static_cast<DeviceMusicLibrarySource>(u8);
+    }
+
+    // R46.0.107：旧版只有一套 muscope/mul1/mul2。迁移时只归属到当时保存的 musrc，
+    // 另一来源从总列表开始，避免再次把 Local/NAS 目录互相污染。
+    DeviceMusicListSelection legacy_selection = make_music_selection_defaults();
+    bool legacy_selection_present = false;
+    if (nvs_get_u8(handle, "muscope", &u8) == ESP_OK && music_list_scope_valid(u8)) {
+        legacy_selection.scope = static_cast<DeviceMusicListScope>(u8);
+        legacy_selection_present = true;
+    }
+    size_t path_bytes = sizeof(legacy_selection.level1_path);
+    if (nvs_get_str(handle, "mul1", legacy_selection.level1_path, &path_bytes) == ESP_OK) {
+        legacy_selection_present = true;
+    } else {
+        legacy_selection.level1_path[0] = '\0';
+    }
+    path_bytes = sizeof(legacy_selection.level2_path);
+    if (nvs_get_str(handle, "mul2", legacy_selection.level2_path, &path_bytes) == ESP_OK) {
+        legacy_selection_present = true;
+    } else {
+        legacy_selection.level2_path[0] = '\0';
+    }
+
+    bool local_selection_v2 = load_music_selection_from_nvs(
+        handle, DeviceMusicLibrarySource::Local, &g_music_selection[0]);
+    bool nas_selection_v2 = load_music_selection_from_nvs(
+        handle, DeviceMusicLibrarySource::Nas, &g_music_selection[1]);
+    if (legacy_selection_present) {
+        if (g_settings.music_library_source == DeviceMusicLibrarySource::Nas && !nas_selection_v2) {
+            g_music_selection[1] = legacy_selection;
+        } else if (g_settings.music_library_source == DeviceMusicLibrarySource::Local && !local_selection_v2) {
+            g_music_selection[0] = legacy_selection;
+        }
+    }
+    load_music_browse_from_nvs(handle, DeviceMusicLibrarySource::Local, &g_music_browse_state[0]);
+    load_music_browse_from_nvs(handle, DeviceMusicLibrarySource::Nas, &g_music_browse_state[1]);
+    g_settings.music_list_scope = music_selection_for_source(g_settings.music_library_source).scope;
+    if (nvs_get_u8(handle, "castint", &u8) == ESP_OK && u8 <= 1U) {
+        g_settings.cassette_dynamic_tint_enabled = u8 != 0U;
+    }
+    if (nvs_get_u8(handle, "motion", &u8) == ESP_OK && u8 <= 1U) {
+        g_settings.motion_controls_enabled = u8 != 0U;
+    }
+    if (nvs_get_u8(handle, "nsfgain", &u8) == ESP_OK && nsf_gain_compensation_valid(u8)) {
+        g_settings.nsf_gain_compensation_db = u8;
+    }
+    if (nvs_get_u8(handle, "memvol", &u8) == ESP_OK && u8 <= 1U) {
+        g_settings.remember_volume = u8 != 0U;
+    }
+    size_t font_file_bytes = sizeof(g_settings.ui_font_file);
+    const esp_err_t font_file_ret =
+        nvs_get_str(handle, "fontfile", g_settings.ui_font_file, &font_file_bytes);
+    if (font_file_ret != ESP_OK && font_file_ret != ESP_ERR_NVS_NOT_FOUND) {
+        // 字体设置损坏或长度异常时恢复默认字体；未保存过字体时保留 make_defaults() 的思源粗黑。
+        snprintf(g_settings.ui_font_file, sizeof(g_settings.ui_font_file), "%s", "思源粗黑.bin");
+    }
+
+    nvs_close(handle);
+    g_settings.ready = true;
+    g_settings.loaded_from_nvs = true;
+    if (g_settings.ble_enabled && g_settings.wifi_enabled) {
+        // Wi-Fi 与 BLE 仍互斥；冲突时收敛到 Wi-Fi，蓝牙模式也同步为关闭。
+        g_settings.ble_enabled = false;
+        g_settings.bluetooth_mode = DeviceBluetoothMode::Off;
+        ESP_LOGW(TAG, "无线设置冲突：BLE/Wi-Fi同时为开，运行期收敛为Wi-Fi=开 BLE=关");
+    }
+
+    ESP_LOGI(TAG, "Settings V1加载完成：USB=%s BLE=%s WiFi=%s audio=%s bright=%u aux=%s library=%s local_scope=%s nas_scope=%s cassette=%s motion=%s nsfgain=+%udB",
+        device_settings_usb_mode_name(g_settings.usb_mode),
+        g_settings.ble_enabled ? "开" : "关",
+        g_settings.wifi_enabled ? "开" : "关",
+        device_settings_audio_output_mode_name(g_settings.audio_output_mode),
+        static_cast<unsigned>(g_settings.brightness_level),
+        device_settings_aux_key_mode_name(g_settings.aux_key_mode),
+        device_settings_music_library_source_name(g_settings.music_library_source),
+        device_settings_music_list_scope_name(g_music_selection[0].scope),
+        device_settings_music_list_scope_name(g_music_selection[1].scope),
+        g_settings.cassette_dynamic_tint_enabled ? "封面变色" : "原装粉色",
+        g_settings.motion_controls_enabled ? "开" : "关",
+        static_cast<unsigned>(g_settings.nsf_gain_compensation_db));
+    return ESP_OK;
+}
+
+bool device_settings_get_snapshot(DeviceSettingsSnapshot *out_snapshot)
+{
+    if (out_snapshot == nullptr) return false;
+    *out_snapshot = g_settings;
+    return g_settings.ready;
+}
+
+bool device_settings_remember_volume_enabled()
+{
+    return !g_settings.ready || g_settings.remember_volume;
+}
+
+bool device_settings_wifi_enabled_is_explicit()
+{
+    return g_settings.ready && g_wifi_setting_explicit;
+}
+
+DeviceMusicLibrarySource device_settings_music_library_source()
+{
+    return g_settings.ready ? g_settings.music_library_source : DeviceMusicLibrarySource::Local;
+}
+
+DeviceMusicListScope device_settings_music_list_scope()
+{
+    return g_settings.ready ? g_settings.music_list_scope : DeviceMusicListScope::All;
+}
+
+esp_err_t device_settings_set_usb_mode(DeviceUsbMode mode)
+{
+    if (!usb_mode_valid(static_cast<uint8_t>(mode))) return ESP_ERR_INVALID_ARG;
+    const DeviceUsbMode old = g_settings.usb_mode;
+    g_settings.usb_mode = mode;
+    const esp_err_t ret = commit_u8("usb", static_cast<uint8_t>(mode));
+    if (ret != ESP_OK) g_settings.usb_mode = old;
+    log_commit_failure("usb", ret);
+    return ret;
+}
+
+esp_err_t device_settings_set_wireless_enabled(bool ble_enabled, bool wifi_enabled)
+{
+    if (ble_enabled && wifi_enabled) return ESP_ERR_INVALID_ARG;
+    if (!g_settings.ready) return ESP_ERR_INVALID_STATE;
+
+    const bool old_ble = g_settings.ble_enabled;
+    const bool old_wifi = g_settings.wifi_enabled;
+    const bool old_explicit = g_wifi_setting_explicit;
+    g_settings.ble_enabled = ble_enabled;
+    g_settings.wifi_enabled = wifi_enabled;
+    g_wifi_setting_explicit = true;
+
+    nvs_handle_t handle = 0;
+    esp_err_t ret = open_rw(&handle);
+    if (ret == ESP_OK) ret = nvs_set_u16(handle, "schema", kSchemaVersion);
+    if (ret == ESP_OK) ret = nvs_set_u8(handle, "ble", ble_enabled ? 1U : 0U);
+    // Wi-Fi 暂时接管射频时只关闭当前 BLE，不覆盖用户选择的手机/手柄模式。
+    const DeviceBluetoothMode persisted_mode =
+        (ble_enabled && g_settings.bluetooth_mode == DeviceBluetoothMode::Off)
+            ? DeviceBluetoothMode::PhoneRemote : g_settings.bluetooth_mode;
+    if (ret == ESP_OK && persisted_mode != g_settings.bluetooth_mode) {
+        ret = nvs_set_u8(handle, "blemode", static_cast<uint8_t>(persisted_mode));
+    }
+    if (ret == ESP_OK) ret = nvs_set_u8(handle, "wifi", wifi_enabled ? 1U : 0U);
+    if (ret == ESP_OK) ret = nvs_commit(handle);
+    if (handle != 0) nvs_close(handle);
+
+    if (ret == ESP_OK) {
+        g_settings.bluetooth_mode = persisted_mode;
+    } else {
+        g_settings.ble_enabled = old_ble;
+        g_settings.wifi_enabled = old_wifi;
+        g_wifi_setting_explicit = old_explicit;
+        log_commit_failure("wireless", ret);
+    }
+    return ret;
+}
+
+esp_err_t device_settings_set_ble_enabled(bool enabled)
+{
+    return device_settings_set_bluetooth_mode(
+        enabled ? DeviceBluetoothMode::PhoneRemote : DeviceBluetoothMode::Off);
+}
+
+esp_err_t device_settings_set_bluetooth_mode(DeviceBluetoothMode mode)
+{
+    const uint8_t raw = static_cast<uint8_t>(mode);
+    if (raw > static_cast<uint8_t>(DeviceBluetoothMode::Controller)) return ESP_ERR_INVALID_ARG;
+    if (!g_settings.ready) return ESP_ERR_INVALID_STATE;
+    const bool enabled = mode != DeviceBluetoothMode::Off;
+    if (enabled && g_settings.wifi_enabled) return ESP_ERR_INVALID_STATE;
+    const DeviceBluetoothMode old_mode = g_settings.bluetooth_mode;
+    const bool old_enabled = g_settings.ble_enabled;
+    g_settings.bluetooth_mode = mode;
+    g_settings.ble_enabled = enabled;
+    nvs_handle_t handle = 0;
+    esp_err_t ret = open_rw(&handle);
+    if (ret == ESP_OK) ret = nvs_set_u16(handle, "schema", kSchemaVersion);
+    if (ret == ESP_OK) ret = nvs_set_u8(handle, "ble", enabled ? 1U : 0U);
+    if (ret == ESP_OK) ret = nvs_set_u8(handle, "blemode", raw);
+    if (ret == ESP_OK) ret = nvs_commit(handle);
+    if (handle != 0) nvs_close(handle);
+    if (ret != ESP_OK) {
+        g_settings.bluetooth_mode = old_mode;
+        g_settings.ble_enabled = old_enabled;
+        log_commit_failure("blemode", ret);
+    }
+    return ret;
+}
+
+esp_err_t device_settings_set_audio_output_mode(DeviceAudioOutputMode mode)
+{
+    if (!audio_output_mode_valid(static_cast<uint8_t>(mode))) return ESP_ERR_INVALID_ARG;
+    const DeviceAudioOutputMode old = g_settings.audio_output_mode;
+    g_settings.audio_output_mode = mode;
+    const esp_err_t ret = commit_u8("audioout", static_cast<uint8_t>(mode));
+    if (ret != ESP_OK) g_settings.audio_output_mode = old;
+    log_commit_failure("audioout", ret);
+    return ret;
+}
+
+esp_err_t device_settings_set_brightness_level(uint8_t level)
+{
+    // Normal亮度不允许写0；真正的AOD/熄屏由screen_lock_simple独立控制。
+    if (level < 5U || level > 100U) return ESP_ERR_INVALID_ARG;
+    const uint8_t old = g_settings.brightness_level;
+    g_settings.brightness_level = level;
+    const esp_err_t ret = commit_u8("bright", level);
+    if (ret != ESP_OK) g_settings.brightness_level = old;
+    log_commit_failure("bright", ret);
+    return ret;
+}
+
+esp_err_t device_settings_set_aux_key_mode(DeviceAuxKeyMode mode)
+{
+    if (!aux_key_mode_valid(static_cast<uint8_t>(mode))) return ESP_ERR_INVALID_ARG;
+    const DeviceAuxKeyMode old = g_settings.aux_key_mode;
+    g_settings.aux_key_mode = mode;
+    const esp_err_t ret = commit_u8("aux", static_cast<uint8_t>(mode));
+    if (ret != ESP_OK) g_settings.aux_key_mode = old;
+    log_commit_failure("aux", ret);
+    return ret;
+}
+
+esp_err_t device_settings_set_auto_screen_off_seconds(uint16_t seconds)
+{
+    if (!auto_screen_off_valid(seconds)) return ESP_ERR_INVALID_ARG;
+    const uint16_t old = g_settings.auto_screen_off_seconds;
+    g_settings.auto_screen_off_seconds = seconds;
+    const esp_err_t ret = commit_u16("screenoff", seconds);
+    if (ret != ESP_OK) g_settings.auto_screen_off_seconds = old;
+    log_commit_failure("screenoff", ret);
+    return ret;
+}
+
+esp_err_t device_settings_set_aod_enabled(bool enabled)
+{
+    const bool old = g_settings.aod_enabled;
+    g_settings.aod_enabled = enabled;
+    const esp_err_t ret = commit_u8("aod", enabled ? 1U : 0U);
+    if (ret != ESP_OK) g_settings.aod_enabled = old;
+    log_commit_failure("aod", ret);
+    return ret;
+}
+
+esp_err_t device_settings_set_animation_mode(DeviceAnimationMode mode)
+{
+    if (!animation_mode_valid(static_cast<uint8_t>(mode))) return ESP_ERR_INVALID_ARG;
+    const DeviceAnimationMode old = g_settings.animation_mode;
+    g_settings.animation_mode = mode;
+    const esp_err_t ret = commit_u8("anim", static_cast<uint8_t>(mode));
+    if (ret != ESP_OK) g_settings.animation_mode = old;
+    log_commit_failure("anim", ret);
+    return ret;
+}
+
+bool device_settings_get_music_list_selection_for_source(
+    DeviceMusicLibrarySource source,
+    DeviceMusicListSelection *out_selection)
+{
+    if (out_selection == nullptr || !g_settings.ready ||
+        !music_library_source_valid(static_cast<uint8_t>(source))) {
+        return false;
+    }
+    *out_selection = music_selection_for_source(source);
+    return true;
+}
+
+bool device_settings_get_music_list_selection(DeviceMusicListSelection *out_selection)
+{
+    return device_settings_get_music_list_selection_for_source(
+        g_settings.music_library_source, out_selection);
+}
+
+esp_err_t device_settings_set_music_list_selection_for_source(
+    DeviceMusicLibrarySource source,
+    DeviceMusicListScope scope,
+    const char *level1_path,
+    const char *level2_path)
+{
+    if (!music_library_source_valid(static_cast<uint8_t>(source)) ||
+        !music_list_scope_valid(static_cast<uint8_t>(scope))) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (level1_path == nullptr) level1_path = "";
+    if (level2_path == nullptr) level2_path = "";
+    DeviceMusicListSelection &selection = music_selection_for_source(source);
+    if (strlen(level1_path) >= sizeof(selection.level1_path) ||
+        strlen(level2_path) >= sizeof(selection.level2_path)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    // Re-selecting the same directory must not synchronously rewrite Flash.
+    if (selection.scope == scope && strcmp(selection.level1_path, level1_path) == 0 &&
+        strcmp(selection.level2_path, level2_path) == 0) return ESP_OK;
+
+    const DeviceMusicListSelection old_selection = selection;
+    const DeviceMusicListScope old_active_scope = g_settings.music_list_scope;
+    selection.scope = scope;
+    snprintf(selection.level1_path, sizeof(selection.level1_path), "%s", level1_path);
+    snprintf(selection.level2_path, sizeof(selection.level2_path), "%s", level2_path);
+    if (source == g_settings.music_library_source) {
+        g_settings.music_list_scope = scope;
+    }
+
+    nvs_handle_t handle = 0;
+    esp_err_t ret = open_rw(&handle);
+    if (ret == ESP_OK) ret = nvs_set_u16(handle, "schema", kSchemaVersion);
+    if (ret == ESP_OK) ret = nvs_set_u8(handle, music_scope_key(source), static_cast<uint8_t>(scope));
+    if (ret == ESP_OK) ret = nvs_set_str(handle, music_level1_key(source), selection.level1_path);
+    if (ret == ESP_OK) ret = nvs_set_str(handle, music_level2_key(source), selection.level2_path);
+    // 当前来源继续镜像旧 key，兼容已有诊断/降级固件；真正恢复始终优先新来源专属 key。
+    if (ret == ESP_OK && source == g_settings.music_library_source) {
+        ret = nvs_set_u8(handle, "muscope", static_cast<uint8_t>(scope));
+        if (ret == ESP_OK) ret = nvs_set_str(handle, "mul1", selection.level1_path);
+        if (ret == ESP_OK) ret = nvs_set_str(handle, "mul2", selection.level2_path);
+    }
+    if (ret == ESP_OK) ret = nvs_commit(handle);
+    if (handle != 0) nvs_close(handle);
+
+    if (ret != ESP_OK) {
+        selection = old_selection;
+        g_settings.music_list_scope = old_active_scope;
+        log_commit_failure(source == DeviceMusicLibrarySource::Nas ? "nas_music_list" : "local_music_list", ret);
+    }
+    return ret;
+}
+
+esp_err_t device_settings_set_music_list_selection(
+    DeviceMusicListScope scope,
+    const char *level1_path,
+    const char *level2_path)
+{
+    return device_settings_set_music_list_selection_for_source(
+        g_settings.music_library_source, scope, level1_path, level2_path);
+}
+
+esp_err_t device_settings_set_music_list_scope(DeviceMusicListScope scope)
+{
+    const DeviceMusicListSelection &selection = music_selection_for_source(
+        g_settings.music_library_source);
+    return device_settings_set_music_list_selection(
+        scope, selection.level1_path, selection.level2_path);
+}
+
+bool device_settings_get_music_browse_state(
+    DeviceMusicLibrarySource source,
+    DeviceMusicBrowseState *out_state)
+{
+    if (out_state == nullptr || !g_settings.ready ||
+        !music_library_source_valid(static_cast<uint8_t>(source))) {
+        return false;
+    }
+    *out_state = music_browse_for_source(source);
+    return out_state->valid;
+}
+
+esp_err_t device_settings_set_music_browse_state(
+    DeviceMusicLibrarySource source,
+    const DeviceMusicBrowseState &state)
+{
+    if (!music_library_source_valid(static_cast<uint8_t>(source)) ||
+        state.browse_mode > 3U || state.folder_view > 3U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    PersistedMusicBrowseV1 stored = {};
+    stored.version = 1U;
+    stored.valid = state.valid ? 1U : 0U;
+    stored.browse_mode = state.browse_mode;
+    stored.folder_view = state.folder_view;
+    memcpy(stored.top_scroll_y, state.top_scroll_y, sizeof(stored.top_scroll_y));
+    memcpy(stored.folder_scroll_y, state.folder_scroll_y, sizeof(stored.folder_scroll_y));
+
+    const DeviceMusicBrowseState old = music_browse_for_source(source);
+    music_browse_for_source(source) = state;
+    nvs_handle_t handle = 0;
+    esp_err_t ret = open_rw(&handle);
+    if (ret == ESP_OK) ret = nvs_set_u16(handle, "schema", kSchemaVersion);
+    if (ret == ESP_OK) ret = nvs_set_blob(handle, music_browse_key(source), &stored, sizeof(stored));
+    if (ret == ESP_OK) ret = nvs_commit(handle);
+    if (handle != 0) nvs_close(handle);
+    if (ret != ESP_OK) {
+        music_browse_for_source(source) = old;
+        log_commit_failure(source == DeviceMusicLibrarySource::Nas ? "nas_browse" : "local_browse", ret);
+    }
+    return ret;
+}
+
+esp_err_t device_settings_set_music_library_source(DeviceMusicLibrarySource source)
+{
+    if (!music_library_source_valid(static_cast<uint8_t>(source))) return ESP_ERR_INVALID_ARG;
+    const DeviceMusicLibrarySource old = g_settings.music_library_source;
+    const DeviceMusicListScope old_scope = g_settings.music_list_scope;
+    const DeviceMusicListSelection old_source_selection = music_selection_for_source(old);
+    const DeviceMusicListSelection &selection = music_selection_for_source(source);
+    g_settings.music_library_source = source;
+    g_settings.music_list_scope = selection.scope;
+
+    // 来源切换与目标来源自己的 scope/path 同事务落盘。否则首次迁移后只改 musrc，
+    // 下次启动会把旧全局 muscope 错认成新来源的上下文。
+    nvs_handle_t handle = 0;
+    esp_err_t ret = open_rw(&handle);
+    if (ret == ESP_OK) ret = nvs_set_u16(handle, "schema", kSchemaVersion);
+    if (ret == ESP_OK) ret = nvs_set_u8(handle, "musrc", static_cast<uint8_t>(source));
+    // 先把旧来源也固化为来源专属 key，完成旧全局 muscope/mul1/mul2 的惰性迁移。
+    if (ret == ESP_OK) ret = nvs_set_u8(handle, music_scope_key(old), static_cast<uint8_t>(old_source_selection.scope));
+    if (ret == ESP_OK) ret = nvs_set_str(handle, music_level1_key(old), old_source_selection.level1_path);
+    if (ret == ESP_OK) ret = nvs_set_str(handle, music_level2_key(old), old_source_selection.level2_path);
+    if (ret == ESP_OK) ret = nvs_set_u8(handle, music_scope_key(source), static_cast<uint8_t>(selection.scope));
+    if (ret == ESP_OK) ret = nvs_set_str(handle, music_level1_key(source), selection.level1_path);
+    if (ret == ESP_OK) ret = nvs_set_str(handle, music_level2_key(source), selection.level2_path);
+    if (ret == ESP_OK) ret = nvs_set_u8(handle, "muscope", static_cast<uint8_t>(selection.scope));
+    if (ret == ESP_OK) ret = nvs_set_str(handle, "mul1", selection.level1_path);
+    if (ret == ESP_OK) ret = nvs_set_str(handle, "mul2", selection.level2_path);
+    if (ret == ESP_OK) ret = nvs_commit(handle);
+    if (handle != 0) nvs_close(handle);
+
+    if (ret != ESP_OK) {
+        g_settings.music_library_source = old;
+        g_settings.music_list_scope = old_scope;
+    }
+    log_commit_failure("musrc", ret);
+    return ret;
+}
+
+esp_err_t device_settings_set_cassette_dynamic_tint_enabled(bool enabled)
+{
+    const bool old = g_settings.cassette_dynamic_tint_enabled;
+    g_settings.cassette_dynamic_tint_enabled = enabled;
+    const esp_err_t ret = commit_u8("castint", enabled ? 1U : 0U);
+    if (ret != ESP_OK) g_settings.cassette_dynamic_tint_enabled = old;
+    log_commit_failure("castint", ret);
+    return ret;
+}
+
+esp_err_t device_settings_set_motion_controls_enabled(bool enabled)
+{
+    const bool old = g_settings.motion_controls_enabled;
+    g_settings.motion_controls_enabled = enabled;
+    const esp_err_t ret = commit_u8("motion", enabled ? 1U : 0U);
+    if (ret != ESP_OK) g_settings.motion_controls_enabled = old;
+    log_commit_failure("motion", ret);
+    return ret;
+}
+
+esp_err_t device_settings_set_nsf_gain_compensation_db(uint8_t db)
+{
+    if (!nsf_gain_compensation_valid(db)) return ESP_ERR_INVALID_ARG;
+    const uint8_t old = g_settings.nsf_gain_compensation_db;
+    g_settings.nsf_gain_compensation_db = db;
+    const esp_err_t ret = commit_u8("nsfgain", db);
+    if (ret != ESP_OK) g_settings.nsf_gain_compensation_db = old;
+    log_commit_failure("nsfgain", ret);
+    return ret;
+}
+
+esp_err_t device_settings_set_remember_volume(bool enabled)
+{
+    const bool old = g_settings.remember_volume;
+    g_settings.remember_volume = enabled;
+    const esp_err_t ret = commit_u8("memvol", enabled ? 1U : 0U);
+    if (ret != ESP_OK) g_settings.remember_volume = old;
+    log_commit_failure("memvol", ret);
+    return ret;
+}
+
+esp_err_t device_settings_set_ui_font_file(const char *filename)
+{
+    if (filename == nullptr || filename[0] == '\0' ||
+        strlen(filename) >= sizeof(g_settings.ui_font_file)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char old[sizeof(g_settings.ui_font_file)] = {};
+    snprintf(old, sizeof(old), "%s", g_settings.ui_font_file);
+    snprintf(g_settings.ui_font_file, sizeof(g_settings.ui_font_file), "%s", filename);
+
+    nvs_handle_t handle = 0;
+    esp_err_t ret = open_rw(&handle);
+    if (ret == ESP_OK) ret = nvs_set_u16(handle, "schema", kSchemaVersion);
+    if (ret == ESP_OK) ret = nvs_set_str(handle, "fontfile", g_settings.ui_font_file);
+    if (ret == ESP_OK) ret = nvs_commit(handle);
+    if (handle != 0) nvs_close(handle);
+
+    if (ret != ESP_OK) {
+        snprintf(g_settings.ui_font_file, sizeof(g_settings.ui_font_file), "%s", old);
+        log_commit_failure("fontfile", ret);
+    }
+    return ret;
+}
+
+esp_err_t device_settings_reset_defaults()
+{
+    if (!g_settings.ready) return ESP_ERR_INVALID_STATE;
+
+    nvs_handle_t handle = 0;
+    esp_err_t ret = nvs_open(kNamespace, NVS_READWRITE, &handle);
+    if (ret != ESP_OK) return ret;
+    ret = nvs_erase_all(handle);
+    if (ret == ESP_OK) ret = nvs_set_u16(handle, "schema", kSchemaVersion);
+    // 恢复默认值使用蓝牙遥控；Wi-Fi 默认关闭，同时写入两个 key，避免触发旧版迁移。
+    if (ret == ESP_OK) ret = nvs_set_u8(handle, "ble", 1U);
+    if (ret == ESP_OK) ret = nvs_set_u8(handle, "blemode", static_cast<uint8_t>(DeviceBluetoothMode::PhoneRemote));
+    if (ret == ESP_OK) ret = nvs_set_u8(handle, "wifi", 0U);
+    if (ret == ESP_OK) ret = nvs_commit(handle);
+    nvs_close(handle);
+    if (ret == ESP_OK) {
+        g_settings = make_defaults();
+        g_music_selection[0] = make_music_selection_defaults();
+        g_music_selection[1] = make_music_selection_defaults();
+        g_music_browse_state[0] = {};
+        g_music_browse_state[1] = {};
+        g_wifi_setting_explicit = true;
+        g_settings.ready = true;
+        g_settings.loaded_from_nvs = true;
+        ESP_LOGI(TAG, "Settings V1已恢复默认值");
+    }
+    return ret;
+}
+
+const char *device_settings_bluetooth_mode_name(DeviceBluetoothMode mode)
+{
+    switch (mode) {
+        case DeviceBluetoothMode::Off: return "关闭";
+        case DeviceBluetoothMode::PhoneRemote: return "手机遥控";
+        case DeviceBluetoothMode::Controller: return "手柄扫描";
+        default: return "未知";
+    }
+}
+
+const char *device_settings_usb_mode_name(DeviceUsbMode mode)
+{
+    switch (mode) {
+        case DeviceUsbMode::Serial: return "串口";
+        case DeviceUsbMode::TfCard: return "TF卡";
+        default: return "未知";
+    }
+}
+
+const char *device_settings_audio_output_mode_name(DeviceAudioOutputMode mode)
+{
+    switch (mode) {
+        case DeviceAudioOutputMode::NormalHeadphones: return "普通耳机";
+        case DeviceAudioOutputMode::LineOut: return "线路输出";
+        case DeviceAudioOutputMode::HighImpedanceHeadphones: return "高阻耳机";
+        default: return "未知";
+    }
+}
+
+const char *device_settings_audio_output_level_name(DeviceAudioOutputMode mode)
+{
+    switch (mode) {
+        // 三档由 AudioTask 安全切换 CS43131 OUT_FS/HV_EN；高阻耳机保持 HV_EN=0 的完整负载范围。
+        case DeviceAudioOutputMode::NormalHeadphones: return "0.5 Vrms";
+        case DeviceAudioOutputMode::LineOut: return "2.0 Vrms";
+        case DeviceAudioOutputMode::HighImpedanceHeadphones: return "1.41 Vrms";
+        default: return "--";
+    }
+}
+
+const char *device_settings_aux_key_mode_name(DeviceAuxKeyMode mode)
+{
+    switch (mode) {
+        case DeviceAuxKeyMode::Volume: return "音量";
+        case DeviceAuxKeyMode::Track: return "切歌";
+        default: return "未知";
+    }
+}
+
+const char *device_settings_animation_mode_name(DeviceAnimationMode mode)
+{
+    switch (mode) {
+        case DeviceAnimationMode::Auto: return "自动";
+        case DeviceAnimationMode::Full: return "完整";
+        case DeviceAnimationMode::Eco: return "省资源";
+        default: return "未知";
+    }
+}
+
+const char *device_settings_music_list_scope_name(DeviceMusicListScope scope)
+{
+    switch (scope) {
+        case DeviceMusicListScope::All: return "总列表";
+        case DeviceMusicListScope::Level1: return "一级列表";
+        case DeviceMusicListScope::Level2: return "二级列表";
+        default: return "未知";
+    }
+}
+
+const char *device_settings_music_library_source_name(DeviceMusicLibrarySource source)
+{
+    switch (source) {
+        case DeviceMusicLibrarySource::Local: return "本地曲库";
+        case DeviceMusicLibrarySource::Nas: return "NAS曲库";
+        default: return "未知";
+    }
+}

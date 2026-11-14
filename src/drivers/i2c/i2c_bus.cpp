@@ -1,0 +1,440 @@
+#include "i2c_bus.h"
+
+#include "esp_log.h"
+
+#include "board_pins.h"
+#include "app_diag_config.h"
+
+
+static const char *TAG = "I2C";
+
+#if APP_DIAG_BOOT_VERBOSE
+#define I2C_BOOT_LOGI(...) ESP_LOGI(TAG, __VA_ARGS__)
+#else
+#define I2C_BOOT_LOGI(...) APP_DIAG_DISCARDED_LOGI(TAG, __VA_ARGS__)
+#endif
+
+
+// I2C 主总线句柄
+static i2c_master_bus_handle_t g_i2c_bus = nullptr;
+
+// I2C1：CS43131 DAC 控制总线
+static i2c_master_bus_handle_t g_i2c_bus1 = nullptr;
+
+
+
+// ============================================================
+// 初始化 I2C 总线
+// ============================================================
+
+esp_err_t i2c_bus_init()
+{
+    if (g_i2c_bus != nullptr) {
+        return ESP_OK;
+    }
+
+
+    I2C_BOOT_LOGI("正在初始化 I2C 总线");
+
+    I2C_BOOT_LOGI(
+        "SCL = GPIO%d，SDA = GPIO%d",
+        FAKEPOD_I2C_SCL,
+        FAKEPOD_I2C_SDA);
+
+
+    i2c_master_bus_config_t config = {};
+
+    config.i2c_port = I2C_NUM_0;
+
+    config.sda_io_num =
+        static_cast<gpio_num_t>(
+            FAKEPOD_I2C_SDA
+        );
+
+    config.scl_io_num =
+        static_cast<gpio_num_t>(
+            FAKEPOD_I2C_SCL
+        );
+
+    config.clk_source =
+        I2C_CLK_SRC_DEFAULT;
+
+    config.glitch_ignore_cnt = 7;
+
+    // PCB 上已有硬件上拉。
+    // 开启内部弱上拉可提高调试阶段容错性。
+    config.flags.enable_internal_pullup = true;
+
+
+    esp_err_t ret =
+        i2c_new_master_bus(
+            &config,
+            &g_i2c_bus
+        );
+
+
+    if (ret == ESP_OK) {
+
+        ESP_LOGI(
+            TAG,
+            "I2C 总线初始化成功"
+        );
+
+    } else {
+
+        ESP_LOGE(
+            TAG,
+            "I2C 总线初始化失败：%s",
+            esp_err_to_name(ret)
+        );
+    }
+
+
+    return ret;
+}
+
+
+// ============================================================
+// 初始化 I2C1 总线（CS43131 DAC 控制）
+// ============================================================
+
+esp_err_t i2c_bus_init_secondary()
+{
+    if (g_i2c_bus1 != nullptr) {
+        return ESP_OK;
+    }
+
+    I2C_BOOT_LOGI(
+        "正在初始化 I2C1：SCL = GPIO%d，SDA = GPIO%d",
+        FAKEPOD_I2C1_SCL,
+        FAKEPOD_I2C1_SDA);
+
+    i2c_master_bus_config_t config = {};
+    config.i2c_port = I2C_NUM_1;
+    config.sda_io_num = static_cast<gpio_num_t>(FAKEPOD_I2C1_SDA);
+    config.scl_io_num = static_cast<gpio_num_t>(FAKEPOD_I2C1_SCL);
+    config.clk_source = I2C_CLK_SRC_DEFAULT;
+    config.glitch_ignore_cnt = 7;
+    config.flags.enable_internal_pullup = true;
+
+    esp_err_t ret = i2c_new_master_bus(&config, &g_i2c_bus1);
+
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "I2C1 总线初始化成功");
+    } else {
+        ESP_LOGE(TAG, "I2C1 总线初始化失败：%s", esp_err_to_name(ret));
+    }
+
+    return ret;
+}
+
+
+// ============================================================
+// 扫描 I2C 总线
+// ============================================================
+
+void i2c_bus_scan()
+{
+    if (g_i2c_bus == nullptr) {
+
+        ESP_LOGE(
+            TAG,
+            "I2C 尚未初始化，无法扫描"
+        );
+
+        return;
+    }
+
+
+    ESP_LOGI(
+        TAG,
+        "开始扫描 I2C 设备"
+    );
+
+
+    int found = 0;
+
+
+    for (
+        uint8_t address = 0x08;
+        address <= 0x77;
+        ++address
+    ) {
+
+        esp_err_t ret =
+            i2c_master_probe(
+                g_i2c_bus,
+                address,
+                20
+            );
+
+
+        if (ret == ESP_OK) {
+
+            const char *name =
+                "未知设备";
+
+
+            if (
+                address ==
+                FAKEPOD_ADDR_CST820
+            ) {
+
+                name = "CST820 触摸";
+
+            }
+            else if (
+                address ==
+                FAKEPOD_ADDR_QMI8658
+            ) {
+
+                name = "QMI8658 六轴";
+            }
+            else if (address == FAKEPOD_ADDR_CS43131) {
+                name = "CS43131 DAC";
+            }
+
+
+            ESP_LOGI(
+                TAG,
+                "发现设备：0x%02X [%s]",
+                address,
+                name
+            );
+
+
+            found++;
+        }
+    }
+
+
+    ESP_LOGI(
+        TAG,
+        "I2C 扫描完成，共发现 %d 个设备",
+        found
+    );
+}
+
+
+// ============================================================
+// 注册 I2C 设备
+// ============================================================
+
+esp_err_t i2c_bus_add_device(
+    uint8_t address,
+    i2c_master_dev_handle_t *handle
+)
+{
+    return i2c_bus_add_device_at_speed(
+        address,
+        400000,
+        handle
+    );
+}
+
+
+// ============================================================
+// 按指定速度注册 I2C 设备
+// ============================================================
+
+esp_err_t i2c_bus_add_device_at_speed(
+    uint8_t address,
+    uint32_t scl_speed_hz,
+    i2c_master_dev_handle_t *handle
+)
+{
+    if (
+        g_i2c_bus == nullptr ||
+        handle == nullptr ||
+        scl_speed_hz == 0
+    ) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    i2c_device_config_t config = {};
+    config.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+    config.device_address = address;
+    config.scl_speed_hz = scl_speed_hz;
+
+    return i2c_master_bus_add_device(
+        g_i2c_bus,
+        &config,
+        handle
+    );
+}
+
+
+// ============================================================
+// 在 I2C1 注册设备
+// ============================================================
+
+esp_err_t i2c_bus_add_device_secondary(
+    uint8_t address,
+    i2c_master_dev_handle_t *handle
+)
+{
+    if (g_i2c_bus1 == nullptr || handle == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    i2c_device_config_t config = {};
+    config.dev_addr_length = I2C_ADDR_BIT_LEN_7;
+    config.device_address = address;
+    // CS43131 控制口先使用 100kHz，提高初次通信时序裕量。
+    config.scl_speed_hz = 100000;
+
+    return i2c_master_bus_add_device(
+        g_i2c_bus1,
+        &config,
+        handle
+    );
+}
+
+
+// ============================================================
+// 注销 I2C 设备
+// ============================================================
+
+esp_err_t i2c_bus_remove_device(i2c_master_dev_handle_t *handle)
+{
+    if (handle == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (*handle == nullptr) {
+        return ESP_OK;
+    }
+
+    const esp_err_t ret = i2c_master_bus_rm_device(*handle);
+    if (ret == ESP_OK) {
+        *handle = nullptr;
+    }
+    return ret;
+}
+
+
+// ============================================================
+// 探测指定 I2C 地址
+// ============================================================
+
+esp_err_t i2c_bus_probe_address(
+    uint8_t address,
+    int timeout_ms
+)
+{
+    if (g_i2c_bus == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return i2c_master_probe(
+        g_i2c_bus,
+        address,
+        timeout_ms
+    );
+}
+
+
+// ============================================================
+// 在 I2C1 上探测指定地址
+// ============================================================
+
+esp_err_t i2c_bus_probe_address_secondary(
+    uint8_t address,
+    int timeout_ms
+)
+{
+    if (g_i2c_bus1 == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return i2c_master_probe(
+        g_i2c_bus1,
+        address,
+        timeout_ms
+    );
+}
+
+
+// ============================================================
+// 读取单字节寄存器
+// ============================================================
+
+esp_err_t i2c_bus_read_reg8(
+    i2c_master_dev_handle_t device,
+    uint8_t reg,
+    uint8_t *value
+)
+{
+    if (
+        device == nullptr ||
+        value == nullptr
+    ) {
+
+        return ESP_ERR_INVALID_ARG;
+    }
+
+
+    return i2c_master_transmit_receive(
+        device,
+        &reg,
+        1,
+        value,
+        1,
+        100
+    );
+}
+
+
+// ============================================================
+// 连续读取多个寄存器字节
+// ============================================================
+
+esp_err_t i2c_bus_read_bytes(
+    i2c_master_dev_handle_t device,
+    uint8_t reg,
+    uint8_t *data,
+    size_t length
+)
+{
+    if (device == nullptr || data == nullptr || length == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return i2c_master_transmit_receive(
+        device,
+        &reg,
+        1,
+        data,
+        length,
+        100
+    );
+}
+
+
+// ============================================================
+// 写入单字节寄存器
+// ============================================================
+
+esp_err_t i2c_bus_write_reg8(
+    i2c_master_dev_handle_t device,
+    uint8_t reg,
+    uint8_t value
+)
+{
+    if (device == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+
+    uint8_t data[2] = {
+        reg,
+        value
+    };
+
+
+    return i2c_master_transmit(
+        device,
+        data,
+        sizeof(data),
+        100
+    );
+}
