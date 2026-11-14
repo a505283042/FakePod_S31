@@ -73,7 +73,6 @@ def resolve_offsets(project_root: Path, build_dir: Path) -> tuple[dict[str, int]
     required = {
         "bootloader.bin",
         "partitions.bin",
-        "ota_data_initial.bin",
         "firmware.bin",
     }
     if required.issubset(flash_offsets):
@@ -84,17 +83,19 @@ def resolve_offsets(project_root: Path, build_dir: Path) -> tuple[dict[str, int]
         raise FileNotFoundError(f"找不到分区表：{partitions_csv}")
 
     partition_offsets = parse_partition_offsets(partitions_csv)
-    if "otadata" not in partition_offsets or "app0" not in partition_offsets:
-        raise ValueError("partitions.csv 缺少 otadata 或 app0，无法安全确定合并偏移")
+    if "app0" not in partition_offsets:
+        raise ValueError("partitions.csv 缺少 app0，无法安全确定合并偏移")
 
     # 当前工程为 ESP32-S3 + ESP-IDF 默认启动布局：Bootloader=0x0000，分区表=0x8000。
-    # otadata 与 app0 则直接从当前项目 partitions.csv 读取，避免与工程配置漂移。
+    # app0 直接从当前项目 partitions.csv 读取；若工程仍保留 otadata 分区则一并合并，
+    # 单槽布局（已移除 OTA 双槽）下自动跳过。
     offsets = {
         "bootloader.bin": 0x0000,
         "partitions.bin": 0x8000,
-        "ota_data_initial.bin": partition_offsets["otadata"],
         "firmware.bin": partition_offsets["app0"],
     }
+    if "otadata" in partition_offsets:
+        offsets["ota_data_initial.bin"] = partition_offsets["otadata"]
     return offsets, "partitions.csv + ESP32-S3 默认启动偏移"
 
 

@@ -114,6 +114,7 @@ static void system_ram_low_water_monitor_update()
             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA)),
             static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
 
+
         g_ram_mon_window_start_tick = now;
         g_ram_mon_min_60s = internal_free;
         g_ram_mon_below_12k_60s = 0U;

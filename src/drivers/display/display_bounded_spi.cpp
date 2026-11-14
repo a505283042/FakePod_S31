@@ -114,7 +114,8 @@ static DisplayBoundedSpiState g_bounded_spi = {};
 // 4 rows remains the low-memory fallback.  Full-width transfers are chunked, so wire format is unchanged.
 // Video优化：主路径提升到16行（29,440B internal RAM），将460行的strip数从58降到29，
 // 减少producer调用和QSPI header开销；内存不足时自动降级到8行再到4行。
-static constexpr uint16_t BOUNDED_SPI_STAGING_ROWS[] = {16U, 8U, 4U};
+// BLE(Bluedroid)启用后内部DMA堆更紧，再补2行/1行兜底，保证封面仍能刷新（只是transaction更多）。
+static constexpr uint16_t BOUNDED_SPI_STAGING_ROWS[] = {16U, 8U, 4U, 2U, 1U};
 static constexpr uint32_t BOUNDED_SPI_PANEL_DRAIN_TIMEOUT_MS = 80U;
 static constexpr uint32_t BOUNDED_SPI_QUEUE_TIMEOUT_MS = 20U;
 static constexpr uint32_t BOUNDED_SPI_RESULT_TIMEOUT_MS = 80U;
@@ -404,6 +405,19 @@ static esp_err_t display_bounded_spi_session_begin(const char *owner)
         }
         g_bounded_spi.dma_strip[0] = nullptr;
         g_bounded_spi.dma_strip[1] = nullptr;
+        // 限频诊断：记录分配失败时的DMA内部堆状况，便于区分“总量不足”与“碎片化”。
+        static TickType_t s_last_no_mem_log_tick = 0;
+        const TickType_t now_tick = xTaskGetTickCount();
+        if (s_last_no_mem_log_tick == 0 ||
+            now_tick - s_last_no_mem_log_tick >= pdMS_TO_TICKS(2000)) {
+            s_last_no_mem_log_tick = now_tick;
+            ESP_LOGW(TAG,
+                "BoundedSPI staging分配失败：最小need=%ux2B DMAfree=%u largestDMA=%u largestINT=%u",
+                static_cast<unsigned>(FAKEPOD_LCD_WIDTH) * 2U,
+                static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL)),
+                static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL)),
+                static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)));
+        }
         return ESP_ERR_NO_MEM;
     }
 

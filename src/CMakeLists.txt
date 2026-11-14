@@ -185,7 +185,6 @@ idf_component_register(
         nvs_flash
         fatfs
         bt
-        esp_hid
         esp_event
         esp_netif
         esp_wifi

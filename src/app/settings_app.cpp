@@ -1565,10 +1565,14 @@ static void bluetooth_switch_click_cb(lv_event_t *event)
         return;
     }
 
+    const bool controller_available = ble_remote_service_controller_supported();
     DeviceBluetoothMode next = DeviceBluetoothMode::Off;
     switch (settings.bluetooth_mode) {
         case DeviceBluetoothMode::Off: next = DeviceBluetoothMode::PhoneRemote; break;
-        case DeviceBluetoothMode::PhoneRemote: next = DeviceBluetoothMode::Controller; break;
+        case DeviceBluetoothMode::PhoneRemote:
+            // 第一阶段 HID Host 关闭：无手柄模式可选，直接在“手机遥控”和“关闭”间切换。
+            next = controller_available ? DeviceBluetoothMode::Controller : DeviceBluetoothMode::Off;
+            break;
         case DeviceBluetoothMode::Controller:
         default: next = DeviceBluetoothMode::Off; break;
     }

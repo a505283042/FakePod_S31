@@ -6,7 +6,7 @@
 #include "device_settings.h"
 
 // R46.0：BLE Foundation 负责蓝牙生命周期、广播和连接状态。
-// 手机遥控通过本服务的加密 GATT 写入入口调用现有 Player 控制，不让 APP 直接操作 NimBLE。
+// 手机遥控通过本服务的加密 GATT 写入入口调用现有 Player 控制，不让 APP 直接操作蓝牙协议栈。
 enum class BleRemoteState : uint8_t {
     Disabled = 0,
     Starting,
@@ -32,10 +32,13 @@ struct BleRemoteSnapshot {
 // 轻量初始化；不会在用户关闭 BLE 时启动蓝牙栈。
 esp_err_t ble_remote_service_init();
 
-// 只更新“用户意图”，真正的 NimBLE 启停由 update() 异步执行，避免阻塞 LVGL/loopTask。
+// 只更新“用户意图”，真正的蓝牙栈启停由 update() 异步执行，避免阻塞 LVGL/loopTask。
 void ble_remote_service_set_enabled(bool enabled);
 void ble_remote_service_set_mode(DeviceBluetoothMode mode);
 void ble_remote_service_update();
+
+// 第一阶段 HID Host 关闭，手柄（Controller）模式不可用；UI 据此跳过该选项。
+bool ble_remote_service_controller_supported();
 
 bool ble_remote_service_get_snapshot(BleRemoteSnapshot *out_snapshot);
 const char *ble_remote_service_state_name(BleRemoteState state);

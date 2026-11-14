@@ -175,11 +175,9 @@ pio device monitor
 | 分区 | 类型 | 偏移 | 大小 |
 |---|---|---|---|
 | nvs | data/nvs | 0x9000 | 20K |
-| otadata | data/ota | 0xe000 | 8K |
-| app0 | app/ota_0 | 0x10000 | 4M |
-| app1 | app/ota_1 | 0x410000 | 4M |
-| fontcache | data/0x40 | 0x810000 | 4M |
-| spiffs | data/spiffs | 0xc10000 | 3968K |
+| app0 | app/ota_0 | 0x10000 | 6M |
+| fontcache | data/0x40 | 0x610000 | 4M |
+| spiffs | data/spiffs | 0xa10000 | 6016K |
 | coredump | data/coredump | 0xff0000 | 64K |
 
 ---
@@ -320,7 +318,7 @@ python tests/host/test_library_row_recycling.py
 | `PermissionError: platforms.lock` | 系统存在多个 PlatformIO Core（提示 obsolete PIO Core），或对平台目录无写权限。清理多余安装、统一 Core 版本后重试。 |
 | TF 卡初始化失败 `sdmmc_card_init failed (0x107)` | 未插卡属正常（硬件无卡检测脚）；已插卡仍失败时检查卡座供电、CMD/D0–D3 上拉，或暂时降低 SDMMC 时钟验证时序。 |
 | 启动日志 `MMU page size mismatch (0x8000 vs 0x10000)` | 提示级信息，不影响运行；如需消除，可在后续统一 bootloader 与应用的 MMU 页大小配置。 |
-| 编译提示 app 分区接近上限 | 当前 app0/app1 各 4MB，固件已占约 91.7%；新增功能前建议扩分区或裁剪资源。 |
+| 编译提示 app 分区接近上限 | 已改为单槽 app0 6MB（占约 61.5%），保留约 2.4MB 余量；不再支持 OTA 双槽，升级走整片串口烧录。 |
 | 视频无法快进/快退 | 缺少同名 `.fvix` 索引，用视频转换工具重新生成。 |
 | 改动设置后未生效 | 「设置 → 应用 → 音乐播放器」中的部分选项需**离开整个设置 APP** 后才正式保存生效。 |
 | 烧录成功但串口反复复位 | USB-Serial-JTAG 在打开/关闭监视器时可能复位；确认端口号未变化，必要时重新上电后再连。 |
