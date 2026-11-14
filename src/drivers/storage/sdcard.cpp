@@ -86,12 +86,11 @@ esp_err_t sdcard_init()
         SDMMC_HOST_DEFAULT();
 
 
-    // 稳定模式固定使用 20MHz。
-    // 实测 40MHz High Speed 在首次大曲库连续目录查找时可能出现单次文件访问长时间不返回，
-    // 即使卡片声明支持高速模式，也不能代表具体 PCB 走线、上拉和卡片组合在该频率下稳定。
-    // 建库性能继续通过减少重复路径查找和分阶段建库优化，不再用提高总线频率换取稳定性。
+    // 40MHz High Speed 试验：板级参考值即 40MHz，驱动会自动用 CMD6 协商高速时序；
+    // 卡片不支持 HS 时驱动仅回落 20MHz，不会导致挂载失败。
+    // 若实机出现访问长时间不返回/超时，改回 SDMMC_FREQ_DEFAULT(20MHz)。
     host.max_freq_khz =
-        SDMMC_FREQ_DEFAULT;
+        SDMMC_FREQ_HIGHSPEED;
 
 
     // ========================================================

@@ -96,7 +96,8 @@ static void raw_sd_cleanup()
 static esp_err_t raw_sd_init()
 {
     g_host = SDMMC_HOST_DEFAULT();
-    g_host.max_freq_khz = SDMMC_FREQ_DEFAULT;
+    // 与 sdcard.cpp 保持一致：40MHz High Speed（卡片不支持时驱动自动回落 20MHz）。
+    g_host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
 
     sdmmc_slot_config_t slot = SDMMC_SLOT_CONFIG_DEFAULT();
     slot.width = 4;
