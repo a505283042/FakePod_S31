@@ -11,6 +11,8 @@
 #include "esp_heap_caps.h"
 #include "esp_jpeg_dec.h"
 #include "esp_log.h"
+
+#include "ppa_ops.h"
 #include "esp_timer.h"
 #include "png.h"
 
@@ -39,6 +41,8 @@ static constexpr uint32_t COVER_COOPERATIVE_ROW_INTERVAL = 32U;
 static constexpr uint8_t COVER_TINT_HUE_BINS = 18U;
 static constexpr size_t COVER_SURFACE_BYTES =
     static_cast<size_t>(FAKEPOD_LCD_WIDTH) * static_cast<size_t>(FAKEPOD_LCD_HEIGHT) * 2U;
+// PPA 要求 PSRAM 输出缓冲地址与长度按 64B cache line 对齐，Surface 分配相应留出尾部余量。
+static constexpr size_t COVER_SURFACE_BYTES_ALIGNED = (COVER_SURFACE_BYTES + 63U) & ~static_cast<size_t>(63U);
 
 struct CoverRequest
 {
@@ -407,8 +411,8 @@ static bool cover_psram_budget_ok(size_t source_bytes, bool need_dimmed)
 static uint8_t *cover_alloc_surface()
 {
     return static_cast<uint8_t *>(heap_caps_aligned_alloc(
-        16U,
-        COVER_SURFACE_BYTES,
+        64U,
+        COVER_SURFACE_BYTES_ALIGNED,
         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
 }
 
@@ -796,16 +800,12 @@ static esp_err_t cover_render_surface(
         for (uint32_t y = 0; y < FAKEPOD_LCD_HEIGHT; ++y) {
             const uint16_t *src_row = jpeg.data + static_cast<size_t>(ymap[y]) * sw;
             uint16_t *normal_row = normal16 + static_cast<size_t>(y) * FAKEPOD_LCD_WIDTH;
-            uint16_t *dimmed_row = need_dimmed
-                ? dimmed16 + static_cast<size_t>(y) * FAKEPOD_LCD_WIDTH
-                : nullptr;
             const bool tint_row = y == next_tint_y && y < tint_y_end;
             if (tint_row) next_tint_y += tint_step_y;
             uint32_t next_tint_x = tint_x_begin;
             for (uint32_t x = 0; x < FAKEPOD_LCD_WIDTH; ++x) {
                 const uint16_t pixel = src_row[xmap[x]];
                 normal_row[x] = pixel;
-                if (dimmed_row != nullptr) dimmed_row[x] = cover_dim_rgb565(pixel);
                 if (tint_row && x == next_tint_x && x < tint_x_end) {
                     cover_tint_accumulate(&tint_acc, pixel);
                     next_tint_x += tint_step_x;
@@ -821,16 +821,12 @@ static esp_err_t cover_render_surface(
         for (uint32_t y = 0; y < FAKEPOD_LCD_HEIGHT; ++y) {
             const uint8_t *src_row = png.data + static_cast<size_t>(ymap[y]) * sw * 3U;
             uint16_t *normal_row = normal16 + static_cast<size_t>(y) * FAKEPOD_LCD_WIDTH;
-            uint16_t *dimmed_row = need_dimmed
-                ? dimmed16 + static_cast<size_t>(y) * FAKEPOD_LCD_WIDTH
-                : nullptr;
             const bool tint_row = y == next_tint_y && y < tint_y_end;
             if (tint_row) next_tint_y += tint_step_y;
             uint32_t next_tint_x = tint_x_begin;
             for (uint32_t x = 0; x < FAKEPOD_LCD_WIDTH; ++x) {
                 const uint16_t pixel = cover_rgb888_to_rgb565(src_row + static_cast<size_t>(xmap[x]) * 3U);
                 normal_row[x] = pixel;
-                if (dimmed_row != nullptr) dimmed_row[x] = cover_dim_rgb565(pixel);
                 if (tint_row && x == next_tint_x && x < tint_x_end) {
                     cover_tint_accumulate(&tint_acc, pixel);
                     next_tint_x += tint_step_x;
@@ -838,6 +834,24 @@ static esp_err_t cover_render_surface(
             }
             if (((y + 1U) % COVER_COOPERATIVE_ROW_INTERVAL) == 0U) {
                 vTaskDelay(1);
+            }
+        }
+    }
+
+    // dimmed Surface：优先用 PPA blend 一次压暗（固定黑色 + A8 alpha），
+    // 省掉逐像素循环；PPA 不可用时回退到原软件实现。
+    if (need_dimmed && dimmed16 != nullptr) {
+        if (!ppa_dim_rgb565(normal16, dimmed16, FAKEPOD_LCD_WIDTH, FAKEPOD_LCD_HEIGHT,
+                            COVER_SURFACE_BYTES_ALIGNED, nullptr)) {
+            for (uint32_t y = 0; y < FAKEPOD_LCD_HEIGHT; ++y) {
+                const uint16_t *normal_row = normal16 + static_cast<size_t>(y) * FAKEPOD_LCD_WIDTH;
+                uint16_t *dimmed_row = dimmed16 + static_cast<size_t>(y) * FAKEPOD_LCD_WIDTH;
+                for (uint32_t x = 0; x < FAKEPOD_LCD_WIDTH; ++x) {
+                    dimmed_row[x] = cover_dim_rgb565(normal_row[x]);
+                }
+                if (((y + 1U) % COVER_COOPERATIVE_ROW_INTERVAL) == 0U) {
+                    vTaskDelay(1);
+                }
             }
         }
     }
@@ -1248,12 +1262,15 @@ bool cover_surface_cache_restore_dimmed(uint32_t track_index)
 
     const uint16_t *src = reinterpret_cast<const uint16_t *>(normal_lease.normal_rgb565);
     uint16_t *dst = reinterpret_cast<uint16_t *>(dimmed);
-    for (uint32_t y = 0U; y < FAKEPOD_LCD_HEIGHT; ++y) {
-        const size_t row = static_cast<size_t>(y) * FAKEPOD_LCD_WIDTH;
-        for (uint32_t x = 0U; x < FAKEPOD_LCD_WIDTH; ++x) {
-            dst[row + x] = cover_dim_rgb565(src[row + x]);
+    if (!ppa_dim_rgb565(src, dst, FAKEPOD_LCD_WIDTH, FAKEPOD_LCD_HEIGHT,
+                        COVER_SURFACE_BYTES_ALIGNED, nullptr)) {
+        for (uint32_t y = 0U; y < FAKEPOD_LCD_HEIGHT; ++y) {
+            const size_t row = static_cast<size_t>(y) * FAKEPOD_LCD_WIDTH;
+            for (uint32_t x = 0U; x < FAKEPOD_LCD_WIDTH; ++x) {
+                dst[row + x] = cover_dim_rgb565(src[row + x]);
+            }
+            if (((y + 1U) % COVER_COOPERATIVE_ROW_INTERVAL) == 0U) vTaskDelay(1);
         }
-        if (((y + 1U) % COVER_COOPERATIVE_ROW_INTERVAL) == 0U) vTaskDelay(1);
     }
 
     bool installed = false;

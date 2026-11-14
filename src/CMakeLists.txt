@@ -58,6 +58,8 @@ idf_component_register(
 
         "drivers/jpeg/jpeg_hw_decoder.cpp"
 
+        "drivers/ppa/ppa_ops.cpp"
+
         "drivers/audio/cs43131.cpp"
         "drivers/audio/i2s_output.c"
 
@@ -136,6 +138,8 @@ idf_component_register(
 
         "drivers/touch"
 
+        "drivers/ppa"
+
         "drivers/imu"
 
         "drivers/storage"
@@ -171,6 +175,7 @@ idf_component_register(
         esp_driver_spi
         esp_lcd
         esp_driver_jpeg
+        esp_driver_ppa
         esp_lv_decoder
         esp_new_jpeg
         libpng

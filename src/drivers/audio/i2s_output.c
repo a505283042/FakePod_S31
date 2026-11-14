@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "driver/i2s_std.h"
+#include "esp_clk_tree.h"
 #include "esp_log.h"
 
 #include "board_pins.h"
@@ -31,6 +32,29 @@ static uint32_t g_sample_rate_hz = 0;
 
 // 静音源不需要与 DMA 单描述符等长；64帧循环写即可，常驻 Internal 从2048B降到512B。
 static uint32_t g_silence[I2S_SILENCE_FRAMES_PER_CHUNK * 2U] = {0};
+
+// ESP32-S31 的 I2S_CLK_SRC_DEFAULT 是 XTAL(40MHz)，且驱动要求 sclk > 1.99 * mclk，
+// mclk = 采样率 × 256。因此采样率超过约 78.4kHz 时 XTAL 必然报
+// "sample rate is too large"。此时改用 APLL：APLL 由 I2S 驱动按 mclk 自动定频，
+// 96k/176.4k/192k 分别只需 49.152/90.3168/98.304MHz，均在 125MHz 上限以内。
+static bool i2s_output_should_use_apll(uint32_t sample_rate_hz, uint32_t *xtal_hz_out)
+{
+    const uint64_t mclk_hz = (uint64_t)sample_rate_hz * I2S_MCLK_MULTIPLE_256;
+    uint32_t xtal_hz = 0;
+    esp_err_t ret = esp_clk_tree_src_get_freq_hz(
+        SOC_MOD_CLK_XTAL,
+        ESP_CLK_TREE_SRC_FREQ_PRECISION_CACHED,
+        &xtal_hz
+    );
+    if (ret != ESP_OK || xtal_hz == 0U) {
+        // 查询失败时按 S31 的 40MHz 晶振经验值兜底。
+        xtal_hz = 40000000U;
+    }
+    if (xtal_hz_out != NULL) {
+        *xtal_hz_out = xtal_hz;
+    }
+    return (double)xtal_hz <= (double)mclk_hz * 1.99;
+}
 
 static esp_err_t i2s_output_create_channel(uint32_t sample_rate_hz, uint8_t dma_desc_override)
 {
@@ -81,6 +105,15 @@ static esp_err_t i2s_output_create_channel(uint32_t sample_rate_hz, uint8_t dma_
             },
         },
     };
+
+    uint32_t xtal_hz = 0;
+    if (i2s_output_should_use_apll(sample_rate_hz, &xtal_hz)) {
+        std_cfg.clk_cfg.clk_src = I2S_CLK_SRC_APLL;
+        ESP_LOGI(TAG, "高采样率 %luHz：I2S 时钟源切换为 APLL（XTAL %luHz 无法满足 %u 倍 mclk 需求）",
+            (unsigned long)sample_rate_hz,
+            (unsigned long)xtal_hz,
+            (unsigned)I2S_MCLK_MULTIPLE_256);
+    }
 
     ret = i2s_channel_init_std_mode(g_tx, &std_cfg);
     if (ret != ESP_OK) {
