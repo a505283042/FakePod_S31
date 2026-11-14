@@ -215,6 +215,7 @@ pio device monitor
 8. **IDF 6.1 兼容**：NAS 配网从 mbedTLS legacy GCM/PKCS5 迁移到 PSA Crypto；`esp_tinyusb` 升级到 `3.0.1`；esp-dsp 卡尔曼模块补充 `<cmath>`；GCC 15 告警降级。
 9. **BLE 配置**：S31 打开 Central + GATT Client（esp_hid 主机侧需要），并移除 S31 不存在的 `BT_CTRL_BLE_MAX_ACT`。
 10. **BoundedSPI 放开 IDF 6.1**：原实现将直连 QSPI 的 Panel IO 私有前缀复用限定在 ESP-IDF 5.5.3，S31 上会静默回退并导致上滑圆环、封面直写、视频直出全部失效。已核对 6.1 的 `esp_lcd_panel_io_spi_t` 前缀字段顺序一致，纳入白名单；运行时仍由字段复核保证不匹配时自动回退。
+11. **硬件 JPEG 解码**：新增 `drivers/jpeg/jpeg_hw_decoder`，封装 S31 片内 JPEG 编解码引擎（`esp_driver_jpeg`），替换封面、图片 APP、视频 MJPEG 帧三条链路的软件解码，并保留 `esp_new_jpeg` 回退。要点：仅支持 baseline（progressive 自动回退）、宽高乘积需能被 8 整除、输出按 MCU 对齐（460×460 填充到 464×464）后由封装裁切、硬件引擎单实例加锁互斥、对齐缓冲按最大帧常驻 PSRAM。实测首帧 1400×1400 封面解码 33.6ms。
 
 ---
 

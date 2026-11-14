@@ -18,6 +18,7 @@
 #include "artwork_loader.h"
 #include "artwork_source_context.h"
 #include "board_pins.h"
+#include "drivers/jpeg/jpeg_hw_decoder.h"
 #include "media_catalog_v2.h"
 
 static const char *TAG = "封面预处理";
@@ -461,6 +462,16 @@ static esp_err_t cover_decode_jpeg(
 
     io.outbuf = buffer;
     io.out_size = static_cast<int>(bytes64);
+    // S31 硬件 JPEG 优先；失败（progressive/尺寸限制等）原样回退软件解码。
+    if (jpeg_hw_decode_rgb565(lease.data, lease.size, buffer,
+            static_cast<size_t>(bytes64), JPEG_HW_ORDER_LE,
+            nullptr, nullptr)) {
+        jpeg_dec_close(decoder);
+        out->data = reinterpret_cast<uint16_t *>(buffer);
+        out->width = static_cast<uint32_t>(info.width);
+        out->height = static_cast<uint32_t>(info.height);
+        return ESP_OK;
+    }
     ret = jpeg_dec_process(decoder, &io);
     jpeg_dec_close(decoder);
     if (ret != JPEG_ERR_OK) {

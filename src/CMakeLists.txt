@@ -56,6 +56,8 @@ idf_component_register(
         "drivers/display/display.cpp"
         "drivers/display/display_bounded_spi.cpp"
 
+        "drivers/jpeg/jpeg_hw_decoder.cpp"
+
         "drivers/audio/cs43131.cpp"
         "drivers/audio/i2s_output.c"
 
@@ -140,6 +142,8 @@ idf_component_register(
 
         "drivers/display"
 
+        "drivers/jpeg"
+
         "drivers/audio"
 
         "audio"
@@ -166,6 +170,7 @@ idf_component_register(
         esp_driver_sdmmc
         esp_driver_spi
         esp_lcd
+        esp_driver_jpeg
         esp_lv_decoder
         esp_new_jpeg
         libpng

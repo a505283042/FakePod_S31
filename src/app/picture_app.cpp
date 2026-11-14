@@ -16,6 +16,7 @@
 
 #include "lvgl.h"
 #include "app_manager.h"
+#include "drivers/jpeg/jpeg_hw_decoder.h"
 #include "font/font_manager.h"
 #include "ui/gesture/gesture_router.h"
 
@@ -161,6 +162,15 @@ static bool decode_jpeg(const char *path)
 
     io.outbuf = g_rgb565;
     io.out_size = static_cast<int>(out_size);
+    // S31 硬件 JPEG 优先；失败（progressive 等）回退软件解码。
+    if (jpeg_hw_decode_rgb565(buf, static_cast<size_t>(size), g_rgb565, out_size,
+            JPEG_HW_ORDER_LE, nullptr, nullptr)) {
+        jpeg_dec_close(decoder);
+        heap_caps_free(buf);
+        g_img_width = sw;
+        g_img_height = sh;
+        return true;
+    }
     ret = jpeg_dec_process(decoder, &io);
     jpeg_dec_close(decoder);
     heap_caps_free(buf);

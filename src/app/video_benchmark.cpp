@@ -14,6 +14,7 @@
 #include "audio/audio_service.h"
 #include "audio/sources/avi_mp3_audio_source.h"
 #include "avi_demuxer.h"
+#include "drivers/jpeg/jpeg_hw_decoder.h"
 #include "video_media_io.h"
 #include "video_seek_index.h"
 #include "video_jpeg_probe.h"
@@ -619,6 +620,15 @@ static esp_err_t decode_frame(
 
     io.outbuf = slot->rgb565_be;
     io.out_size = static_cast<int>(kRgb565Bytes);
+    // S31 硬件 JPEG 优先；失败（progressive 等）回退软件解码。
+    if (jpeg_hw_decode_rgb565(data, size, slot->rgb565_be, expected_rgb565_bytes,
+            JPEG_HW_ORDER_BE, nullptr, nullptr)) {
+        *out_decode_us = static_cast<uint32_t>(esp_timer_get_time() - started_us);
+        slot->width = static_cast<uint16_t>(info.width);
+        slot->height = static_cast<uint16_t>(info.height);
+        slot->rgb565_bytes = expected_rgb565_bytes;
+        return ESP_OK;
+    }
     jpeg_ret = jpeg_dec_process(decoder, &io);
     *out_decode_us = static_cast<uint32_t>(esp_timer_get_time() - started_us);
     if (jpeg_ret != JPEG_ERR_OK) return ESP_ERR_INVALID_RESPONSE;
