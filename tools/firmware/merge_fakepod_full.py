@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""将 PlatformIO 生成的 4 个 ESP32-S3 固件镜像合并为可从 0x0000 烧录的完整镜像。"""
+"""将 PlatformIO 生成的 4 个 ESP32-S31 固件镜像合并为可从 0x0000 烧录的完整镜像。"""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import shlex
 import sys
 from pathlib import Path
 
-DEFAULT_ENV = "fakepod_nano"
+DEFAULT_ENV = "fakepod_s31"
 OUTPUT_NAME = "FakePod_Full.bin"
 
 

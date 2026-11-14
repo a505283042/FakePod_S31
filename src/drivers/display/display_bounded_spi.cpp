@@ -33,7 +33,8 @@ static const char *TAG = "显示";
 // portMAX_DELAY 的 bus acquire/result recycle；Launcher 已迁移并通过压力测试；
 // 主页 Cover 也已迁入同一传输层，彻底移除对旧 ContinuousGRAM 的运行时依赖。
 //
-// 本模块不再调用上述 Panel IO 发送入口。项目固定 ESP-IDF 5.5.3，因此使用官方源中可验证的
+// 本模块不再调用上述 Panel IO 发送入口。官方源中的 esp_lcd_panel_io_spi_t 在 5.5.3 与 6.1
+// 保持同一前缀布局，因此使用可验证的
 // esp_lcd_panel_io_spi_t 前缀布局取得其唯一 spi_device_handle_t 和 num_trans_inflight：
 // 1) 在同一个 LVGL Task 内先用有限 get_trans_result() 回收 Panel IO 已提交事务；
 // 2) 再直接向同一个 spi_device queue 本模块自己的 raw descriptor；
@@ -60,6 +61,19 @@ struct DisplayPanelIoSpiV553Prefix
     int lcd_cmd_bits;
     int lcd_param_bits;
 };
+
+// 可复用该私有前缀布局的 ESP-IDF 版本：
+// - 5.5.3：原 ESP32-S3 工程验证版本；
+// - 6.1.x：ESP32-S31 移植版，esp_lcd_panel_io_spi_t 前缀字段顺序与 5.5.3 完全一致。
+// 运行时仍由 display_bounded_spi_abi_valid() 复核 spi_dev / dc_gpio_num / 位宽 / queue_size，
+// 任何字段不符都会自动回退到 LVGL 传输链，不会触碰错误偏移。
+#if (ESP_IDF_VERSION_MAJOR == 5 && ESP_IDF_VERSION_MINOR == 5 && ESP_IDF_VERSION_PATCH == 3)
+#define DISPLAY_BOUNDED_SPI_PANEL_IO_ABI_SUPPORTED 1
+#elif (ESP_IDF_VERSION_MAJOR == 6 && ESP_IDF_VERSION_MINOR == 1)
+#define DISPLAY_BOUNDED_SPI_PANEL_IO_ABI_SUPPORTED 1
+#else
+#define DISPLAY_BOUNDED_SPI_PANEL_IO_ABI_SUPPORTED 0
+#endif
 
 // SPI driver 在 SPI_TRANS_VARIABLE_ADDR 下会把 spi_transaction_t 后的前三字节解释为
 // command_bits/address_bits/dummy_bits；esp_lcd SPI device 的 post-callback 又会把同一尾部
@@ -115,7 +129,7 @@ static constexpr uint32_t display_bounded_qspi_header(uint32_t opcode, uint8_t c
 
 static DisplayPanelIoSpiV553Prefix *display_panel_io_spi_v553_prefix()
 {
-#if ESP_IDF_VERSION_MAJOR == 5 && ESP_IDF_VERSION_MINOR == 5 && ESP_IDF_VERSION_PATCH == 3
+#if DISPLAY_BOUNDED_SPI_PANEL_IO_ABI_SUPPORTED
     return reinterpret_cast<DisplayPanelIoSpiV553Prefix *>(display_get_panel_io());
 #else
     return nullptr;
@@ -125,7 +139,7 @@ static DisplayPanelIoSpiV553Prefix *display_panel_io_spi_v553_prefix()
 static bool display_bounded_spi_abi_valid(DisplayPanelIoSpiV553Prefix *io)
 {
     // 当前板卡是 CO5300 QSPI：无独立 D/C、32-bit QSPI header、8-bit 参数。
-    // 只有这组已验证配置才允许触碰 IDF 5.5.3 的 Panel IO 私有前缀。
+    // 只有这组已验证配置才允许触碰 Panel IO 私有前缀。
     return io != nullptr && io->spi_dev != nullptr && io->dc_gpio_num < 0 &&
         io->lcd_cmd_bits == 32 && io->lcd_param_bits == 8 && io->queue_size >= 2U &&
         io->spi_trans_max_bytes > 0U;
@@ -141,11 +155,11 @@ static bool display_bounded_spi_available_internal()
 
 bool display_launcher_bounded_spi_available()
 {
-#if !(ESP_IDF_VERSION_MAJOR == 5 && ESP_IDF_VERSION_MINOR == 5 && ESP_IDF_VERSION_PATCH == 3)
+#if !DISPLAY_BOUNDED_SPI_PANEL_IO_ABI_SUPPORTED
     static bool warned = false;
     if (!warned) {
         warned = true;
-        ESP_LOGW(TAG, "BoundedSPI仅验证 ESP-IDF 5.5.3；当前版本 %d.%d.%d 固定回退 LVGL 传输链",
+        ESP_LOGW(TAG, "BoundedSPI 仅支持 ESP-IDF 5.5.3 / 6.1.x；当前版本 %d.%d.%d 固定回退 LVGL 传输链",
             ESP_IDF_VERSION_MAJOR, ESP_IDF_VERSION_MINOR, ESP_IDF_VERSION_PATCH);
     }
 #endif
