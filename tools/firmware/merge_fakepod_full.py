@@ -32,16 +32,8 @@ def parse_partition_offsets(partitions_csv: Path) -> dict[str, int]:
     return offsets
 
 
-def parse_flash_args(build_dir: Path) -> dict[str, int]:
-    """优先读取 PlatformIO/ESP-IDF 生成的实际烧录参数，避免硬编码偏移。"""
-    wanted = {
-        "bootloader.bin",
-        "partitions.bin",
-        "ota_data_initial.bin",
-        "firmware.bin",
-    }
-    result: dict[str, int] = {}
-
+def parse_flash_args(build_dir: Path) -> list[tuple[int, str]]:
+    """读取 PlatformIO/ESP-IDF 生成的 (偏移, 镜像路径) 列表，避免硬编码偏移。"""
     for name in ("flash_args", "flash_project_args"):
         path = build_dir / name
         if not path.is_file():
@@ -52,31 +44,45 @@ def parse_flash_args(build_dir: Path) -> dict[str, int]:
         except OSError:
             continue
 
+        entries: list[tuple[int, str]] = []
         for index in range(len(tokens) - 1):
-            token = tokens[index]
-            image = Path(tokens[index + 1]).name
-            if image not in wanted:
-                continue
             try:
-                result[image] = parse_int(token)
+                offset = parse_int(tokens[index])
             except ValueError:
                 continue
+            image = tokens[index + 1]
+            if not image.lower().endswith(".bin") or image.startswith("--"):
+                continue
+            entries.append((offset, image))
+        if entries:
+            return entries
 
-        if wanted.issubset(result):
-            return result
-
-    return result
+    return []
 
 
 def resolve_offsets(project_root: Path, build_dir: Path) -> tuple[dict[str, int], str]:
-    flash_offsets = parse_flash_args(build_dir)
+    offsets: dict[str, int] = {}
+    for offset, image in parse_flash_args(build_dir):
+        base = Path(image).name.lower()
+        target = Path(image).name
+        if not (build_dir / target).is_file():
+            continue
+        if "bootloader" in base:
+            offsets["bootloader.bin"] = offset
+        elif "partition" in base:
+            offsets["partitions.bin"] = offset
+        elif "ota_data" in base:
+            offsets["ota_data_initial.bin"] = offset
+        else:
+            offsets["firmware.bin"] = offset
+
     required = {
         "bootloader.bin",
         "partitions.bin",
         "firmware.bin",
     }
-    if required.issubset(flash_offsets):
-        return flash_offsets, "PlatformIO flash_args"
+    if required.issubset(offsets):
+        return offsets, "PlatformIO flash_args"
 
     partitions_csv = project_root / "partitions.csv"
     if not partitions_csv.is_file():
@@ -86,17 +92,14 @@ def resolve_offsets(project_root: Path, build_dir: Path) -> tuple[dict[str, int]
     if "app0" not in partition_offsets:
         raise ValueError("partitions.csv 缺少 app0，无法安全确定合并偏移")
 
-    # 当前工程为 ESP32-S3 + ESP-IDF 默认启动布局：Bootloader=0x0000，分区表=0x8000。
-    # app0 直接从当前项目 partitions.csv 读取；若工程仍保留 otadata 分区则一并合并，
-    # 单槽布局（已移除 OTA 双槽）下自动跳过。
-    offsets = {
-        "bootloader.bin": 0x0000,
-        "partitions.bin": 0x8000,
-        "firmware.bin": partition_offsets["app0"],
-    }
+    # ESP32-S31 的实际启动布局由 flash_args 给出：Bootloader=0x2000，分区表=0x8000。
+    # 注意不是 ESP32 的 0x1000，也不是 ESP32-S3 的 0x0000；写错会导致 ROM 报 invalid header。
+    offsets.setdefault("bootloader.bin", 0x2000)
+    offsets.setdefault("partitions.bin", 0x8000)
+    offsets["firmware.bin"] = partition_offsets["app0"]
     if "otadata" in partition_offsets:
         offsets["ota_data_initial.bin"] = partition_offsets["otadata"]
-    return offsets, "partitions.csv + ESP32-S3 默认启动偏移"
+    return offsets, "partitions.csv + ESP32-S31 启动偏移"
 
 
 def sha256_file(path: Path) -> str:

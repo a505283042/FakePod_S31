@@ -1646,6 +1646,28 @@ static esp_err_t media_library_scan_with_scratch(
         return ESP_ERR_NO_MEM;
     }
 
+    // 去重：Catalog 校验要求路径在忽略大小写比较下严格递增；FAT 卡上若残留
+    // 仅大小写不同的重复条目，整库构建会直接失败。这里保留排序后的第一条，
+    // 丢弃后续重复项，用单曲跳过换取整库可用。
+    for (size_t i = 1U; i < g_entry_count;) {
+        const char *previous_path = g_path_pool + g_entries[i - 1U].path_offset;
+        const char *path = g_path_pool + g_entries[i].path_offset;
+        if (strcasecmp(previous_path, path) != 0) {
+            ++i;
+            continue;
+        }
+        record_scan_issue(path, "路径与已收录歌曲忽略大小写后重复，本次已跳过");
+        media_library_drop_metadata(&g_entries[i]);
+        media_library_drop_artwork(&g_entries[i]);
+        if (i + 1U < g_entry_count) {
+            memmove(&g_entries[i], &g_entries[i + 1U],
+                (g_entry_count - i - 1U) * sizeof(MediaEntry));
+        }
+        g_entry_count--;
+        g_entries[g_entry_count] = {};
+        skipped_track_count++;
+    }
+
     // 全库未变化且旧 V2 来自 final 时直接发布已经完整校验过的旧 Catalog。
     // 这样大曲库第二次启动不需要同时保留“旧 Catalog + 新 Catalog”两份 PSRAM。
     bool reuse_whole_catalog = have_previous_v2 &&
@@ -1982,6 +2004,85 @@ static esp_err_t media_library_scan_with_scratch(
             media_catalog_v2_release(&next_catalog);
             catalog_ret = media_catalog_v2_build_from_index_records(
                 g_entries, g_entry_count, g_path_pool, g_path_size, &next_catalog);
+        }
+    }
+
+    // 兜底：整库校验失败时用前缀二分定位问题曲目，只降级出问题的那一首，
+    // 其余歌曲的元数据保持不变；实在放不进曲库的曲目才跳过。
+    for (uint32_t attempt = 0U;
+         catalog_ret != ESP_OK && media_library_is_track_catalog_error(catalog_ret) &&
+         attempt < 64U && g_entry_count > 0U; ++attempt) {
+        // 已知整库失败、空前缀成功；二分找最小的失败前缀。
+        size_t prefix_ok = 0U;
+        size_t prefix_bad = g_entry_count;
+        bool probe_error = false;
+        while (prefix_ok + 1U < prefix_bad) {
+            const size_t mid = prefix_ok + (prefix_bad - prefix_ok) / 2U;
+            media_catalog_v2_release(&next_catalog);
+            const esp_err_t probe = media_catalog_v2_build_from_index_records(
+                g_entries, mid, g_path_pool, g_path_size, &next_catalog);
+            if (probe == ESP_OK) {
+                prefix_ok = mid;
+            } else if (media_library_is_track_catalog_error(probe)) {
+                prefix_bad = mid;
+            } else {
+                catalog_ret = probe;
+                probe_error = true;
+                break;
+            }
+        }
+        if (probe_error) {
+            break;
+        }
+
+        const size_t index = prefix_bad - 1U;
+        const char *path = g_path_pool + g_entries[index].path_offset;
+
+        // 先只丢弃这一首的可选元数据，标题回退文件名。
+        media_library_drop_metadata(&g_entries[index]);
+        media_catalog_v2_release(&next_catalog);
+        catalog_ret = media_catalog_v2_build_from_index_records(
+            g_entries, g_entry_count, g_path_pool, g_path_size, &next_catalog);
+        if (catalog_ret == ESP_OK) {
+            record_scan_issue(path, "该歌曲元数据无法通过整库校验，已降级为文件名条目");
+            ESP_LOGW(TAG, "整库校验失败，已仅降级问题曲目：%s", path);
+            break;
+        }
+
+        // 元数据降级后仍失败，才把这一首从曲库中跳过。
+        if (have_previous_v2) {
+            const TrackRowV2 *old_track = nullptr;
+            const MediaManifestRecordV2 *old_manifest = nullptr;
+            if (media_catalog_store_v2_find(&previous_v2, path, &old_track, &old_manifest) && old_track != nullptr) {
+                const bool was_updated = old_manifest != nullptr &&
+                    (old_track->format != g_entries[index].format || old_manifest->format != g_entries[index].format ||
+                     old_manifest->file_size_bytes != g_entries[index].file_size_bytes ||
+                     old_manifest->modified_time != g_entries[index].modified_time);
+                if (was_updated && updated_count > 0U) {
+                    updated_count--;
+                }
+                removed_count++;
+                notify_changes_detected();
+            } else if (added_count > 0U) {
+                added_count--;
+            }
+        }
+        media_library_drop_artwork(&g_entries[index]);
+        if (index + 1U < g_entry_count) {
+            memmove(&g_entries[index], &g_entries[index + 1U],
+                (g_entry_count - index - 1U) * sizeof(MediaEntry));
+        }
+        g_entry_count--;
+        g_entries[g_entry_count] = {};
+        skipped_track_count++;
+        record_scan_issue(path, "该歌曲无法通过整库校验，本次已跳过");
+
+        media_catalog_v2_release(&next_catalog);
+        catalog_ret = media_catalog_v2_build_from_index_records(
+            g_entries, g_entry_count, g_path_pool, g_path_size, &next_catalog);
+        if (catalog_ret == ESP_OK) {
+            ESP_LOGW(TAG, "整库校验失败，已跳过问题曲目：%s", path);
+            break;
         }
     }
     const int64_t catalog_build_finished_us = esp_timer_get_time();
