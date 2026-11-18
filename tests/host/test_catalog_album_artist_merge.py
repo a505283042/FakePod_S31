@@ -140,6 +140,9 @@ def test_catalog_recovery_never_bisects_and_discards_an_arbitrary_prefix_track()
     assert "prefix_ok" not in source
     assert "已保留上一次有效曲库" in source
     assert "media_catalog_v2_publish(&next_catalog, fallback_crc)" in source
+    assert "case_insensitive != 0 ? case_insensitive : strcmp(path_a, path_b)" in source
+    assert "entry.scan_artwork_changed" in source
+    assert "existing_path_count = 0U" in source
 
 
 if __name__ == "__main__":

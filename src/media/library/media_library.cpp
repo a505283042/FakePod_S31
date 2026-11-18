@@ -763,7 +763,7 @@ static esp_err_t media_library_scan_with_scratch(
     size_t last_incremental_added_progress_count = 0U;
     int64_t last_incremental_added_progress_us = start_us;
     const auto notify_incremental_added_progress = [&](bool force) {
-        if (!have_previous_v2 || on_scan_event == nullptr || added_count == 0U) {
+        if (!have_previous_v2 || on_scan_event == nullptr || (!force && added_count == 0U)) {
             return;
         }
 
@@ -2037,6 +2037,11 @@ static esp_err_t media_library_scan_with_scratch(
             esp_err_to_name(catalog_ret));
 
         if (!replace_runtime_catalog && have_previous_v2) {
+            // 扫描发现的增量尚未提交；回退旧 Catalog 时把启动页进度归零。
+            added_count = 0U;
+            updated_count = 0U;
+            removed_count = 0U;
+            notify_incremental_added_progress(true);
             issue_count++;
             if (first_issue_file[0] == '\0') {
                 snprintf(first_issue_file, sizeof(scratch->first_issue_file), "%s", "MusicCatalogV2");
@@ -2074,6 +2079,12 @@ static esp_err_t media_library_scan_with_scratch(
             media_catalog_v2_release(&next_catalog);
             ESP_LOGE(TAG, "整库校验失败且回退旧Catalog发布失败：%s", esp_err_to_name(publish_ret));
             catalog_ret = publish_ret;
+        } else if (replace_runtime_catalog) {
+            // 热刷新失败时运行时仍是旧 Catalog，同样清除本轮未提交的新增进度。
+            added_count = 0U;
+            updated_count = 0U;
+            removed_count = 0U;
+            notify_incremental_added_progress(true);
         }
     }
 
