@@ -11,12 +11,16 @@
 | test_nas_folder_count.py | NAS 目录计数 |
 | test_nas_server_playback_bind.py | NAS 服务器切换后的播放绑定 |
 | test_remote_power.py | BLE 状态发送节流 |
+| test_catalog_album_artist_merge.py | Catalog C++ 回归：Album Artist 后补齐及安全回退 |
+| test_merge_fakepod_full.py | 完整固件合并：flash_args 实际路径/偏移和错误偏移拒绝 |
 
 从项目根目录运行，例如：
 
 ```text
 python tests/host/test_independent_browse.py
 python tests/host/test_nas_exclusive_restore.py
+python tests/host/test_catalog_album_artist_merge.py
+python tests/host/test_merge_fakepod_full.py
 ```
 
 需要 Python 3；执行 C++ 主机回归的脚本还需要 g++。这些测试使用主机替身，不能代替完整固件构建及真机验收。

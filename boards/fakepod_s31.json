@@ -14,7 +14,9 @@
     "flash_size": "16MB",
     "maximum_size": "16777216",
     "maximum_ram_size": "524288",
-    "speed": 921600
+    "speed": 921600,
+    "bootloader_offset": "0x2000",
+    "partition_table_offset": "0x8000"
   },
   "url": "https://www.espressif.com/",
   "vendor": "FakePod"

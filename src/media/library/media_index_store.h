@@ -22,6 +22,9 @@ struct MediaIndexRecord
     // 仅扫描期使用，不参与 V1/V2 磁盘序列化。排序时随记录一起移动，Catalog 构建完成后释放。
     MediaMetadataBuildV2 *metadata_build = nullptr;
     MediaArtworkBuildV2 *artwork_build = nullptr;
+
+    // 仅本轮扫描使用：旧歌曲的目录/内嵌封面 locator 是否发生变化，不写入磁盘索引。
+    bool scan_artwork_changed = false;
 };
 
 struct MediaIndexSnapshot
