@@ -557,7 +557,8 @@ static int media_library_compare_entries(const void *left, const void *right)
     const MediaEntry *b = static_cast<const MediaEntry *>(right);
     const char *path_a = g_path_pool + a->path_offset;
     const char *path_b = g_path_pool + b->path_offset;
-    return strcasecmp(path_a, path_b);
+    const int case_insensitive = strcasecmp(path_a, path_b);
+    return case_insensitive != 0 ? case_insensitive : strcmp(path_a, path_b);
 }
 
 static void media_library_sort_entries()
@@ -1013,9 +1014,6 @@ static esp_err_t media_library_scan_with_scratch(
                         const MediaManifestRecordV2 *old_manifest = nullptr;
                         const bool old_v2_found = media_catalog_store_v2_find(
                             &previous_v2, full_path, &old_v2_track, &old_manifest);
-                        if (old_v2_found && old_v2_track != nullptr) {
-                            existing_path_count++;
-                        }
                         if (old_v2_found && old_v2_track != nullptr && old_manifest != nullptr &&
                             old_v2_track->format == format && old_manifest->format == format &&
                             old_manifest->file_size_bytes == static_cast<uint64_t>(info.st_size) &&
@@ -1145,17 +1143,15 @@ static esp_err_t media_library_scan_with_scratch(
                         }
                     }
 
-                    // 新增/文件签名变化在深度 probe 前就能确定，先通知启动页，避免用户只在扫描快结束时才看到提示。
+                    // 新增/文件签名变化先累计；只有新 Catalog 成功发布后才发出变更通知。
                     if (have_previous_v2) {
                         if (old_v2_track == nullptr) {
                             added_count++;
                             catalog_change_counted = true;
-                            notify_changes_detected();
                             notify_incremental_added_progress(false);
                         } else if (!v2_signature_match) {
                             updated_count++;
                             catalog_change_counted = true;
-                            notify_changes_detected();
                         }
                     }
 
@@ -1459,7 +1455,6 @@ static esp_err_t media_library_scan_with_scratch(
                     if (have_previous_v2 && old_v2_track != nullptr &&
                         !catalog_change_counted && v2_signature_match && !artwork_unchanged) {
                         updated_count++;
-                        notify_changes_detected();
                     }
 
                     if (!media_library_add_track(full_path, format, info, technical, metadata_build, artwork_build)) {
@@ -1474,6 +1469,9 @@ static esp_err_t media_library_scan_with_scratch(
                         out_of_memory = true;
                         break;
                     }
+                    g_entries[g_entry_count - 1U].scan_artwork_changed =
+                        have_previous_v2 && old_v2_track != nullptr &&
+                        v2_signature_match && !artwork_unchanged;
                     notify_initial_build_progress(false);
                     format_count[static_cast<size_t>(format)]++;
                     if ((g_entry_count % SCAN_YIELD_INTERVAL_TRACKS) == 0U) {
@@ -1601,23 +1599,78 @@ static esp_err_t media_library_scan_with_scratch(
         media_library_reset_build_state(replace_runtime_catalog);
         return ESP_ERR_NO_MEM;
     }
-    // 若最后一批不足节流阈值，也要把最终已发现数量送到启动页；
-    // 后续还可能进行排序、Catalog 组装和落盘，因此用户不会在这段时间看到过期数字。
-    notify_initial_build_progress(true);
-    notify_incremental_added_progress(true);
-
     if (root_missing) {
         ESP_LOGW(TAG, "音乐目录不存在：%s，音乐库保持为空", MUSIC_ROOT);
     }
     media_library_sort_entries();
 
+    if (!media_library_repack_sorted_path_pool()) {
+        ESP_LOGE(TAG, "排序后重建确定性路径池失败");
+        media_catalog_store_v2_release(&previous_v2);
+        media_index_store_release(&previous_v1);
+        media_library_reset_build_state(replace_runtime_catalog);
+        return ESP_ERR_NO_MEM;
+    }
+
+    // 去重：Catalog 校验要求路径在忽略大小写比较下严格递增。
+    // 比较器对大小写相同的路径再按原始字节排序，确保保留项稳定、可复现。
+    bool duplicate_path_found = false;
+    for (size_t i = 1U; i < g_entry_count;) {
+        const char *previous_path = g_path_pool + g_entries[i - 1U].path_offset;
+        const char *path = g_path_pool + g_entries[i].path_offset;
+        if (strcasecmp(previous_path, path) != 0) {
+            ++i;
+            continue;
+        }
+        duplicate_path_found = true;
+        record_scan_issue(path, "路径与已收录歌曲忽略大小写后重复，本次已跳过");
+        media_library_drop_metadata(&g_entries[i]);
+        media_library_drop_artwork(&g_entries[i]);
+        if (i + 1U < g_entry_count) {
+            memmove(&g_entries[i], &g_entries[i + 1U],
+                (g_entry_count - i - 1U) * sizeof(MediaEntry));
+        }
+        g_entry_count--;
+        g_entries[g_entry_count] = {};
+        skipped_track_count++;
+    }
+
+    // 所有变更统计都以去重后的唯一路径集合为准，避免重复目录项重复计数。
+    if (have_previous_v2) {
+        existing_path_count = 0U;
+        added_count = 0U;
+        updated_count = 0U;
+        for (size_t i = 0; i < g_entry_count; ++i) {
+            const MediaEntry &entry = g_entries[i];
+            const char *path = g_path_pool + entry.path_offset;
+            const TrackRowV2 *old_track = nullptr;
+            const MediaManifestRecordV2 *old_manifest = nullptr;
+            if (media_catalog_store_v2_find(&previous_v2, path, &old_track, &old_manifest) &&
+                old_track != nullptr) {
+                existing_path_count++;
+                const bool signature_matches =
+                    old_manifest != nullptr &&
+                    old_track->format == entry.format &&
+                    old_manifest->format == entry.format &&
+                    old_manifest->file_size_bytes == entry.file_size_bytes &&
+                    old_manifest->modified_time == entry.modified_time;
+                if (!signature_matches || entry.scan_artwork_changed) {
+                    updated_count++;
+                }
+            } else {
+                added_count++;
+            }
+        }
+    }
+
     size_t removed_count =
         have_previous_v2 && previous_track_count > existing_path_count
         ? previous_track_count - existing_path_count
         : 0U;
-    if (removed_count > 0U) {
-        notify_changes_detected();
-    }
+
+    // 扫描过程中的进度允许暂时显示发现数；最终数量以去重后的统计为准。
+    notify_initial_build_progress(true);
+    notify_incremental_added_progress(true);
 
     const auto publish_change_summary = [&](size_t current_count) {
         if (out_changes == nullptr) {
@@ -1638,39 +1691,9 @@ static esp_err_t media_library_scan_with_scratch(
             (added_count > 0U || removed_count > 0U || updated_count > 0U);
     };
 
-    if (!media_library_repack_sorted_path_pool()) {
-        ESP_LOGE(TAG, "排序后重建确定性路径池失败");
-        media_catalog_store_v2_release(&previous_v2);
-        media_index_store_release(&previous_v1);
-        media_library_reset_build_state(replace_runtime_catalog);
-        return ESP_ERR_NO_MEM;
-    }
-
-    // 去重：Catalog 校验要求路径在忽略大小写比较下严格递增；FAT 卡上若残留
-    // 仅大小写不同的重复条目，整库构建会直接失败。这里保留排序后的第一条，
-    // 丢弃后续重复项，用单曲跳过换取整库可用。
-    for (size_t i = 1U; i < g_entry_count;) {
-        const char *previous_path = g_path_pool + g_entries[i - 1U].path_offset;
-        const char *path = g_path_pool + g_entries[i].path_offset;
-        if (strcasecmp(previous_path, path) != 0) {
-            ++i;
-            continue;
-        }
-        record_scan_issue(path, "路径与已收录歌曲忽略大小写后重复，本次已跳过");
-        media_library_drop_metadata(&g_entries[i]);
-        media_library_drop_artwork(&g_entries[i]);
-        if (i + 1U < g_entry_count) {
-            memmove(&g_entries[i], &g_entries[i + 1U],
-                (g_entry_count - i - 1U) * sizeof(MediaEntry));
-        }
-        g_entry_count--;
-        g_entries[g_entry_count] = {};
-        skipped_track_count++;
-    }
-
     // 全库未变化且旧 V2 来自 final 时直接发布已经完整校验过的旧 Catalog。
     // 这样大曲库第二次启动不需要同时保留“旧 Catalog + 新 Catalog”两份 PSRAM。
-    bool reuse_whole_catalog = have_previous_v2 &&
+    bool reuse_whole_catalog = have_previous_v2 && !duplicate_path_found &&
         previous_v2.source == MediaCatalogLoadSourceV2::Final &&
         full_track_reused_count == g_entry_count &&
         previous_v2.catalog.track_count == g_entry_count;
@@ -1985,7 +2008,6 @@ static esp_err_t media_library_scan_with_scratch(
                         updated_count--;
                     }
                     removed_count++;
-                    notify_changes_detected();
                 } else if (added_count > 0U) {
                     added_count--;
                 }
@@ -2007,84 +2029,54 @@ static esp_err_t media_library_scan_with_scratch(
         }
     }
 
-    // 兜底：整库校验失败时用前缀二分定位问题曲目，只降级出问题的那一首，
-    // 其余歌曲的元数据保持不变；实在放不进曲库的曲目才跳过。
-    for (uint32_t attempt = 0U;
-         catalog_ret != ESP_OK && media_library_is_track_catalog_error(catalog_ret) &&
-         attempt < 64U && g_entry_count > 0U; ++attempt) {
-        // 已知整库失败、空前缀成功；二分找最小的失败前缀。
-        size_t prefix_ok = 0U;
-        size_t prefix_bad = g_entry_count;
-        bool probe_error = false;
-        while (prefix_ok + 1U < prefix_bad) {
-            const size_t mid = prefix_ok + (prefix_bad - prefix_ok) / 2U;
+    // 整库校验失败但单曲校验均已通过时，错误可能来自跨歌曲聚合关系或 Catalog 构建器。
+    // 不假设失败前缀具有单调性，也不再根据二分结果删除任意歌曲或清空其 Metadata。
+    // 冷启动若有上一份已校验 Catalog，则保留旧库；USB 热刷新则让当前运行时 Catalog 保持不变。
+    if (catalog_ret != ESP_OK && media_library_is_track_catalog_error(catalog_ret)) {
+        ESP_LOGE(TAG, "整库 Catalog 校验失败，拒绝按前缀二分删除歌曲：%s",
+            esp_err_to_name(catalog_ret));
+
+        if (!replace_runtime_catalog && have_previous_v2) {
+            issue_count++;
+            if (first_issue_file[0] == '\0') {
+                snprintf(first_issue_file, sizeof(scratch->first_issue_file), "%s", "MusicCatalogV2");
+                snprintf(first_issue_reason, sizeof(scratch->first_issue_reason), "%s",
+                    "整库校验失败，已保留上一次有效曲库");
+            }
+
+            const uint32_t fallback_track_count = previous_v2.catalog.track_count;
+            const uint32_t fallback_crc = previous_v2.index_crc32;
             media_catalog_v2_release(&next_catalog);
-            const esp_err_t probe = media_catalog_v2_build_from_index_records(
-                g_entries, mid, g_path_pool, g_path_size, &next_catalog);
-            if (probe == ESP_OK) {
-                prefix_ok = mid;
-            } else if (media_library_is_track_catalog_error(probe)) {
-                prefix_bad = mid;
-            } else {
-                catalog_ret = probe;
-                probe_error = true;
-                break;
-            }
-        }
-        if (probe_error) {
-            break;
-        }
-
-        const size_t index = prefix_bad - 1U;
-        const char *path = g_path_pool + g_entries[index].path_offset;
-
-        // 先只丢弃这一首的可选元数据，标题回退文件名。
-        media_library_drop_metadata(&g_entries[index]);
-        media_catalog_v2_release(&next_catalog);
-        catalog_ret = media_catalog_v2_build_from_index_records(
-            g_entries, g_entry_count, g_path_pool, g_path_size, &next_catalog);
-        if (catalog_ret == ESP_OK) {
-            record_scan_issue(path, "该歌曲元数据无法通过整库校验，已降级为文件名条目");
-            ESP_LOGW(TAG, "整库校验失败，已仅降级问题曲目：%s", path);
-            break;
-        }
-
-        // 元数据降级后仍失败，才把这一首从曲库中跳过。
-        if (have_previous_v2) {
-            const TrackRowV2 *old_track = nullptr;
-            const MediaManifestRecordV2 *old_manifest = nullptr;
-            if (media_catalog_store_v2_find(&previous_v2, path, &old_track, &old_manifest) && old_track != nullptr) {
-                const bool was_updated = old_manifest != nullptr &&
-                    (old_track->format != g_entries[index].format || old_manifest->format != g_entries[index].format ||
-                     old_manifest->file_size_bytes != g_entries[index].file_size_bytes ||
-                     old_manifest->modified_time != g_entries[index].modified_time);
-                if (was_updated && updated_count > 0U) {
-                    updated_count--;
+            next_catalog = previous_v2.catalog;
+            previous_v2.catalog = {};
+            const esp_err_t publish_ret = media_catalog_v2_publish(&next_catalog, fallback_crc);
+            if (publish_ret == ESP_OK) {
+                media_catalog_store_v2_release(&previous_v2);
+                media_index_store_release(&previous_v1);
+                g_ready = true;
+                media_library_release_build_buffers();
+                if (out_changes != nullptr) {
+                    *out_changes = {};
+                    out_changes->had_previous_catalog = true;
+                    out_changes->previous_count = fallback_track_count;
+                    out_changes->current_count = fallback_track_count;
+                    out_changes->issue_count = static_cast<uint32_t>(issue_count);
+                    snprintf(out_changes->first_issue_file, sizeof(out_changes->first_issue_file), "%s",
+                        first_issue_file);
+                    snprintf(out_changes->first_issue_reason, sizeof(out_changes->first_issue_reason), "%s",
+                        first_issue_reason);
                 }
-                removed_count++;
-                notify_changes_detected();
-            } else if (added_count > 0U) {
-                added_count--;
+                ESP_LOGW(TAG, "整库校验失败，已保留上一次有效Catalog：tracks=%u",
+                    static_cast<unsigned>(fallback_track_count));
+                return ESP_OK;
             }
-        }
-        media_library_drop_artwork(&g_entries[index]);
-        if (index + 1U < g_entry_count) {
-            memmove(&g_entries[index], &g_entries[index + 1U],
-                (g_entry_count - index - 1U) * sizeof(MediaEntry));
-        }
-        g_entry_count--;
-        g_entries[g_entry_count] = {};
-        skipped_track_count++;
-        record_scan_issue(path, "该歌曲无法通过整库校验，本次已跳过");
 
-        media_catalog_v2_release(&next_catalog);
-        catalog_ret = media_catalog_v2_build_from_index_records(
-            g_entries, g_entry_count, g_path_pool, g_path_size, &next_catalog);
-        if (catalog_ret == ESP_OK) {
-            ESP_LOGW(TAG, "整库校验失败，已跳过问题曲目：%s", path);
-            break;
+            media_catalog_v2_release(&next_catalog);
+            ESP_LOGE(TAG, "整库校验失败且回退旧Catalog发布失败：%s", esp_err_to_name(publish_ret));
+            catalog_ret = publish_ret;
         }
     }
+
     const int64_t catalog_build_finished_us = esp_timer_get_time();
     if (catalog_ret != ESP_OK) {
         ESP_LOGE(TAG, "构建 MusicCatalogV2 失败：%s", esp_err_to_name(catalog_ret));
@@ -2128,8 +2120,12 @@ static esp_err_t media_library_scan_with_scratch(
 
     media_catalog_store_v2_release(&previous_v2);
     media_index_store_release(&previous_v1);
-    media_library_release_build_buffers();
     g_ready = true;
+    if (have_previous_v2 &&
+        (added_count > 0U || removed_count > 0U || updated_count > 0U)) {
+        notify_changes_detected();
+    }
+    media_library_release_build_buffers();
     const uint32_t elapsed_ms = static_cast<uint32_t>((esp_timer_get_time() - start_us) / 1000);
     if (have_previous_v2) {
         const uint32_t walk_ms = static_cast<uint32_t>((scan_walk_finished_us - start_us) / 1000LL);

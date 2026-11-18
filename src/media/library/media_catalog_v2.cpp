@@ -577,6 +577,13 @@ esp_err_t media_catalog_v2_build_from_index_records(
                 album_builds[album_id].album_artist_id = album_artist_id;
             }
             CatalogAlbumBuildV2 &album = album_builds[album_id];
+            // 同一专辑可能先遇到未写 Album Artist 标签的曲目，后遇到显式标签。
+            // 两者按回退后的显示歌手归入同一 Album；此时必须补齐先前缺失的实体 ID，
+            // 否则后续带 HAS_ALBUM_ARTIST_TAG 的 Track 会令整库校验失败。
+            if (album.album_artist_id == MEDIA_CATALOG_INVALID_ID_V2 &&
+                album_artist_id != MEDIA_CATALOG_INVALID_ID_V2) {
+                album.album_artist_id = album_artist_id;
+            }
             if (album.artwork_track_id == MEDIA_CATALOG_INVALID_ID_V2 &&
                 artwork != nullptr && artwork->source != MediaArtworkSourceV2::None) {
                 album.artwork_track_id = static_cast<uint32_t>(i);
