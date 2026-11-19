@@ -1,6 +1,7 @@
 #include "lyrics_service.h"
 
 #include <algorithm>
+#include <new>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -749,7 +750,6 @@ static esp_err_t lyrics_parse_utf8_lrc(
         heap_caps_free(text_pool);
         return ESP_ERR_NO_MEM;
     }
-    memset(rows, 0, timestamp_count * sizeof(LyricsLineRow));
     text_pool[0] = '\0';
     uint32_t text_used = 1U;
     uint32_t row_used = 0U;
@@ -803,8 +803,10 @@ static esp_err_t lyrics_parse_utf8_lrc(
                     int64_t adjusted = static_cast<int64_t>(timestamps[i]) + global_offset_ms;
                     if (adjusted < 0) adjusted = 0;
                     if (adjusted > UINT32_MAX) adjusted = UINT32_MAX;
-                    rows[row_used].time_ms = static_cast<uint32_t>(adjusted);
-                    rows[row_used].text_off = text_off;
+                    LyricsLineRow *row =
+                        new (&rows[row_used]) LyricsLineRow{};
+                    row->time_ms = static_cast<uint32_t>(adjusted);
+                    row->text_off = text_off;
                     ++row_used;
                 }
             }
