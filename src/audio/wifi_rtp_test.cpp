@@ -37,12 +37,15 @@ static const char *TAG = "WiFi_RTP_Test";
 static constexpr size_t kInputFrames = 256U;
 static constexpr size_t kRingBlockCount = 64U;
 static constexpr size_t kRtpHeaderBytes = 12U;
+static constexpr size_t kRtpExtensionBytes = 8U;
+static constexpr size_t kRtpPayloadOffset = kRtpHeaderBytes + kRtpExtensionBytes;
+static constexpr uint16_t kRtpAudioFormatExtensionProfile = 0xF0D1U;
 static constexpr size_t kRtpPacketFrames = 240U;
 static constexpr size_t kChannels = 2U;
 static constexpr size_t kBytesPerSample = 3U;
 static constexpr size_t kRtpPayloadBytes =
     kRtpPacketFrames * kChannels * kBytesPerSample;
-static constexpr size_t kRtpPacketBytes = kRtpHeaderBytes + kRtpPayloadBytes;
+static constexpr size_t kRtpPacketBytes = kRtpPayloadOffset + kRtpPayloadBytes;
 static constexpr uint8_t kRtpPayloadTypeL24 = 96U;
 static constexpr uint16_t kDiscoveryPort =
     CONFIG_FAKEPOD_WIFI_RTP_TEST_DISCOVERY_PORT;
@@ -256,11 +259,17 @@ static bool send_rtp_packet(
     uint32_t *timestamp,
     uint32_t ssrc,
     bool *marker,
+    uint32_t sample_rate_hz,
     uint16_t frames)
 {
-    if (frames == 0U || frames > kRtpPacketFrames) return false;
+    if (frames == 0U || frames > kRtpPacketFrames || sample_rate_hz == 0U) return false;
 
-    g_packet[0] = 0x80U; // RTP version 2, no padding/extension/CSRC.
+    // RTP v2 + extension. The one-word FakePod audio-format extension carries
+    // the PCM sample rate so receivers can configure their I2S clock exactly.
+    g_packet[0] = 0x90U; // RTP version 2, extension present, no CSRC.
+    write_be16(g_packet + kRtpHeaderBytes, kRtpAudioFormatExtensionProfile);
+    write_be16(g_packet + kRtpHeaderBytes + 2U, 1U); // one 32-bit extension word
+    write_be32(g_packet + kRtpHeaderBytes + 4U, sample_rate_hz);
     g_packet[1] = static_cast<uint8_t>(
         (*marker ? 0x80U : 0U) | kRtpPayloadTypeL24);
     write_be16(g_packet + 2U, *sequence);
@@ -268,7 +277,7 @@ static bool send_rtp_packet(
     write_be32(g_packet + 8U, ssrc);
 
     const size_t packet_bytes =
-        kRtpHeaderBytes + static_cast<size_t>(frames) * kChannels * kBytesPerSample;
+        kRtpPayloadOffset + static_cast<size_t>(frames) * kChannels * kBytesPerSample;
     const int64_t send_started_us = esp_timer_get_time();
     const int sent = sendto(
         fd,
@@ -540,7 +549,7 @@ static void wifi_rtp_task(void *)
                 if (packet_frames > 0U &&
                     idle_now_us - last_pcm_us >= kPartialPacketFlushUs) {
                     (void)send_rtp_packet(fd, destination, &sequence,
-                        &timestamp, ssrc, &marker, packet_frames);
+                        &timestamp, ssrc, &marker, stream_rate_hz, packet_frames);
                     packet_frames = 0U;
                 }
                 const uint32_t wait_ms = (packet_frames > 0U) ? 20U : 200U;
@@ -577,7 +586,7 @@ static void wifi_rtp_task(void *)
 
             // pcm_decoder_read_pcm32() stores valid PCM bits left-aligned.
             // RTP L24 uses packed 24-bit samples in network byte order.
-            const size_t out = kRtpHeaderBytes +
+            const size_t out = kRtpPayloadOffset +
                 static_cast<size_t>(packet_frames) * kChannels * kBytesPerSample;
             g_packet[out + 0U] = static_cast<uint8_t>((left >> 16U) & 0xFFU);
             g_packet[out + 1U] = static_cast<uint8_t>((left >> 8U) & 0xFFU);
@@ -600,7 +609,7 @@ static void wifi_rtp_task(void *)
 
         if (packet_frames == kRtpPacketFrames) {
             (void)send_rtp_packet(fd, destination, &sequence,
-                &timestamp, ssrc, &marker, packet_frames);
+                &timestamp, ssrc, &marker, stream_rate_hz, packet_frames);
             packet_frames = 0U;
         }
     }
