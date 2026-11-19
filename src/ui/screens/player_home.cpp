@@ -2735,6 +2735,13 @@ static void player_home_overlay_apply_dim_path()
         return;
     }
 
+    // Log only path transitions: distinguish cached RGB565 source swaps from
+    // the full-screen alpha-backdrop fallback without flooding the 100ms timer.
+    static bool last_path_valid = false;
+    static bool last_fast_dim = false;
+    static bool last_overlay_visible = false;
+    static MusicVisualMode last_visual_mode = MusicVisualMode::Artwork;
+
     // R.20：CoverSurface 命中时直接切预暗 RGB565，backdrop 保持全透明；
     // 只有 Overlay 可见且压缩 JPEG/PNG 回退路径没有 dimmed Surface 时，才启用旧 alpha 黑层。
     bool fast_dim = false;
@@ -2750,6 +2757,21 @@ static void player_home_overlay_apply_dim_path()
             ? kOverlayDimOpacity
             : static_cast<lv_opa_t>(LV_OPA_TRANSP);
     player_home_overlay_set_backdrop_opa_if_changed(backdrop_opa);
+
+    if (!last_path_valid || last_fast_dim != fast_dim ||
+        last_overlay_visible != g_overlay_visible ||
+        last_visual_mode != g_music_visual_mode) {
+        ESP_LOGI(TAG,
+            "Overlay压暗路径：mode=%s visible=%u cached_dimmed=%u alpha_backdrop=%u",
+            g_music_visual_mode == MusicVisualMode::Cassette ? "Cassette" : "Artwork",
+            g_overlay_visible ? 1U : 0U,
+            fast_dim ? 1U : 0U,
+            (g_overlay_visible && !fast_dim) ? 1U : 0U);
+        last_path_valid = true;
+        last_fast_dim = fast_dim;
+        last_overlay_visible = g_overlay_visible;
+        last_visual_mode = g_music_visual_mode;
+    }
 }
 
 static bool player_home_finish_cassette_controls_present_if_ready()
