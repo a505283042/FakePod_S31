@@ -38,7 +38,9 @@ static constexpr size_t kRtpPacketBytes = kRtpHeaderBytes + kRtpPayloadBytes;
 static constexpr uint8_t kRtpPayloadTypeL24 = 96U;
 static constexpr uint32_t kTaskStackBytes = 4096U;
 static constexpr UBaseType_t kTaskPriority = 2U;
-static constexpr BaseType_t kTaskCore = 1;
+// Keep the low-priority RTP sidecar off Core 1, where LVGL runs at P3.
+// Core 0 hosts AudioTask at P5, so RTP cannot preempt real-time PCM/I2S work.
+static constexpr BaseType_t kTaskCore = 0;
 static constexpr int64_t kPartialPacketFlushUs = 20000LL;
 
 struct PcmBlock {
