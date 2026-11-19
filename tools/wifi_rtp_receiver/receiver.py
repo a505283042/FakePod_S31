@@ -541,7 +541,7 @@ def main():
                     f"dup={current['duplicate']} bad={current['bad']} "
                     f"q={current['queue']} ({current['buffer_ms']:.0f}ms) "
                     f"overrun={current['queue_overruns']} "
-                    f"underrun={current['underruns']} udpbuf={current['socket_rcvbuf']} 
+                    f"underrun={current['underruns']} udpbuf={current['socket_rcvbuf']} "
                     f"ssrc={current['ssrc']} from={current['sender']}"
                 )
                 previous = current
