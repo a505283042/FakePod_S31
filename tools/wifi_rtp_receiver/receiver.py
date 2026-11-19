@@ -221,6 +221,8 @@ class RtpAudioReceiver:
         self.explicit_rate = False
         if self.manual_sample_rate is None:
             self.detected_rate = None
+            self.prebuffer_packets = 40
+            self.prebuffer_frames = self.prebuffer_packets * PACKET_FRAMES
 
     def _apply_explicit_sample_rate(self, sample_rate: int):
         changed = self.detected_rate != sample_rate
@@ -236,7 +238,7 @@ class RtpAudioReceiver:
             self.prebuffer_packets = self._prebuffer_count(sample_rate, self.prebuffer_ms)
             self.prebuffer_frames = self.prebuffer_packets * PACKET_FRAMES
             self._clear_audio_queue()
-            print(f"\\n[RTP] Explicit sample rate: {sample_rate} Hz")
+            print(f"\n[RTP] Explicit sample rate: {sample_rate} Hz")
 
     def _observe_sample_rate(self, rtp_timestamp: int, arrival_time: float):
         if self.manual_sample_rate is not None or self.explicit_rate:
