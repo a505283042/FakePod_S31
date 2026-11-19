@@ -90,7 +90,7 @@ class RtpAudioReceiver:
             float(sample_rate) if sample_rate is not None else None
         )
         self.prebuffer_ms = prebuffer_ms
-        self.prebuffer_packets = self._prebuffer_count(sample_rate) if sample_rate else 40
+        self.prebuffer_packets = self._prebuffer_count(sample_rate, prebuffer_ms) if sample_rate else 40
         self.rate_observations = deque(maxlen=1024)
         self.last_rtp_timestamp: Optional[int] = None
         self.unwrapped_rtp_timestamp = 0
@@ -103,7 +103,7 @@ class RtpAudioReceiver:
 
         self.expected_sequence: Optional[int] = None
         self.ssrc: Optional[int] = None
-        self.pending: dict[int, tuple[float, np.ndarray]] = {}
+        self.pending: dict[int, tuple[float, int, np.ndarray]] = {}
         self.reorder_wait_seconds = 0.006
 
         self.callback_generation = 0
@@ -124,11 +124,11 @@ class RtpAudioReceiver:
         self.last_sender = ""
 
     @staticmethod
-    def _prebuffer_count(sample_rate: Optional[int]) -> int:
+    def _prebuffer_count(sample_rate: Optional[int], prebuffer_ms: int) -> int:
         if not sample_rate:
             return 40
         return max(
-            2, int(np.ceil(sample_rate * 100 / 1000.0 / PACKET_FRAMES))
+            2, int(np.ceil(sample_rate * prebuffer_ms / 1000.0 / PACKET_FRAMES))
         )
 
     def _reset_rate_detector(self):
@@ -209,7 +209,7 @@ class RtpAudioReceiver:
         # Require repeated agreement after a >=1.25 s observation window.
         if self.rate_candidate_streak >= 8 and self.detected_rate != candidate:
             self.detected_rate = candidate
-            self.prebuffer_packets = self._prebuffer_count(candidate)
+            self.prebuffer_packets = self._prebuffer_count(candidate, self.prebuffer_ms)
             # Discard packets accumulated while identifying the stream so
             # playback starts near live time after PortAudio opens the device.
             self._clear_audio_queue()
