@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import queue
 from collections import deque
 import socket
 import struct
@@ -79,6 +78,60 @@ def parse_rtp(packet: bytes):
     return marker, sequence, timestamp, ssrc, pcm
 
 
+class PcmRingBuffer:
+    """Preallocated stereo PCM ring; isolates PortAudio from packet-level work."""
+    def __init__(self, capacity_frames: int):
+        self.capacity_frames = max(PACKET_FRAMES * 8, int(capacity_frames))
+        self.data = np.zeros((self.capacity_frames, 2), dtype=np.float32)
+        self.read_index = self.write_index = self.used_frames = 0
+        self.dropped_frames = 0
+        self.lock = threading.Lock()
+
+    def clear(self):
+        with self.lock:
+            self.read_index = self.write_index = self.used_frames = 0
+
+    def available(self) -> int:
+        with self.lock:
+            return self.used_frames
+
+    def write(self, pcm: np.ndarray):
+        frames = int(pcm.shape[0])
+        if frames <= 0:
+            return
+        if frames > self.capacity_frames:
+            self.dropped_frames += frames - self.capacity_frames
+            pcm = pcm[-self.capacity_frames:]
+            frames = self.capacity_frames
+        with self.lock:
+            overflow = max(0, self.used_frames + frames - self.capacity_frames)
+            if overflow:
+                self.read_index = (self.read_index + overflow) % self.capacity_frames
+                self.used_frames -= overflow
+                self.dropped_frames += overflow
+            first = min(frames, self.capacity_frames - self.write_index)
+            self.data[self.write_index:self.write_index + first] = pcm[:first]
+            remaining = frames - first
+            if remaining:
+                self.data[:remaining] = pcm[first:]
+            self.write_index = (self.write_index + frames) % self.capacity_frames
+            self.used_frames += frames
+
+    def read_into(self, outdata: np.ndarray, frames: int) -> int:
+        with self.lock:
+            count = min(int(frames), self.used_frames)
+            if count <= 0:
+                return 0
+            first = min(count, self.capacity_frames - self.read_index)
+            outdata[:first] = self.data[self.read_index:self.read_index + first]
+            remaining = count - first
+            if remaining:
+                outdata[first:count] = self.data[:remaining]
+            self.read_index = (self.read_index + count) % self.capacity_frames
+            self.used_frames -= count
+            return count
+
+
 class RtpAudioReceiver:
     def __init__(self, sample_rate: Optional[int], prebuffer_ms: int, queue_packets: int):
         # None means automatic RTP clock-rate detection. RTP L24 carries no
@@ -96,7 +149,9 @@ class RtpAudioReceiver:
         self.unwrapped_rtp_timestamp = 0
         self.rate_candidate: Optional[int] = None
         self.rate_candidate_streak = 0
-        self.audio_queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=queue_packets)
+        self.pcm_ring = PcmRingBuffer(queue_packets * PACKET_FRAMES)
+        self.prebuffer_frames = self.prebuffer_packets * PACKET_FRAMES
+        self.last_rate_eval_time = 0.0
         self.stop_event = threading.Event()
         self.thread: Optional[threading.Thread] = None
         self.sock: Optional[socket.socket] = None
@@ -106,10 +161,6 @@ class RtpAudioReceiver:
         self.pending: dict[int, tuple[float, int, np.ndarray]] = {}
         self.reorder_wait_seconds = 0.006
 
-        self.callback_generation = 0
-        self.generation = 0
-        self.current_block: Optional[np.ndarray] = None
-        self.current_offset = 0
         self.playing = False
 
         self.packets = 0
@@ -122,6 +173,7 @@ class RtpAudioReceiver:
         self.underruns = 0
         self.stream_restarts = 0
         self.last_sender = ""
+        self.socket_receive_buffer = 0
 
     @staticmethod
     def _prebuffer_count(sample_rate: Optional[int], prebuffer_ms: int) -> int:
@@ -168,9 +220,12 @@ class RtpAudioReceiver:
         ):
             self.rate_observations.popleft()
 
+        # Avoid running a NumPy regression on every 2.5 ms packet.
+        if arrival_time - self.last_rate_eval_time < 0.25:
+            return
+        self.last_rate_eval_time = arrival_time
         if len(self.rate_observations) < 40:
             return
-
         first_time = self.rate_observations[0][0]
         last_time = self.rate_observations[-1][0]
         if last_time - first_time < 1.25:
@@ -210,30 +265,19 @@ class RtpAudioReceiver:
         if self.rate_candidate_streak >= 8 and self.detected_rate != candidate:
             self.detected_rate = candidate
             self.prebuffer_packets = self._prebuffer_count(candidate, self.prebuffer_ms)
-            # Discard packets accumulated while identifying the stream so
-            # playback starts near live time after PortAudio opens the device.
+            self.prebuffer_frames = self.prebuffer_packets * PACKET_FRAMES
             self._clear_audio_queue()
             self.playing = False
             print(f"\n[AUTO] RTP clock rate detected: {candidate} Hz")
 
     def _clear_audio_queue(self):
-        while True:
-            try:
-                self.audio_queue.get_nowait()
-            except queue.Empty:
-                break
-        self.generation += 1
+        self.pcm_ring.clear()
+        self.playing = False
 
     def _enqueue_audio(self, pcm: np.ndarray):
-        if self.audio_queue.full():
-            try:
-                self.audio_queue.get_nowait()
-                self.queue_overruns += 1
-            except queue.Empty:
-                pass
-        try:
-            self.audio_queue.put_nowait(pcm)
-        except queue.Full:
+        before = self.pcm_ring.dropped_frames
+        self.pcm_ring.write(pcm)
+        if self.pcm_ring.dropped_frames > before:
             self.queue_overruns += 1
 
     def _flush_reorder_buffer(self, now: float):
@@ -325,7 +369,8 @@ class RtpAudioReceiver:
 
     def start(self, bind_address: str, port: int):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
+        self.socket_receive_buffer = self.sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
         self.sock.bind((bind_address, port))
         self.thread = threading.Thread(
             target=self._receive_loop,
@@ -344,44 +389,18 @@ class RtpAudioReceiver:
             self.thread.join(timeout=1.0)
 
     def audio_callback(self, outdata, frames, _time_info, status):
+        # Bounded callback: zero-fill and copy from preallocated PCM memory only.
         outdata.fill(0)
-
         if status:
             self.underruns += 1
-
-        if self.callback_generation != self.generation:
-            self.current_block = None
-            self.current_offset = 0
-            self.callback_generation = self.generation
-            self.playing = False
-
         if not self.playing:
-            if self.audio_queue.qsize() < self.prebuffer_packets:
+            if self.pcm_ring.available() < self.prebuffer_frames:
                 return
             self.playing = True
-
-        written = 0
-        while written < frames:
-            if self.current_block is None:
-                try:
-                    self.current_block = self.audio_queue.get_nowait()
-                    self.current_offset = 0
-                except queue.Empty:
-                    self.underruns += 1
-                    self.playing = False
-                    break
-
-            available = len(self.current_block) - self.current_offset
-            count = min(frames - written, available)
-            outdata[written:written + count] = self.current_block[
-                self.current_offset:self.current_offset + count
-            ]
-            written += count
-            self.current_offset += count
-
-            if self.current_offset >= len(self.current_block):
-                self.current_block = None
-                self.current_offset = 0
+        written = self.pcm_ring.read_into(outdata, frames)
+        if written < frames:
+            self.underruns += 1
+            self.playing = False
 
     def stats_snapshot(self):
         return {
@@ -391,8 +410,10 @@ class RtpAudioReceiver:
             "late": self.late_packets,
             "duplicate": self.duplicate_packets,
             "bad": self.bad_packets,
-            "queue": self.audio_queue.qsize(),
+            "queue": int(np.ceil(self.pcm_ring.available() / PACKET_FRAMES)),
+            "buffer_ms": self.pcm_ring.available() * 1000.0 / self.detected_rate if self.detected_rate else 0.0,
             "queue_overruns": self.queue_overruns,
+            "socket_rcvbuf": self.socket_receive_buffer,
             "underruns": self.underruns,
             "ssrc": self.ssrc,
             "sender": self.last_sender,
@@ -478,7 +499,7 @@ def main():
                             channels=2,
                             dtype="float32",
                             blocksize=0,
-                            latency="high",
+                            latency=0.12,
                             callback=receiver.audio_callback,
                         )
                         candidate_stream.start()
@@ -518,8 +539,9 @@ def main():
                     f"rx={packet_rate:6.1f} pkt/s  {mbps:5.2f} Mbps  "
                     f"lost={current['lost']} late={current['late']} "
                     f"dup={current['duplicate']} bad={current['bad']} "
-                    f"q={current['queue']} overrun={current['queue_overruns']} "
-                    f"underrun={current['underruns']} "
+                    f"q={current['queue']} ({current['buffer_ms']:.0f}ms) "
+                    f"overrun={current['queue_overruns']} "
+                    f"underrun={current['underruns']} udpbuf={current['socket_rcvbuf']} 
                     f"ssrc={current['ssrc']} from={current['sender']}"
                 )
                 previous = current
