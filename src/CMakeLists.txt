@@ -64,6 +64,7 @@ idf_component_register(
         "drivers/audio/i2s_output.c"
 
         "audio/audio_service.cpp"
+        "audio/wifi_rtp_test.cpp"
         "audio/audio_decode_workspace.cpp"
         "audio/nsf_synth.cpp"
         "audio/audio_spectrum_snapshot.cpp"
