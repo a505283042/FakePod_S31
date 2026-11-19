@@ -36,6 +36,11 @@ static constexpr size_t kRtpPayloadBytes =
     kRtpPacketFrames * kChannels * kBytesPerSample;
 static constexpr size_t kRtpPacketBytes = kRtpHeaderBytes + kRtpPayloadBytes;
 static constexpr uint8_t kRtpPayloadTypeL24 = 96U;
+static constexpr uint16_t kDiscoveryPort =
+    CONFIG_FAKEPOD_WIFI_RTP_TEST_DISCOVERY_PORT;
+static constexpr int64_t kDiscoveryIntervalUs = 2000000LL;
+static constexpr int64_t kReceiverLeaseUs = 7000000LL;
+static constexpr size_t kDiscoveryPacketBytes = 12U;
 static constexpr uint32_t kTaskStackBytes = 4096U;
 static constexpr UBaseType_t kTaskPriority = 4U;
 // Core 0 is reserved for AudioTask (P5): keeping RTP there at P2 starves
@@ -85,6 +90,21 @@ static void write_be32(uint8_t *dst, uint32_t value)
     dst[3] = static_cast<uint8_t>(value & 0xFFU);
 }
 
+static uint16_t read_be16(const uint8_t *src)
+{
+    return static_cast<uint16_t>(
+        (static_cast<uint16_t>(src[0]) << 8U) |
+        static_cast<uint16_t>(src[1]));
+}
+
+static uint32_t read_be32(const uint8_t *src)
+{
+    return (static_cast<uint32_t>(src[0]) << 24U) |
+        (static_cast<uint32_t>(src[1]) << 16U) |
+        (static_cast<uint32_t>(src[2]) << 8U) |
+        static_cast<uint32_t>(src[3]);
+}
+
 static void discard_queued_audio()
 {
     const uint32_t head = __atomic_load_n(&g_head, __ATOMIC_ACQUIRE);
@@ -106,21 +126,8 @@ static void reset_rtp_session(
     *packet_frames = 0U;
 }
 
-static int create_rtp_socket(sockaddr_in *destination)
+static int create_rtp_socket()
 {
-    if (destination == nullptr) return -1;
-
-    memset(destination, 0, sizeof(*destination));
-    destination->sin_family = AF_INET;
-    destination->sin_port = htons(CONFIG_FAKEPOD_WIFI_RTP_TEST_PORT);
-
-    if (inet_pton(AF_INET, CONFIG_FAKEPOD_WIFI_RTP_TEST_TARGET_IP,
-                  &destination->sin_addr) != 1) {
-        ESP_LOGE(TAG, "无效的接收端 IPv4 地址：%s",
-            CONFIG_FAKEPOD_WIFI_RTP_TEST_TARGET_IP);
-        return -1;
-    }
-
     const int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (fd < 0) {
         ESP_LOGE(TAG, "创建 RTP UDP socket 失败：errno=%d", errno);
@@ -142,10 +149,96 @@ static int create_rtp_socket(sockaddr_in *destination)
     timeout.tv_usec = 1000;
     (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
 
-    ESP_LOGI(TAG, "RTP L24 接收端：%s:%u",
-        CONFIG_FAKEPOD_WIFI_RTP_TEST_TARGET_IP,
+    ESP_LOGI(TAG, "RTP UDP socket 已就绪：port=%u，等待自动发现接收端",
         static_cast<unsigned>(CONFIG_FAKEPOD_WIFI_RTP_TEST_PORT));
     return fd;
+}
+
+static int create_discovery_socket()
+{
+    const int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (fd < 0) {
+        ESP_LOGE(TAG, "创建 RTP 发现 socket 失败：errno=%d", errno);
+        return -1;
+    }
+
+    int enabled = 1;
+    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
+    if (setsockopt(fd, SOL_SOCKET, SO_BROADCAST,
+                   &enabled, sizeof(enabled)) != 0) {
+        ESP_LOGE(TAG, "启用 UDP 广播失败：errno=%d", errno);
+        close(fd);
+        return -1;
+    }
+
+    sockaddr_in local = {};
+    local.sin_family = AF_INET;
+    local.sin_port = htons(kDiscoveryPort);
+    local.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(fd, reinterpret_cast<const sockaddr *>(&local),
+             sizeof(local)) != 0) {
+        ESP_LOGE(TAG, "绑定 RTP 发现端口失败：port=%u errno=%d",
+            static_cast<unsigned>(kDiscoveryPort), errno);
+        close(fd);
+        return -1;
+    }
+
+    ESP_LOGI(TAG, "RTP 自动发现已就绪：UDP broadcast/response port=%u",
+        static_cast<unsigned>(kDiscoveryPort));
+    return fd;
+}
+
+static bool send_discovery_probe(int fd, uint32_t nonce)
+{
+    uint8_t packet[kDiscoveryPacketBytes] = {};
+    memcpy(packet, "FPRD", 4U);
+    packet[4] = 1U; // Discovery protocol version.
+    write_be32(packet + 8U, nonce);
+
+    sockaddr_in broadcast = {};
+    broadcast.sin_family = AF_INET;
+    broadcast.sin_port = htons(kDiscoveryPort);
+    broadcast.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+
+    const int sent = sendto(
+        fd,
+        packet,
+        sizeof(packet),
+        0,
+        reinterpret_cast<const sockaddr *>(&broadcast),
+        sizeof(broadcast));
+    return sent == static_cast<int>(sizeof(packet));
+}
+
+static bool parse_discovery_response(
+    const uint8_t *packet,
+    size_t packet_bytes,
+    uint32_t expected_nonce,
+    uint16_t *rtp_port)
+{
+    if (packet == nullptr || rtp_port == nullptr ||
+        packet_bytes != kDiscoveryPacketBytes ||
+        memcmp(packet, "FPRR", 4U) != 0 ||
+        packet[4] != 1U ||
+        read_be32(packet + 8U) != expected_nonce) {
+        return false;
+    }
+
+    const uint16_t port = read_be16(packet + 6U);
+    if (port < 1024U) return false;
+    *rtp_port = port;
+    return true;
+}
+
+static void format_ipv4(const in_addr &address, char *out, size_t out_size)
+{
+    if (out == nullptr || out_size == 0U) return;
+    const uint32_t value = ntohl(address.s_addr);
+    (void)snprintf(out, out_size, "%u.%u.%u.%u",
+        static_cast<unsigned>((value >> 24U) & 0xFFU),
+        static_cast<unsigned>((value >> 16U) & 0xFFU),
+        static_cast<unsigned>((value >> 8U) & 0xFFU),
+        static_cast<unsigned>(value & 0xFFU));
 }
 
 static bool send_rtp_packet(
@@ -207,7 +300,13 @@ static bool send_rtp_packet(
 static void wifi_rtp_task(void *)
 {
     int fd = -1;
+    int discovery_fd = -1;
     sockaddr_in destination = {};
+    bool receiver_found = false;
+    uint32_t pending_nonce = 0U;
+    int64_t next_probe_us = 0;
+    int64_t last_receiver_seen_us = 0;
+    int64_t last_wait_log_us = 0;
 
     PcmBlock *current = nullptr;
     size_t current_frame = 0U;
@@ -233,6 +332,16 @@ static void wifi_rtp_task(void *)
                 close(fd);
                 fd = -1;
             }
+            if (discovery_fd >= 0) {
+                close(discovery_fd);
+                discovery_fd = -1;
+            }
+            g_socket_send_buffer_bytes = 0;
+            receiver_found = false;
+            pending_nonce = 0U;
+            next_probe_us = 0;
+            last_receiver_seen_us = 0;
+            destination = {};
             current = nullptr;
             current_frame = 0U;
             packet_frames = 0U;
@@ -243,33 +352,123 @@ static void wifi_rtp_task(void *)
             continue;
         }
 
+        if (discovery_fd < 0) {
+            discovery_fd = create_discovery_socket();
+            if (discovery_fd < 0) {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
+            next_probe_us = 0;
+        }
+
         if (fd < 0) {
-            fd = create_rtp_socket(&destination);
+            fd = create_rtp_socket();
             if (fd < 0) {
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 continue;
             }
+        }
+
+        int64_t now_us = esp_timer_get_time();
+        if (now_us >= next_probe_us) {
+            pending_nonce = esp_random();
+            if (pending_nonce == 0U) pending_nonce = 1U;
+            if (!send_discovery_probe(discovery_fd, pending_nonce)) {
+                ESP_LOGW(TAG, "发送 RTP 接收端发现广播失败：errno=%d", errno);
+            }
+            next_probe_us = now_us + kDiscoveryIntervalUs;
+        }
+
+        // The PC receiver replies by unicast to this socket's UDP source port.
+        // Drain all currently queued discovery replies without blocking RTP work.
+        while (true) {
+            uint8_t response[kDiscoveryPacketBytes] = {};
+            sockaddr_in sender = {};
+            socklen_t sender_len = sizeof(sender);
+            const int received = recvfrom(
+                discovery_fd,
+                response,
+                sizeof(response),
+                MSG_DONTWAIT,
+                reinterpret_cast<sockaddr *>(&sender),
+                &sender_len);
+            if (received < 0) {
+                if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                    ESP_LOGW(TAG, "接收 RTP 发现响应失败：errno=%d", errno);
+                }
+                break;
+            }
+
+            uint16_t receiver_rtp_port = 0U;
+            if (!parse_discovery_response(
+                    response, static_cast<size_t>(received),
+                    pending_nonce, &receiver_rtp_port)) {
+                continue;
+            }
+
+            if (!receiver_found) {
+                destination = sender;
+                destination.sin_port = htons(receiver_rtp_port);
+                receiver_found = true;
+                last_receiver_seen_us = esp_timer_get_time();
+
+                current = nullptr;
+                current_frame = 0U;
+                packet_frames = 0U;
+                stream_rate_hz = 0U;
+                discard_queued_audio();
+                reset_rtp_session(
+                    &sequence, &timestamp, &ssrc, &marker, &packet_frames);
+                __atomic_store_n(&g_network_ready, true, __ATOMIC_RELEASE);
+
+                char receiver_ip[16] = {};
+                format_ipv4(destination.sin_addr, receiver_ip, sizeof(receiver_ip));
+                ESP_LOGI(TAG,
+                    "自动发现 RTP 接收端：%s:%u（discovery UDP %u）",
+                    receiver_ip,
+                    static_cast<unsigned>(receiver_rtp_port),
+                    static_cast<unsigned>(kDiscoveryPort));
+            } else if (sender.sin_addr.s_addr == destination.sin_addr.s_addr) {
+                // Renew the active receiver lease. Other responders are ignored
+                // while this receiver remains alive to avoid target flapping.
+                destination.sin_port = htons(receiver_rtp_port);
+                last_receiver_seen_us = esp_timer_get_time();
+            }
+        }
+
+        now_us = esp_timer_get_time();
+        if (receiver_found &&
+            now_us - last_receiver_seen_us > kReceiverLeaseUs) {
+            char receiver_ip[16] = {};
+            format_ipv4(destination.sin_addr, receiver_ip, sizeof(receiver_ip));
+            ESP_LOGW(TAG, "RTP 接收端离线：%s:%u；重新发现中",
+                receiver_ip,
+                static_cast<unsigned>(ntohs(destination.sin_port)));
+
+            receiver_found = false;
+            __atomic_store_n(&g_network_ready, false, __ATOMIC_RELEASE);
+            destination = {};
+            last_receiver_seen_us = 0;
+            next_probe_us = 0;
             current = nullptr;
+            current_frame = 0U;
             packet_frames = 0U;
             stream_rate_hz = 0U;
             discard_queued_audio();
-            reset_rtp_session(&sequence, &timestamp, &ssrc, &marker, &packet_frames);
-            __atomic_store_n(&g_network_ready, true, __ATOMIC_RELEASE);
+            reset_rtp_session(
+                &sequence, &timestamp, &ssrc, &marker, &packet_frames);
         }
 
-        if (__atomic_exchange_n(&g_overflowed, false, __ATOMIC_ACQ_REL)) {
-            // Drop stale queued audio rather than allowing network congestion
-            // to turn into an ever-growing playback delay.
-            discard_queued_audio();
-            current = nullptr;
-            current_frame = 0U;
-            stream_rate_hz = 0U;
-            reset_rtp_session(&sequence, &timestamp, &ssrc, &marker, &packet_frames);
-            ESP_LOGW(TAG, "RTP 发送队列溢出：已丢弃过期 PCM 并重建会话");
+        if (!receiver_found) {
+            __atomic_store_n(&g_network_ready, false, __ATOMIC_RELEASE);
+            if (now_us - last_wait_log_us >= 5000000LL) {
+                ESP_LOGI(TAG, "等待 RTP 接收端：broadcast=255.255.255.255:%u",
+                    static_cast<unsigned>(kDiscoveryPort));
+                last_wait_log_us = now_us;
+            }
         }
 
-        const int64_t stats_now_us = esp_timer_get_time();
-        if (stats_now_us - last_stats_us >= 5000000LL) {
+        if (now_us - last_stats_us >= 5000000LL) {
             const uint32_t head = __atomic_load_n(&g_head, __ATOMIC_ACQUIRE);
             const uint32_t tail = __atomic_load_n(&g_tail, __ATOMIC_RELAXED);
             const uint32_t queue_blocks = head - tail;
@@ -281,7 +480,7 @@ static void wifi_rtp_task(void *)
             ESP_LOGI(TAG,
                 "RTP_STATS rate=%lu packets=%lu send_errors=%lu dropped_blocks=%lu "
                 "queue=%lu/%u queue_ms=%lu peak=%lu send_errno=%ld send_ret=%ld "
-                "send_err_us=%lu max_send_us=%lu sndbuf=%d",
+                "send_err_us=%lu max_send_us=%lu sndbuf=%d receiver=%u",
                 static_cast<unsigned long>(stream_rate_hz),
                 static_cast<unsigned long>(
                     __atomic_load_n(&g_packets_sent, __ATOMIC_RELAXED)),
@@ -302,26 +501,40 @@ static void wifi_rtp_task(void *)
                     __atomic_load_n(&g_last_send_error_us, __ATOMIC_RELAXED)),
                 static_cast<unsigned long>(
                     __atomic_load_n(&g_max_send_us, __ATOMIC_RELAXED)),
-                g_socket_send_buffer_bytes);
-            last_stats_us = stats_now_us;
+                g_socket_send_buffer_bytes,
+                receiver_found ? 1U : 0U);
+            last_stats_us = now_us;
+        }
+
+        if (!receiver_found) {
+            TickType_t wait_ticks = pdMS_TO_TICKS(100U);
+            if (wait_ticks == 0U) wait_ticks = 1U;
+            (void)ulTaskNotifyTake(pdTRUE, wait_ticks);
+            continue;
+        }
+
+        if (__atomic_exchange_n(&g_overflowed, false, __ATOMIC_ACQ_REL)) {
+            // Drop stale queued audio rather than allowing network congestion
+            // to turn into an ever-growing playback delay.
+            discard_queued_audio();
+            current = nullptr;
+            current_frame = 0U;
+            stream_rate_hz = 0U;
+            reset_rtp_session(&sequence, &timestamp, &ssrc, &marker, &packet_frames);
+            ESP_LOGW(TAG, "RTP 发送队列溢出：已丢弃过期 PCM 并重建会话");
         }
 
         if (current == nullptr) {
             const uint32_t tail = __atomic_load_n(&g_tail, __ATOMIC_RELAXED);
             const uint32_t head = __atomic_load_n(&g_head, __ATOMIC_ACQUIRE);
             if (tail == head) {
-                const int64_t now_us = esp_timer_get_time();
+                const int64_t idle_now_us = esp_timer_get_time();
                 if (packet_frames > 0U &&
-                    now_us - last_pcm_us >= kPartialPacketFlushUs) {
+                    idle_now_us - last_pcm_us >= kPartialPacketFlushUs) {
                     (void)send_rtp_packet(fd, destination, &sequence,
                         &timestamp, ssrc, &marker, packet_frames);
                     packet_frames = 0U;
                 }
-                // Wait for the producer instead of polling. A 1 ms delay
-                // can round down to zero ticks on lower tick-rate builds,
-                // starving IDLE1 and triggering the task watchdog.
-                // Keep a slow connectivity watchdog while idle; when a
-                // partial RTP packet is pending, wake sooner to flush it.
                 const uint32_t wait_ms = (packet_frames > 0U) ? 20U : 200U;
                 TickType_t wait_ticks = pdMS_TO_TICKS(wait_ms);
                 if (wait_ticks == 0U) wait_ticks = 1U;
@@ -370,7 +583,6 @@ static void wifi_rtp_task(void *)
         }
 
         if (current_frame >= current->frames) {
-            // One timer read per decoded block, not per PCM frame.
             last_pcm_us = esp_timer_get_time();
             current = nullptr;
             current_frame = 0U;
@@ -385,7 +597,6 @@ static void wifi_rtp_task(void *)
         }
     }
 }
-
 } // namespace
 
 esp_err_t wifi_rtp_test_start()
@@ -434,8 +645,8 @@ esp_err_t wifi_rtp_test_start()
     }
 
     ESP_LOGW(TAG,
-        "PC RTP 音频测试已启用：目标=%s:%u；task core=%d priority=%u；仅在 Wi-Fi 已连接且播放 Music PCM 时发送",
-        CONFIG_FAKEPOD_WIFI_RTP_TEST_TARGET_IP,
+        "PC RTP 音频测试已启用：自动发现 UDP=%u，RTP UDP=%u；task core=%d priority=%u",
+        static_cast<unsigned>(kDiscoveryPort),
         static_cast<unsigned>(CONFIG_FAKEPOD_WIFI_RTP_TEST_PORT),
         static_cast<int>(kTaskCore),
         static_cast<unsigned>(kTaskPriority));
