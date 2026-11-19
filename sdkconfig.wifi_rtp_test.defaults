@@ -1,0 +1,5 @@
+# Separate defaults for env:fakepod_s31_wifi_rtp_test.
+# Change the IPv4 address to the Windows PC running receiver.py.
+CONFIG_FAKEPOD_WIFI_RTP_TEST_ENABLE=y
+CONFIG_FAKEPOD_WIFI_RTP_TEST_TARGET_IP="192.168.1.100"
+CONFIG_FAKEPOD_WIFI_RTP_TEST_PORT=5004
