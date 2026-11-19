@@ -1,6 +1,14 @@
 #include "wifi_rtp_test.h"
 
 #include <errno.h>
+
+// Existing generated sdkconfig files may predate the discovery-port option.
+// Keep the test build source-compatible until PlatformIO regenerates sdkconfig.
+#ifndef CONFIG_FAKEPOD_WIFI_RTP_TEST_DISCOVERY_PORT
+#define CONFIG_FAKEPOD_WIFI_RTP_TEST_DISCOVERY_PORT 5005
+#endif
+
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
