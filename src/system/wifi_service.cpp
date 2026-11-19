@@ -764,7 +764,7 @@ esp_err_t wifi_service_submit_credentials(const char *ssid, const char *password
         portEXIT_CRITICAL(&g_lock);
         return ESP_ERR_INVALID_STATE;
     }
-    memset(&g_pending, 0, sizeof(g_pending));
+    g_pending = WifiCredentials{};
     memcpy(g_pending.ssid, ssid, ssid_len);
     if (password_len > 0U) memcpy(g_pending.password, password, password_len);
     g_pending_valid = true;
