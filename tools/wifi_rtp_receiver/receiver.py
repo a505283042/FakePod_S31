@@ -470,8 +470,9 @@ def main():
 
                 attempted_rate = requested_rate
                 if requested_rate is not None:
+                    candidate_stream = None
                     try:
-                        output_stream = sd.OutputStream(
+                        candidate_stream = sd.OutputStream(
                             device=args.device,
                             samplerate=requested_rate,
                             channels=2,
@@ -480,10 +481,16 @@ def main():
                             latency="high",
                             callback=receiver.audio_callback,
                         )
-                        output_stream.start()
+                        candidate_stream.start()
+                        output_stream = candidate_stream
                         output_rate = requested_rate
                         print(f"[AUDIO] Windows output opened at {requested_rate} Hz")
                     except Exception as exc:
+                        if candidate_stream is not None:
+                            try:
+                                candidate_stream.close()
+                            except Exception:
+                                pass
                         output_stream = None
                         output_rate = None
                         print(
