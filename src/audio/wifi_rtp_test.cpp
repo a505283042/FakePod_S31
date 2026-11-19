@@ -37,10 +37,11 @@ static constexpr size_t kRtpPayloadBytes =
 static constexpr size_t kRtpPacketBytes = kRtpHeaderBytes + kRtpPayloadBytes;
 static constexpr uint8_t kRtpPayloadTypeL24 = 96U;
 static constexpr uint32_t kTaskStackBytes = 4096U;
-static constexpr UBaseType_t kTaskPriority = 2U;
-// Keep the low-priority RTP sidecar off Core 1, where LVGL runs at P3.
-// Core 0 hosts AudioTask at P5, so RTP cannot preempt real-time PCM/I2S work.
-static constexpr BaseType_t kTaskCore = 0;
+static constexpr UBaseType_t kTaskPriority = 4U;
+// Core 0 is reserved for AudioTask (P5): keeping RTP there at P2 starves
+// packetization during CPU-heavy FLAC decode, especially at 96 kHz.
+// Core 1 P4 is above LVGL P3 and shares priority with FlacPrefetch P4.
+static constexpr BaseType_t kTaskCore = 1;
 static constexpr int64_t kPartialPacketFlushUs = 20000LL;
 
 struct PcmBlock {
@@ -61,6 +62,12 @@ static uint32_t g_tail = 0U;
 static uint32_t g_dropped_blocks = 0U;
 static uint32_t g_send_errors = 0U;
 static uint32_t g_packets_sent = 0U;
+static uint32_t g_queue_peak = 0U;
+static int32_t g_last_send_error_errno = 0;
+static int32_t g_last_send_error_result = 0;
+static uint32_t g_last_send_error_us = 0U;
+static uint32_t g_max_send_us = 0U;
+static int g_socket_send_buffer_bytes = 0;
 static bool g_network_ready = false;
 static bool g_overflowed = false;
 
@@ -123,8 +130,14 @@ static int create_rtp_socket(sockaddr_in *destination)
     int send_buffer_bytes = 8192;
     (void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF,
         &send_buffer_bytes, sizeof(send_buffer_bytes));
+    int actual_send_buffer = 0;
+    socklen_t actual_send_buffer_len = sizeof(actual_send_buffer);
+    if (getsockopt(fd, SOL_SOCKET, SO_SNDBUF,
+                   &actual_send_buffer, &actual_send_buffer_len) == 0) {
+        g_socket_send_buffer_bytes = actual_send_buffer;
+    }
 
-    // Socket back-pressure is isolated to this low-priority worker task.
+    // Socket back-pressure is isolated to this worker task.
     struct timeval timeout = {};
     timeout.tv_usec = 1000;
     (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
@@ -155,6 +168,7 @@ static bool send_rtp_packet(
 
     const size_t packet_bytes =
         kRtpHeaderBytes + static_cast<size_t>(frames) * kChannels * kBytesPerSample;
+    const int64_t send_started_us = esp_timer_get_time();
     const int sent = sendto(
         fd,
         g_packet,
@@ -162,6 +176,14 @@ static bool send_rtp_packet(
         0,
         reinterpret_cast<const sockaddr *>(&destination),
         sizeof(destination));
+    const uint32_t send_elapsed_us = static_cast<uint32_t>(
+        esp_timer_get_time() - send_started_us);
+    uint32_t previous_max_us = __atomic_load_n(&g_max_send_us, __ATOMIC_RELAXED);
+    while (send_elapsed_us > previous_max_us &&
+           !__atomic_compare_exchange_n(
+               &g_max_send_us, &previous_max_us, send_elapsed_us, false,
+               __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+    }
 
     // Advance RTP time even when a datagram is lost. The receiver detects the
     // missing sequence and can insert silence without shifting the timeline.
@@ -170,6 +192,10 @@ static bool send_rtp_packet(
     *marker = false;
 
     if (sent != static_cast<int>(packet_bytes)) {
+        const int send_errno = sent < 0 ? errno : 0;
+        __atomic_store_n(&g_last_send_error_errno, send_errno, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_last_send_error_result, sent, __ATOMIC_RELAXED);
+        __atomic_store_n(&g_last_send_error_us, send_elapsed_us, __ATOMIC_RELAXED);
         __atomic_add_fetch(&g_send_errors, 1U, __ATOMIC_RELAXED);
         return false;
     }
@@ -246,8 +272,16 @@ static void wifi_rtp_task(void *)
         if (stats_now_us - last_stats_us >= 5000000LL) {
             const uint32_t head = __atomic_load_n(&g_head, __ATOMIC_ACQUIRE);
             const uint32_t tail = __atomic_load_n(&g_tail, __ATOMIC_RELAXED);
+            const uint32_t queue_blocks = head - tail;
+            const uint32_t queue_ms = stream_rate_hz != 0U
+                ? static_cast<uint32_t>(
+                    (static_cast<uint64_t>(queue_blocks) * kInputFrames * 1000ULL) /
+                    stream_rate_hz)
+                : 0U;
             ESP_LOGI(TAG,
-                "RTP_STATS rate=%lu packets=%lu send_errors=%lu dropped_blocks=%lu queue=%lu",
+                "RTP_STATS rate=%lu packets=%lu send_errors=%lu dropped_blocks=%lu "
+                "queue=%lu/%u queue_ms=%lu peak=%lu send_errno=%ld send_ret=%ld "
+                "send_err_us=%lu max_send_us=%lu sndbuf=%d",
                 static_cast<unsigned long>(stream_rate_hz),
                 static_cast<unsigned long>(
                     __atomic_load_n(&g_packets_sent, __ATOMIC_RELAXED)),
@@ -255,7 +289,20 @@ static void wifi_rtp_task(void *)
                     __atomic_load_n(&g_send_errors, __ATOMIC_RELAXED)),
                 static_cast<unsigned long>(
                     __atomic_load_n(&g_dropped_blocks, __ATOMIC_RELAXED)),
-                static_cast<unsigned long>(head - tail));
+                static_cast<unsigned long>(queue_blocks),
+                static_cast<unsigned>(kRingBlockCount),
+                static_cast<unsigned long>(queue_ms),
+                static_cast<unsigned long>(
+                    __atomic_load_n(&g_queue_peak, __ATOMIC_RELAXED)),
+                static_cast<long>(
+                    __atomic_load_n(&g_last_send_error_errno, __ATOMIC_RELAXED)),
+                static_cast<long>(
+                    __atomic_load_n(&g_last_send_error_result, __ATOMIC_RELAXED)),
+                static_cast<unsigned long>(
+                    __atomic_load_n(&g_last_send_error_us, __ATOMIC_RELAXED)),
+                static_cast<unsigned long>(
+                    __atomic_load_n(&g_max_send_us, __ATOMIC_RELAXED)),
+                g_socket_send_buffer_bytes);
             last_stats_us = stats_now_us;
         }
 
@@ -361,6 +408,11 @@ esp_err_t wifi_rtp_test_start()
 
     __atomic_store_n(&g_head, 0U, __ATOMIC_RELAXED);
     __atomic_store_n(&g_tail, 0U, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_queue_peak, 0U, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_last_send_error_errno, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_last_send_error_result, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_last_send_error_us, 0U, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_max_send_us, 0U, __ATOMIC_RELAXED);
     __atomic_store_n(&g_network_ready, false, __ATOMIC_RELAXED);
     __atomic_store_n(&g_overflowed, false, __ATOMIC_RELAXED);
 
@@ -424,6 +476,13 @@ void wifi_rtp_test_publish_pcm32(
             count * kChannels * sizeof(int32_t));
 
         __atomic_store_n(&g_head, head + 1U, __ATOMIC_RELEASE);
+        const uint32_t queued_after_publish = head + 1U - tail;
+        uint32_t peak = __atomic_load_n(&g_queue_peak, __ATOMIC_RELAXED);
+        while (queued_after_publish > peak &&
+               !__atomic_compare_exchange_n(
+                   &g_queue_peak, &peak, queued_after_publish, false,
+                   __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+        }
 
         // Wake the sender only after the PCM block is fully published.
         // The notification is non-blocking and keeps the AudioTask independent
