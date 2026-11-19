@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <errno.h>
+#include <new>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -40,6 +41,15 @@ struct Payload {
     uint8_t nonce[12] = {};
     char config[900] = {};
 };
+
+static void secure_zero(void *buffer, size_t size)
+{
+    volatile uint8_t *bytes = static_cast<volatile uint8_t *>(buffer);
+    while (size > 0U) {
+        *bytes++ = 0U;
+        --size;
+    }
+}
 
 static bool read_exact(int fd, void* buffer, size_t size) {
     uint8_t* out = static_cast<uint8_t*>(buffer);
@@ -281,10 +291,19 @@ static void pairing_task(void*) {
                 timeval timeouts = {}; timeouts.tv_sec = 3;
                 (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeouts, sizeof(timeouts));
                 (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeouts, sizeof(timeouts));
-                Payload* ctx = static_cast<Payload*>(heap_caps_calloc(1, sizeof(Payload),
-                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-                const bool success = ctx && serve_once(fd, ctx, expires);
-                if (ctx) { memset(ctx, 0, sizeof(Payload)); heap_caps_free(ctx); }
+                void *payload_memory = heap_caps_malloc(sizeof(Payload),
+                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                Payload *ctx = payload_memory != nullptr
+                    ? new (payload_memory) Payload{}
+                    : nullptr;
+                const bool success = ctx != nullptr && serve_once(fd, ctx, expires);
+                if (ctx != nullptr) {
+                    // The payload contains the session key and decrypted NAS credentials.
+                    // Use volatile byte writes so the wipe cannot be optimized away.
+                    secure_zero(ctx, sizeof(*ctx));
+                    ctx->~Payload();
+                    heap_caps_free(ctx);
+                }
                 close(fd);
                 if (success) {
                     const esp_err_t ret = nas_catalog_service_request_pending_switch();
