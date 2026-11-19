@@ -4,6 +4,9 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
+
+#include "sys/time.h"
 
 #include "esp_err.h"
 
@@ -237,6 +240,23 @@ static void wifi_rtp_task(void *)
             ESP_LOGW(TAG, "RTP 发送队列溢出：已丢弃过期 PCM 并重建会话");
         }
 
+        const int64_t stats_now_us = esp_timer_get_time();
+        if (stats_now_us - last_stats_us >= 5000000LL) {
+            const uint32_t head = __atomic_load_n(&g_head, __ATOMIC_ACQUIRE);
+            const uint32_t tail = __atomic_load_n(&g_tail, __ATOMIC_RELAXED);
+            ESP_LOGI(TAG,
+                "RTP_STATS rate=%lu packets=%lu send_errors=%lu dropped_blocks=%lu queue=%lu",
+                static_cast<unsigned long>(stream_rate_hz),
+                static_cast<unsigned long>(
+                    __atomic_load_n(&g_packets_sent, __ATOMIC_RELAXED)),
+                static_cast<unsigned long>(
+                    __atomic_load_n(&g_send_errors, __ATOMIC_RELAXED)),
+                static_cast<unsigned long>(
+                    __atomic_load_n(&g_dropped_blocks, __ATOMIC_RELAXED)),
+                static_cast<unsigned long>(head - tail));
+            last_stats_us = stats_now_us;
+        }
+
         if (current == nullptr) {
             const uint32_t tail = __atomic_load_n(&g_tail, __ATOMIC_RELAXED);
             const uint32_t head = __atomic_load_n(&g_head, __ATOMIC_ACQUIRE);
@@ -247,20 +267,6 @@ static void wifi_rtp_task(void *)
                     (void)send_rtp_packet(fd, destination, &sequence,
                         &timestamp, ssrc, &marker, packet_frames);
                     packet_frames = 0U;
-                }
-                if (now_us - last_stats_us >= 5000000LL) {
-                    const uint32_t depth = head - tail;
-                    ESP_LOGI(TAG,
-                        "RTP_STATS rate=%lu packets=%lu send_errors=%lu dropped_blocks=%lu queue=%lu",
-                        static_cast<unsigned long>(stream_rate_hz),
-                        static_cast<unsigned long>(
-                            __atomic_load_n(&g_packets_sent, __ATOMIC_RELAXED)),
-                        static_cast<unsigned long>(
-                            __atomic_load_n(&g_send_errors, __ATOMIC_RELAXED)),
-                        static_cast<unsigned long>(
-                            __atomic_load_n(&g_dropped_blocks, __ATOMIC_RELAXED)),
-                        static_cast<unsigned long>(depth));
-                    last_stats_us = now_us;
                 }
                 vTaskDelay(pdMS_TO_TICKS(1));
                 continue;
