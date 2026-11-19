@@ -2591,6 +2591,20 @@ static bool cassette_view_trim_memory()
     }
 
     const size_t before = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    const bool had_owned_psram_buffers =
+        g_controls_cache_pixels != nullptr ||
+        g_controls_cache_back_pixels != nullptr ||
+        g_next_controls_cache_pixels != nullptr ||
+        g_next_shell_rgb565 != nullptr ||
+        g_shell_pixels != nullptr ||
+        g_shell_base_rgb565 != nullptr ||
+        g_shell_tint_work_rgb565 != nullptr ||
+        g_shell_tint_luma != nullptr ||
+        g_big_reel_pixels != nullptr ||
+        g_small_roller_pixels != nullptr ||
+        g_small_roller_base_rgb565 != nullptr ||
+        g_small_roller_tint_luma != nullptr ||
+        g_tape_amount_pixels != nullptr;
 
     // 所有相关 LVGL 对象此时均已隐藏。descriptor 是静态对象，先解除数据引用，
     // 再释放像素，确保下一次进入磁带时只能经过 prepare/bind 重新建立来源。
@@ -2633,9 +2647,17 @@ static bool cassette_view_trim_memory()
     g_last_glint_snapshot = 0xFFU;
 
     const size_t after = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    ESP_LOGI(TAG, "磁带PSRAM已回收：reclaimed=%uB free=%u->%uB",
-        static_cast<unsigned>(after >= before ? after - before : 0U),
-        static_cast<unsigned>(before), static_cast<unsigned>(after));
+    const size_t reclaimed = after >= before ? after - before : 0U;
+    if (had_owned_psram_buffers) {
+        ESP_LOGI(TAG, "磁带PSRAM清理完成：reclaimed=%uB free=%u->%uB",
+            static_cast<unsigned>(reclaimed),
+            static_cast<unsigned>(before), static_cast<unsigned>(after));
+    } else {
+        // Artwork 模式下 QoS 也可能调用 inactive Cassette 的收尾路径；
+        // 没有磁带缓存时这是一次空清理，不应误报成实际 PSRAM 回收。
+        ESP_LOGD(TAG, "磁带PSRAM清理跳过：无磁带缓存可释放 free=%uB",
+            static_cast<unsigned>(after));
+    }
     return true;
 }
 
