@@ -268,7 +268,12 @@ static void wifi_rtp_task(void *)
                         &timestamp, ssrc, &marker, packet_frames);
                     packet_frames = 0U;
                 }
-                vTaskDelay(pdMS_TO_TICKS(1));
+                // Wait for the producer instead of polling. A 1 ms delay
+                // can round down to zero ticks on lower tick-rate builds,
+                // starving IDLE1 and triggering the task watchdog.
+                TickType_t wait_ticks = pdMS_TO_TICKS(20U);
+                if (wait_ticks == 0U) wait_ticks = 1U;
+                (void)ulTaskNotifyTake(pdTRUE, wait_ticks);
                 continue;
             }
 
@@ -412,6 +417,13 @@ void wifi_rtp_test_publish_pcm32(
             count * kChannels * sizeof(int32_t));
 
         __atomic_store_n(&g_head, head + 1U, __ATOMIC_RELEASE);
+
+        // Wake the sender only after the PCM block is fully published.
+        // The notification is non-blocking and keeps the AudioTask independent
+        // of UDP/network scheduling.
+        if (g_task != nullptr) {
+            xTaskNotifyGive(g_task);
+        }
         offset += count;
     }
 }
