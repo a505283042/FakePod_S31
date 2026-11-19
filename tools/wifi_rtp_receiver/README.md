@@ -56,7 +56,11 @@ suitable device with `--device` after checking `--list-devices`.
 ## 3. Configure and build FakePod
 
 Edit `sdkconfig.wifi_rtp_test.defaults` and set
-`CONFIG_FAKEPOD_WIFI_RTP_TEST_TARGET_IP` to the PC's IPv4 address.
+`CONFIG_FAKEPOD_WIFI_RTP_TEST_TARGET_IP` to the PC's IPv4 address before the
+first build. If `sdkconfig.fakepod_s31_wifi_rtp_test` has already been
+generated, change the same option in that generated file or run the test
+environment's menuconfig target; defaults do not overwrite an existing
+sdkconfig.
 
 Build the isolated test environment:
 
