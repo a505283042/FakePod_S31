@@ -271,7 +271,10 @@ static void wifi_rtp_task(void *)
                 // Wait for the producer instead of polling. A 1 ms delay
                 // can round down to zero ticks on lower tick-rate builds,
                 // starving IDLE1 and triggering the task watchdog.
-                TickType_t wait_ticks = pdMS_TO_TICKS(20U);
+                // Keep a slow connectivity watchdog while idle; when a
+                // partial RTP packet is pending, wake sooner to flush it.
+                const uint32_t wait_ms = (packet_frames > 0U) ? 20U : 200U;
+                TickType_t wait_ticks = pdMS_TO_TICKS(wait_ms);
                 if (wait_ticks == 0U) wait_ticks = 1U;
                 (void)ulTaskNotifyTake(pdTRUE, wait_ticks);
                 continue;
