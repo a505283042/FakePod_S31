@@ -230,10 +230,10 @@ static bool parse_discovery_response(
     return true;
 }
 
-static void format_ipv4(const in_addr &address, char *out, size_t out_size)
+static void format_ipv4(uint32_t address_be, char *out, size_t out_size)
 {
     if (out == nullptr || out_size == 0U) return;
-    const uint32_t value = ntohl(address.s_addr);
+    const uint32_t value = ntohl(address_be);
     (void)snprintf(out, out_size, "%u.%u.%u.%u",
         static_cast<unsigned>((value >> 24U) & 0xFFU),
         static_cast<unsigned>((value >> 16U) & 0xFFU),
@@ -422,7 +422,7 @@ static void wifi_rtp_task(void *)
                 __atomic_store_n(&g_network_ready, true, __ATOMIC_RELEASE);
 
                 char receiver_ip[16] = {};
-                format_ipv4(destination.sin_addr, receiver_ip, sizeof(receiver_ip));
+                format_ipv4(destination.sin_addr.s_addr, receiver_ip, sizeof(receiver_ip));
                 ESP_LOGI(TAG,
                     "自动发现 RTP 接收端：%s:%u（discovery UDP %u）",
                     receiver_ip,
