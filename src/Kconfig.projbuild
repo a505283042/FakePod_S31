@@ -1,0 +1,25 @@
+menu "FakePod Wi-Fi RTP audio test"
+
+config FAKEPOD_WIFI_RTP_TEST_ENABLE
+    bool "Enable RTP L24 audio streaming to a PC"
+    default n
+    help
+        Sends decoded music PCM to a Windows/Linux RTP receiver for
+        wireless audio validation. Disabled in normal firmware builds.
+
+config FAKEPOD_WIFI_RTP_TEST_TARGET_IP
+    string "RTP receiver IPv4 address"
+    default "192.168.1.100"
+    depends on FAKEPOD_WIFI_RTP_TEST_ENABLE
+    help
+        IPv4 address of the computer running tools/wifi_rtp_receiver/receiver.py.
+
+config FAKEPOD_WIFI_RTP_TEST_PORT
+    int "RTP receiver UDP port"
+    range 1024 65535
+    default 5004
+    depends on FAKEPOD_WIFI_RTP_TEST_ENABLE
+    help
+        UDP port used for RTP L24 audio packets.
+
+endmenu
