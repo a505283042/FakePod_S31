@@ -262,7 +262,7 @@ class RtpAudioReceiver:
             self.rate_candidate_streak = 1
 
         # Require repeated agreement after a >=1.25 s observation window.
-        if self.rate_candidate_streak >= 8 and self.detected_rate != candidate:
+        if self.rate_candidate_streak >= 2 and self.detected_rate != candidate:
             self.detected_rate = candidate
             self.prebuffer_packets = self._prebuffer_count(candidate, self.prebuffer_ms)
             self.prebuffer_frames = self.prebuffer_packets * PACKET_FRAMES
@@ -433,7 +433,7 @@ def main():
                         help="PCM sample rate (44100/48000/88200/96000) or auto")
     parser.add_argument("--device", default=None,
                         help="PortAudio output device index or name")
-    parser.add_argument("--prebuffer-ms", type=int, default=100)
+    parser.add_argument("--prebuffer-ms", type=int, default=150)
     parser.add_argument("--queue-packets", type=int, default=512)
     parser.add_argument("--list-devices", action="store_true")
     args = parser.parse_args()
