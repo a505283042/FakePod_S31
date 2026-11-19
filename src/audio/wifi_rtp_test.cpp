@@ -382,9 +382,11 @@ esp_err_t wifi_rtp_test_start()
     }
 
     ESP_LOGW(TAG,
-        "PC RTP 音频测试已启用：目标=%s:%u；仅在 Wi-Fi 已连接且播放 Music PCM 时发送",
+        "PC RTP 音频测试已启用：目标=%s:%u；task core=%d priority=%u；仅在 Wi-Fi 已连接且播放 Music PCM 时发送",
         CONFIG_FAKEPOD_WIFI_RTP_TEST_TARGET_IP,
-        static_cast<unsigned>(CONFIG_FAKEPOD_WIFI_RTP_TEST_PORT));
+        static_cast<unsigned>(CONFIG_FAKEPOD_WIFI_RTP_TEST_PORT),
+        static_cast<int>(kTaskCore),
+        static_cast<unsigned>(kTaskPriority));
     return ESP_OK;
 }
 
