@@ -440,7 +440,7 @@ static void wifi_rtp_task(void *)
         if (receiver_found &&
             now_us - last_receiver_seen_us > kReceiverLeaseUs) {
             char receiver_ip[16] = {};
-            format_ipv4(destination.sin_addr, receiver_ip, sizeof(receiver_ip));
+            format_ipv4(destination.sin_addr.s_addr, receiver_ip, sizeof(receiver_ip));
             ESP_LOGW(TAG, "RTP 接收端离线：%s:%u；重新发现中",
                 receiver_ip,
                 static_cast<unsigned>(ntohs(destination.sin_port)));
