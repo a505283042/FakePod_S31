@@ -7,12 +7,20 @@ config FAKEPOD_WIFI_RTP_TEST_ENABLE
         Sends decoded music PCM to a Windows/Linux RTP receiver for
         wireless audio validation. Disabled in normal firmware builds.
 
+# Retained as a hidden legacy symbol so existing generated sdkconfig files
+# remain readable. The sender now discovers the receiver automatically.
 config FAKEPOD_WIFI_RTP_TEST_TARGET_IP
-    string "RTP receiver IPv4 address"
-    default "192.168.1.100"
+    string
+    default ""
+    depends on FAKEPOD_WIFI_RTP_TEST_ENABLE
+
+config FAKEPOD_WIFI_RTP_TEST_DISCOVERY_PORT
+    int "RTP receiver discovery UDP port"
+    range 1024 65535
+    default 5005
     depends on FAKEPOD_WIFI_RTP_TEST_ENABLE
     help
-        IPv4 address of the computer running tools/wifi_rtp_receiver/receiver.py.
+        UDP port used by the FakePod receiver discovery request/response.
 
 config FAKEPOD_WIFI_RTP_TEST_PORT
     int "RTP receiver UDP port"
