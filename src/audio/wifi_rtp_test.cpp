@@ -310,10 +310,11 @@ static void wifi_rtp_task(void *)
 
             ++current_frame;
             ++packet_frames;
-            last_pcm_us = esp_timer_get_time();
         }
 
         if (current_frame >= current->frames) {
+            // One timer read per decoded block, not per PCM frame.
+            last_pcm_us = esp_timer_get_time();
             current = nullptr;
             current_frame = 0U;
             const uint32_t tail = __atomic_load_n(&g_tail, __ATOMIC_RELAXED);
