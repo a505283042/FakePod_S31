@@ -50,7 +50,7 @@ python receiver.py --bind 0.0.0.0 --port 5004 --rate auto
 
 The default is `auto`, so `--rate auto` can also be omitted. The receiver
 uses a 1.25–2.5 second rolling regression of RTP timestamp progression against
-packet arrival time, then classifies the stream as 44.1, 48, 88.2 or 96 kHz.
+packet arrival time, then classifies the stream as 44.1, 48, 88.2 or 96 kHz. The regression is evaluated four times per second (rather than on every packet) to keep the receive thread responsive.
 It automatically reopens the Windows output stream when FakePod starts a new
 RTP session after switching to a track with a different sample rate.
 
@@ -103,9 +103,13 @@ successful I2S submission and sends it to the configured PC address.
 At 96 kHz / 24-bit / stereo, the PCM payload rate is 4.608 Mbit/s. A full
 240-frame packet contains 1,440 payload bytes plus the 12-byte RTP header.
 
-The receiver uses a bounded jitter/reorder queue and inserts silence for
-missing RTP sequence numbers. It reports packet rate, throughput, loss,
-reordering, queue depth and playback underruns.
+The receiver uses a bounded RTP reorder stage followed by a preallocated,
+frame-based PCM ring buffer. The PortAudio callback only copies already-decoded
+PCM from this ring; it does not acquire Python Queue items or perform packet
+work. The default startup prebuffer is 150 ms. The Windows UDP receive buffer
+is enlarged to absorb short scheduling bursts. It reports packet rate,
+throughput, loss, reordering, buffered audio in milliseconds, ring overruns,
+UDP socket buffer size and playback underruns.
 
 A matching SDP example for a 96 kHz / 24-bit stereo stream is included as
 `fakepod-96k24.sdp`. It documents the standard dynamic payload mapping
