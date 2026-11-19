@@ -9,10 +9,10 @@ sends a small UDP broadcast discovery request; this program replies with its
 RTP port. FakePod then sends the audio stream to the responding PC using UDP
 unicast. No PC IP address needs to be entered in the firmware.
 
-The audio payload is standard RTP L24: packed signed 24-bit PCM in network
-byte order. The receiver automatically estimates the PCM clock rate from
-ordered RTP timestamps and packet arrival times, then opens/reopens the
-Windows output device at the detected rate.
+The audio payload is RTP L24: packed signed 24-bit PCM in network byte order.
+New FakePod packets include a one-word RTP header extension (profile 0xF0D1)
+with the exact 32-bit PCM sample rate. The receiver uses that rate directly;
+legacy packets without the extension retain timestamp/arrival-rate estimation.
 
 ## 1. Network setup
 
@@ -66,12 +66,11 @@ Keep the receiver running before starting playback on FakePod. The console
 prints that automatic discovery is ready. When FakePod probes the LAN, the
 receiver replies automatically; FakePod logs the selected PC IP and RTP port.
 
-The receiver uses a 1.25–2.5 second rolling regression of RTP timestamp
-progression against packet arrival time, then classifies the stream as 44.1,
-48, 88.2 or 96 kHz. The regression is evaluated four times per second to keep
-the receive thread responsive. It automatically reopens the Windows output
-stream when FakePod starts a new RTP session after switching to a track with a
-different sample rate.
+For new FakePod firmware, the receiver reads the exact sample rate from the
+RTP audio-format extension and immediately opens/reopens the Windows output
+stream at 44.1, 48, 88.2 or 96 kHz. Legacy packets without the extension use a
+1.25–2.5 second rolling regression of RTP timestamp progression against packet
+arrival time as a compatibility fallback.
 
 For a fixed-rate diagnostic test, use `--rate 44100`, `48000`, `88200` or
 `96000` to disable automatic detection.
@@ -140,8 +139,12 @@ is limited to the local IPv4 broadcast domain; it does not cross routers/VLANs.
 - Packetization: up to 240 stereo frames per RTP packet
 - Destination: automatically discovered PC IP, UDP port 5004 by default
 
-At 96 kHz / 24-bit / stereo, the PCM payload rate is 4.608 Mbit/s. A full
-240-frame packet contains 1,440 payload bytes plus the 12-byte RTP header.
+The FakePod audio-format extension uses profile 0xF0D1, length 1 (one 32-bit
+word), followed by the sample rate in big-endian order. A full 240-frame packet
+contains 1,440 payload bytes plus the 20-byte RTP header and extension (1,460
+bytes total). Including IPv4 and UDP headers, this is 1,488 bytes, within a
+standard 1,500-byte MTU. At 96 kHz / 24-bit / stereo, the PCM payload rate is
+4.608 Mbit/s.
 
 The receiver uses a bounded RTP reorder stage followed by a preallocated,
 frame-based PCM ring buffer. The PortAudio callback only copies already-decoded
