@@ -1264,8 +1264,14 @@ static void spectrum_delayed_start_cb(lv_timer_t *timer)
         lv_timer_del(timer);
     }
     g_delayed_start_timer = nullptr;
-    if (g_visible && g_timer != nullptr) {
-        lv_timer_resume(g_timer);
+    if (g_visible) {
+        // Defer FFT task creation until the page-switch first frame has settled.
+        if (!g_hi_res_guard_active) {
+            audio_service_set_spectrum_enabled(true);
+        }
+        if (g_timer != nullptr) {
+            lv_timer_resume(g_timer);
+        }
     }
 }
 } // namespace
@@ -1395,19 +1401,23 @@ void spectrum_view_open()
         g_last_displayed_second = audio.position_ms / 1000ULL;
     }
     spectrum_update_bars();
-    // 延迟 100ms 启动频谱定时器，让 LVGL 先完成页面切换首帧渲染，
-    // 避免首帧渲染与频谱自绘叠加造成卡顿。
+    // Delay both FFT task creation and spectrum animation by 100ms so the
+    // LVGL page-switch first frame can finish before Core1 receives FFT work.
     if (g_timer != nullptr) {
         if (g_delayed_start_timer != nullptr) {
             lv_timer_del(g_delayed_start_timer);
+            g_delayed_start_timer = nullptr;
         }
         g_delayed_start_timer = lv_timer_create(spectrum_delayed_start_cb, 100, nullptr);
         if (g_delayed_start_timer != nullptr) {
             lv_timer_set_repeat_count(g_delayed_start_timer, 1);
+        } else {
+            // Preserve functionality if the one-shot timer cannot be allocated.
+            if (!g_hi_res_guard_active) {
+                audio_service_set_spectrum_enabled(true);
+            }
+            lv_timer_resume(g_timer);
         }
-    }
-    if (!g_hi_res_guard_active) {
-        audio_service_set_spectrum_enabled(true);
     }
     UI_PAGE_INTERACTION_LOGI("打开频谱页：style=%u %s guard=%u",
         static_cast<unsigned>(g_style), spectrum_style_name(g_style),
@@ -1465,17 +1475,25 @@ void spectrum_view_resume_after_app_switch()
     if (audio_service_get_snapshot(&audio)) {
         spectrum_update_hi_res_guard(audio);
     }
-    if (!g_hi_res_guard_active) {
-        audio_service_set_spectrum_enabled(true);
-    }
-
-    // 不清柱高/样式缓存，直接同步后台期间产生的最新 Audio/Spectrum Snapshot。
-    spectrum_timer_cb(nullptr);
+    // Reuse the same staged startup as a normal page open. Do not create the
+    // FFT task in the app-switch call stack while LVGL is presenting the page.
     if (g_timer != nullptr) {
         lv_timer_reset(g_timer);
-        lv_timer_resume(g_timer);
+        if (g_delayed_start_timer != nullptr) {
+            lv_timer_del(g_delayed_start_timer);
+            g_delayed_start_timer = nullptr;
+        }
+        g_delayed_start_timer = lv_timer_create(spectrum_delayed_start_cb, 100, nullptr);
+        if (g_delayed_start_timer != nullptr) {
+            lv_timer_set_repeat_count(g_delayed_start_timer, 1);
+        } else {
+            if (!g_hi_res_guard_active) {
+                audio_service_set_spectrum_enabled(true);
+            }
+            lv_timer_resume(g_timer);
+        }
     }
-    UI_PAGE_INTERACTION_LOGI("频谱页恢复：同步最新状态 guard=%u",
+    UI_PAGE_INTERACTION_LOGI("频谱页恢复：延迟100ms启动FFT与动画 guard=%u",
         g_hi_res_guard_active ? 1U : 0U);
 }
 
