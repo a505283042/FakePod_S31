@@ -20,6 +20,13 @@ RTP_FIXED_HEADER_BYTES = 12
 BYTES_PER_STEREO_FRAME = 6
 PACKET_FRAMES = 240
 
+# FakePod automatic receiver discovery protocol (12-byte UDP datagrams).
+DISCOVERY_VERSION = 1
+DISCOVERY_REQUEST_MAGIC = b"FPRD"
+DISCOVERY_RESPONSE_MAGIC = b"FPRR"
+DISCOVERY_REQUEST = struct.Struct("!4sB3xI")
+DISCOVERY_RESPONSE = struct.Struct("!4sBBHI")
+
 
 def decode_l24_stereo(payload: bytes) -> np.ndarray:
     if not payload or len(payload) % BYTES_PER_STEREO_FRAME:
@@ -133,7 +140,13 @@ class PcmRingBuffer:
 
 
 class RtpAudioReceiver:
-    def __init__(self, sample_rate: Optional[int], prebuffer_ms: int, queue_packets: int):
+    def __init__(
+        self,
+        sample_rate: Optional[int],
+        prebuffer_ms: int,
+        queue_packets: int,
+        discovery_port: int = 5005,
+    ):
         # None means automatic RTP clock-rate detection. RTP L24 carries no
         # explicit clock rate in each packet, so auto mode estimates it from
         # ordered RTP timestamps versus packet arrival time.
@@ -155,6 +168,10 @@ class RtpAudioReceiver:
         self.stop_event = threading.Event()
         self.thread: Optional[threading.Thread] = None
         self.sock: Optional[socket.socket] = None
+        self.discovery_port = int(discovery_port)
+        self.discovery_sock: Optional[socket.socket] = None
+        self.discovery_thread: Optional[threading.Thread] = None
+        self.discovery_requests = 0
 
         self.expected_sequence: Optional[int] = None
         self.ssrc: Optional[int] = None
@@ -348,6 +365,42 @@ class RtpAudioReceiver:
         self.bytes_received += len(packet)
         self._flush_reorder_buffer(time.monotonic())
 
+    def _discovery_loop(self):
+        """Answer FakePod UDP discovery probes with this receiver's RTP port."""
+        assert self.discovery_sock is not None
+        while not self.stop_event.is_set():
+            try:
+                packet, sender = self.discovery_sock.recvfrom(128)
+            except socket.timeout:
+                continue
+            except OSError:
+                if not self.stop_event.is_set():
+                    print("[DISCOVERY] Discovery socket stopped unexpectedly.")
+                break
+
+            if len(packet) != DISCOVERY_REQUEST.size:
+                continue
+            try:
+                magic, version, nonce = DISCOVERY_REQUEST.unpack(packet)
+            except struct.error:
+                continue
+            if magic != DISCOVERY_REQUEST_MAGIC or version != DISCOVERY_VERSION:
+                continue
+
+            response = DISCOVERY_RESPONSE.pack(
+                DISCOVERY_RESPONSE_MAGIC,
+                DISCOVERY_VERSION,
+                0,  # flags reserved for future receiver capabilities
+                self.rtp_port,
+                nonce,
+            )
+            try:
+                self.discovery_sock.sendto(response, sender)
+                self.discovery_requests += 1
+            except OSError as exc:
+                if not self.stop_event.is_set():
+                    print(f"[DISCOVERY] Cannot reply to {sender[0]}: {exc}")
+
     def _receive_loop(self, bind_address: str, port: int):
         assert self.sock is not None
         self.sock.settimeout(0.005)
@@ -368,13 +421,39 @@ class RtpAudioReceiver:
                 self.bad_packets += 1
 
     def start(self, bind_address: str, port: int):
+        self.rtp_port = int(port)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
         self.socket_receive_buffer = self.sock.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
-        self.sock.bind((bind_address, port))
+
+        try:
+            self.sock.bind((bind_address, self.rtp_port))
+
+            # The discovery listener is separate from the high-rate RTP socket
+            # so discovery replies cannot delay audio packet reception.
+            self.discovery_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.discovery_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.discovery_sock.bind(("0.0.0.0", self.discovery_port))
+            self.discovery_sock.settimeout(0.25)
+        except OSError:
+            if self.discovery_sock is not None:
+                self.discovery_sock.close()
+                self.discovery_sock = None
+            if self.sock is not None:
+                self.sock.close()
+                self.sock = None
+            raise
+
+        self.discovery_thread = threading.Thread(
+            target=self._discovery_loop,
+            name="FakePod-RTP-Discovery",
+            daemon=True,
+        )
+        self.discovery_thread.start()
+
         self.thread = threading.Thread(
             target=self._receive_loop,
-            args=(bind_address, port),
+            args=(bind_address, self.rtp_port),
             name="RTP-L24-Receiver",
             daemon=True,
         )
@@ -385,8 +464,13 @@ class RtpAudioReceiver:
         if self.sock is not None:
             self.sock.close()
             self.sock = None
+        if self.discovery_sock is not None:
+            self.discovery_sock.close()
+            self.discovery_sock = None
         if self.thread is not None:
             self.thread.join(timeout=1.0)
+        if self.discovery_thread is not None:
+            self.discovery_thread.join(timeout=1.0)
 
     def audio_callback(self, outdata, frames, _time_info, status):
         # Bounded callback: zero-fill and copy from preallocated PCM memory only.
@@ -429,6 +513,12 @@ def main():
     )
     parser.add_argument("--bind", default="0.0.0.0", help="local IPv4 bind address")
     parser.add_argument("--port", type=int, default=5004, help="RTP UDP port")
+    parser.add_argument(
+        "--discovery-port",
+        type=int,
+        default=5005,
+        help="FakePod UDP discovery port (default: 5005)",
+    )
     parser.add_argument("--rate", default="auto",
                         help="PCM sample rate (44100/48000/88200/96000) or auto")
     parser.add_argument("--device", default=None,
@@ -442,6 +532,13 @@ def main():
         print(sd.query_devices())
         return
 
+    if not (1024 <= args.port <= 65535):
+        parser.error("--port must be between 1024 and 65535")
+    if not (1024 <= args.discovery_port <= 65535):
+        parser.error("--discovery-port must be between 1024 and 65535")
+    if args.discovery_port == args.port:
+        parser.error("--discovery-port must differ from --port")
+
     try:
         sample_rate = None if args.rate.lower() == "auto" else int(args.rate)
     except ValueError:
@@ -453,10 +550,15 @@ def main():
         sample_rate=sample_rate,
         prebuffer_ms=args.prebuffer_ms,
         queue_packets=args.queue_packets,
+        discovery_port=args.discovery_port,
     )
     receiver.start(args.bind, args.port)
 
     print(f"Listening RTP L24 stereo on {args.bind}:{args.port}")
+    print(
+        f"FakePod auto-discovery ready on UDP {args.discovery_port}; "
+        "the first responding receiver is selected automatically"
+    )
     print(
         "Sample rate: automatic detection from RTP timestamps"
         if sample_rate is None
