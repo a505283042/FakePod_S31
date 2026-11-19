@@ -36,9 +36,9 @@ FakePod discovery requests and returns the RTP port (5004 by default).
 Use Python 3.10 or newer:
 
 ```powershell
-cd tools\\wifi_rtp_receiver
+cd tools\wifi_rtp_receiver
 py -m venv .venv
-.\\.venv\\Scripts\\Activate.ps1
+.\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
