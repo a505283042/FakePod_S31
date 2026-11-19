@@ -17,7 +17,6 @@ constexpr int kEngineTimeoutMs = 800;
 // 失败原因只打印前几次，避免视频逐帧回退时刷屏。
 constexpr int kMaxFailureLogs = 3;
 
-SemaphoreHandle_t g_lock = nullptr;
 jpeg_decoder_handle_t g_engine = nullptr;
 bool g_engine_init_failed = false;
 uint8_t *g_pad_buffer = nullptr;
@@ -31,7 +30,7 @@ SemaphoreHandle_t lock()
     return s_lock;
 }
 
-// 调用方需持有 g_lock。
+// 调用方需持有 lock() 返回的互斥量。
 bool ensure_engine_locked()
 {
     if (g_engine != nullptr) return true;
