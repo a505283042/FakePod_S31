@@ -17,6 +17,8 @@ import sounddevice as sd
 RTP_VERSION = 2
 RTP_PAYLOAD_TYPE_L24 = 96
 RTP_FIXED_HEADER_BYTES = 12
+RTP_AUDIO_EXTENSION_PROFILE = 0xF0D1
+SUPPORTED_SAMPLE_RATES = (44100, 48000, 88200, 96000)
 BYTES_PER_STEREO_FRAME = 6
 PACKET_FRAMES = 240
 
@@ -65,13 +67,22 @@ def parse_rtp(packet: bytes):
     if len(packet) < offset:
         raise ValueError("truncated RTP CSRC list")
 
+    sample_rate = None
     if extension:
         if len(packet) < offset + 4:
             raise ValueError("truncated RTP extension header")
-        extension_words = struct.unpack_from("!H", packet, offset + 2)[0]
-        offset += 4 + extension_words * 4
-        if len(packet) < offset:
+        extension_profile, extension_words = struct.unpack_from("!HH", packet, offset)
+        extension_data_offset = offset + 4
+        extension_end = extension_data_offset + extension_words * 4
+        if len(packet) < extension_end:
             raise ValueError("truncated RTP extension data")
+        if extension_profile == RTP_AUDIO_EXTENSION_PROFILE:
+            if extension_words != 1:
+                raise ValueError("invalid FakePod audio-format extension length")
+            sample_rate = struct.unpack_from("!I", packet, extension_data_offset)[0]
+            if sample_rate not in SUPPORTED_SAMPLE_RATES:
+                raise ValueError(f"unsupported RTP sample rate {sample_rate}")
+        offset = extension_end
 
     end = len(packet)
     if padding:
@@ -82,7 +93,7 @@ def parse_rtp(packet: bytes):
 
     payload = packet[offset:end]
     pcm = decode_l24_stereo(payload)
-    return marker, sequence, timestamp, ssrc, pcm
+    return marker, sequence, timestamp, ssrc, pcm, sample_rate
 
 
 class PcmRingBuffer:
@@ -147,9 +158,8 @@ class RtpAudioReceiver:
         queue_packets: int,
         discovery_port: int = 5005,
     ):
-        # None means automatic RTP clock-rate detection. RTP L24 carries no
-        # explicit clock rate in each packet, so auto mode estimates it from
-        # ordered RTP timestamps versus packet arrival time.
+        # In auto mode prefer FakePod's explicit RTP audio-format extension.
+        # Legacy RTP without that extension falls back to timestamp/arrival estimation.
         self.manual_sample_rate = sample_rate
         self.detected_rate: Optional[int] = sample_rate
         self.rate_estimate_hz: Optional[float] = (
@@ -158,6 +168,7 @@ class RtpAudioReceiver:
         self.prebuffer_ms = prebuffer_ms
         self.prebuffer_packets = self._prebuffer_count(sample_rate, prebuffer_ms) if sample_rate else 40
         self.rate_observations = deque(maxlen=1024)
+        self.explicit_rate = False
         self.last_rtp_timestamp: Optional[int] = None
         self.unwrapped_rtp_timestamp = 0
         self.rate_candidate: Optional[int] = None
@@ -207,11 +218,28 @@ class RtpAudioReceiver:
         self.rate_candidate = None
         self.rate_candidate_streak = 0
         self.rate_estimate_hz = None
+        self.explicit_rate = False
         if self.manual_sample_rate is None:
             self.detected_rate = None
 
+    def _apply_explicit_sample_rate(self, sample_rate: int):
+        changed = self.detected_rate != sample_rate
+        self.explicit_rate = True
+        self.detected_rate = sample_rate
+        self.rate_estimate_hz = float(sample_rate)
+        self.rate_candidate = sample_rate
+        self.rate_candidate_streak = 0
+        self.rate_observations.clear()
+        self.last_rtp_timestamp = None
+        self.unwrapped_rtp_timestamp = 0
+        if changed:
+            self.prebuffer_packets = self._prebuffer_count(sample_rate, self.prebuffer_ms)
+            self.prebuffer_frames = self.prebuffer_packets * PACKET_FRAMES
+            self._clear_audio_queue()
+            print(f"\\n[RTP] Explicit sample rate: {sample_rate} Hz")
+
     def _observe_sample_rate(self, rtp_timestamp: int, arrival_time: float):
-        if self.manual_sample_rate is not None:
+        if self.manual_sample_rate is not None or self.explicit_rate:
             return
 
         if self.last_rtp_timestamp is None:
@@ -328,7 +356,7 @@ class RtpAudioReceiver:
             self.expected_sequence = (expected + 1) & 0xFFFF
 
     def _handle_packet(self, packet: bytes, sender):
-        marker, sequence, rtp_timestamp, ssrc, pcm = parse_rtp(packet)
+        marker, sequence, rtp_timestamp, ssrc, pcm, packet_rate = parse_rtp(packet)
         self.last_sender = f"{sender[0]}:{sender[1]}"
 
         if self.ssrc != ssrc or marker:
@@ -340,7 +368,18 @@ class RtpAudioReceiver:
             self._clear_audio_queue()
             self.playing = False
             if self.manual_sample_rate is None:
-                self._reset_rate_detector()
+                if packet_rate is not None:
+                    self._apply_explicit_sample_rate(packet_rate)
+                else:
+                    self._reset_rate_detector()
+
+        elif self.manual_sample_rate is None and packet_rate is not None:
+            if self.detected_rate != packet_rate:
+                # Treat an in-session format change as a fresh audio timeline.
+                self.expected_sequence = sequence
+                self.pending.clear()
+                self._clear_audio_queue()
+                self._apply_explicit_sample_rate(packet_rate)
 
         if self.expected_sequence is None:
             self.expected_sequence = sequence
