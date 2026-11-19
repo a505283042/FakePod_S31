@@ -18,6 +18,7 @@
 #include "audio_playback_clock.h"
 #include "audio_rate_profile.h"
 #include "audio_spectrum_snapshot.h"
+#include "wifi_rtp_test.h"
 #include "nsf_synth.h"
 #include "sources/avi_mp3_audio_source.h"
 #include "sources/buffered_http_audio_source.h"
@@ -25,6 +26,16 @@
 #include "app_diag_config.h"
 
 static const char *TAG = "音频服务";
+
+#if defined(CONFIG_FAKEPOD_WIFI_RTP_TEST_ENABLE) && CONFIG_FAKEPOD_WIFI_RTP_TEST_ENABLE
+static void audio_service_start_wifi_rtp_test()
+{
+    const esp_err_t ret = wifi_rtp_test_start();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "PC RTP 测试发送器启动失败：%s；不影响本地播放", esp_err_to_name(ret));
+    }
+}
+#endif
 
 #if APP_DIAG_AUDIO_POP
 #define AUDIO_POP_TRACE_LOG(...) \
@@ -3068,6 +3079,10 @@ static void audio_task_service_pcm_playback()
         return;
     }
     audio_task_note_music_pcm(g_pcm_block, frames);
+#if defined(CONFIG_FAKEPOD_WIFI_RTP_TEST_ENABLE) && CONFIG_FAKEPOD_WIFI_RTP_TEST_ENABLE
+    // Test-only tap: copy decoded PCM to a bounded PSRAM queue; never wait for UDP.
+    wifi_rtp_test_publish_pcm32(g_pcm_block, frames, g_task_sample_rate_hz);
+#endif
 
     // i2s_output_stream_write_pcm32() 成功表示整块真实 PCM 已复制进 DMA。
     // 启动 prime、暂停保持时钟和 EOF drain 都走 silence API，因此不会污染该计数。
@@ -6735,6 +6750,11 @@ esp_err_t audio_service_start()
             ESP_LOGE(TAG, "等待已存在的 AudioTask 初始化超时");
             return ESP_ERR_TIMEOUT;
         }
+        if (g_start_result == ESP_OK) {
+#if defined(CONFIG_FAKEPOD_WIFI_RTP_TEST_ENABLE) && CONFIG_FAKEPOD_WIFI_RTP_TEST_ENABLE
+            audio_service_start_wifi_rtp_test();
+#endif
+        }
         return g_start_result;
     }
 
@@ -6763,6 +6783,11 @@ esp_err_t audio_service_start()
         return ESP_ERR_TIMEOUT;
     }
 
+    if (g_start_result == ESP_OK) {
+#if defined(CONFIG_FAKEPOD_WIFI_RTP_TEST_ENABLE) && CONFIG_FAKEPOD_WIFI_RTP_TEST_ENABLE
+        audio_service_start_wifi_rtp_test();
+#endif
+    }
     return g_start_result;
 }
 
