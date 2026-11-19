@@ -5,8 +5,10 @@ optional FakePod Wi-Fi test sender and plays it through the Windows audio
 device using PortAudio.
 
 The audio payload is not a FakePod-specific UDP frame: it is packed 24-bit
-signed PCM in network byte order as defined for RTP L24. The receiver currently
-expects the sample rate to be supplied on the command line.
+signed PCM in network byte order as defined for RTP L24. By default, the PC
+receiver automatically estimates the PCM clock rate from ordered RTP timestamps
+and packet arrival times, then opens/reopens the Windows output device at the
+detected rate.
 
 ## 1. Network setup
 
@@ -40,15 +42,20 @@ List available output devices:
 python receiver.py --list-devices
 ```
 
-Start a 96 kHz receiver:
+Start the receiver with automatic sample-rate detection (recommended):
 
 ```powershell
-python receiver.py --bind 0.0.0.0 --port 5004 --rate 96000
+python receiver.py --bind 0.0.0.0 --port 5004 --rate auto
 ```
 
-The `--rate` value must match the track currently playing on FakePod. Use
-`44100`, `48000`, `88200`, or `96000` as appropriate. Restart the receiver
-when switching to a track with a different sample rate.
+The default is `auto`, so `--rate auto` can also be omitted. The receiver
+uses a 1.25–2.5 second rolling regression of RTP timestamp progression against
+packet arrival time, then classifies the stream as 44.1, 48, 88.2 or 96 kHz.
+It automatically reopens the Windows output stream when FakePod starts a new
+RTP session after switching to a track with a different sample rate.
+
+For a fixed-rate diagnostic test, `--rate 44100`, `48000`, `88200` or
+`96000` disables automatic detection.
 
 If the default output device cannot open the requested sample rate, select a
 suitable device with `--device` after checking `--list-devices`.
@@ -110,8 +117,12 @@ A matching SDP example for a 96 kHz / 24-bit stereo stream is included as
 - Existing CS43131/I2S playback remains active; PC playback is an additional
   output. Adjust or mute the FakePod's local analog output if both are audible.
 - The sender is disabled in the normal firmware environment.
-- The PC receiver's sample rate is selected manually. Dynamic RTP session
-  description/SDP negotiation is not implemented in this first test.
+- RTP L24 does not carry its clock rate in each RTP packet. This test receiver
+  infers the rate from RTP timestamps and arrival timing; it is intended for
+  this FakePod sender, whose RTP timestamp increments in PCM sample frames and
+  whose SSRC changes on a sample-rate/session restart. This inference is not
+  a substitute for SDP/RTSP clock-rate signaling when interoperating with
+  arbitrary third-party RTP senders.
 - No audio is sent while Wi-Fi is disconnected. The sender queue is bounded;
   on overflow it drops stale queued audio and starts a new RTP session rather
   than delaying playback indefinitely.
