@@ -100,6 +100,10 @@ The receiver uses a bounded jitter/reorder queue and inserts silence for
 missing RTP sequence numbers. It reports packet rate, throughput, loss,
 reordering, queue depth and playback underruns.
 
+A matching SDP example for a 96 kHz / 24-bit stereo stream is included as
+`fakepod-96k24.sdp`. It documents the standard dynamic payload mapping
+`L24/96000/2` for use with other RTP-capable tools.
+
 ## 5. Scope and limitations of this first validation
 
 - This is a test-only output tap for regular Music playback (local or NAS).
