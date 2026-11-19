@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import queue
+from collections import deque
 import socket
 import struct
 import threading
@@ -79,11 +80,22 @@ def parse_rtp(packet: bytes):
 
 
 class RtpAudioReceiver:
-    def __init__(self, sample_rate: int, prebuffer_ms: int, queue_packets: int):
-        self.sample_rate = sample_rate
-        self.prebuffer_packets = max(
-            2, int(np.ceil(sample_rate * prebuffer_ms / 1000.0 / PACKET_FRAMES))
+    def __init__(self, sample_rate: Optional[int], prebuffer_ms: int, queue_packets: int):
+        # None means automatic RTP clock-rate detection. RTP L24 carries no
+        # explicit clock rate in each packet, so auto mode estimates it from
+        # ordered RTP timestamps versus packet arrival time.
+        self.manual_sample_rate = sample_rate
+        self.detected_rate: Optional[int] = sample_rate
+        self.rate_estimate_hz: Optional[float] = (
+            float(sample_rate) if sample_rate is not None else None
         )
+        self.prebuffer_ms = prebuffer_ms
+        self.prebuffer_packets = self._prebuffer_count(sample_rate) if sample_rate else 40
+        self.rate_observations = deque(maxlen=1024)
+        self.last_rtp_timestamp: Optional[int] = None
+        self.unwrapped_rtp_timestamp = 0
+        self.rate_candidate: Optional[int] = None
+        self.rate_candidate_streak = 0
         self.audio_queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=queue_packets)
         self.stop_event = threading.Event()
         self.thread: Optional[threading.Thread] = None
@@ -111,6 +123,99 @@ class RtpAudioReceiver:
         self.stream_restarts = 0
         self.last_sender = ""
 
+    @staticmethod
+    def _prebuffer_count(sample_rate: Optional[int]) -> int:
+        if not sample_rate:
+            return 40
+        return max(
+            2, int(np.ceil(sample_rate * 100 / 1000.0 / PACKET_FRAMES))
+        )
+
+    def _reset_rate_detector(self):
+        self.rate_observations.clear()
+        self.last_rtp_timestamp = None
+        self.unwrapped_rtp_timestamp = 0
+        self.rate_candidate = None
+        self.rate_candidate_streak = 0
+        self.rate_estimate_hz = None
+        if self.manual_sample_rate is None:
+            self.detected_rate = None
+
+    def _observe_sample_rate(self, rtp_timestamp: int, arrival_time: float):
+        if self.manual_sample_rate is not None:
+            return
+
+        if self.last_rtp_timestamp is None:
+            self.last_rtp_timestamp = rtp_timestamp
+            self.unwrapped_rtp_timestamp = rtp_timestamp
+            self.rate_observations.append((arrival_time, self.unwrapped_rtp_timestamp))
+            return
+
+        # Unwrap the 32-bit RTP timestamp. Packets reach this method in RTP
+        # sequence order, after the receiver's small reorder buffer.
+        delta = (rtp_timestamp - self.last_rtp_timestamp) & 0xFFFFFFFF
+        if delta == 0 or delta >= 0x80000000:
+            return
+        self.unwrapped_rtp_timestamp += delta
+        self.last_rtp_timestamp = rtp_timestamp
+        self.rate_observations.append((arrival_time, self.unwrapped_rtp_timestamp))
+
+        # Use a multi-second regression to average out Wi-Fi jitter and task
+        # scheduling bursts. The RTP timestamp clock is the PCM sample clock.
+        while (
+            len(self.rate_observations) > 2
+            and arrival_time - self.rate_observations[0][0] > 2.5
+        ):
+            self.rate_observations.popleft()
+
+        if len(self.rate_observations) < 40:
+            return
+
+        first_time = self.rate_observations[0][0]
+        last_time = self.rate_observations[-1][0]
+        if last_time - first_time < 1.25:
+            return
+
+        times = np.fromiter(
+            (item[0] for item in self.rate_observations), dtype=np.float64
+        )
+        ticks = np.fromiter(
+            (item[1] for item in self.rate_observations), dtype=np.float64
+        )
+        times -= times[0]
+        times_centered = times - times.mean()
+        denominator = float(np.dot(times_centered, times_centered))
+        if denominator <= 0.0:
+            return
+
+        ticks_centered = ticks - ticks.mean()
+        estimate = float(np.dot(times_centered, ticks_centered) / denominator)
+        self.rate_estimate_hz = estimate
+
+        supported_rates = (44100, 48000, 88200, 96000)
+        candidate = min(supported_rates, key=lambda rate: abs(rate - estimate))
+        relative_error = abs(candidate - estimate) / candidate
+        if relative_error > 0.015:
+            self.rate_candidate = None
+            self.rate_candidate_streak = 0
+            return
+
+        if candidate == self.rate_candidate:
+            self.rate_candidate_streak += 1
+        else:
+            self.rate_candidate = candidate
+            self.rate_candidate_streak = 1
+
+        # Require repeated agreement after a >=1.25 s observation window.
+        if self.rate_candidate_streak >= 8 and self.detected_rate != candidate:
+            self.detected_rate = candidate
+            self.prebuffer_packets = self._prebuffer_count(candidate)
+            # Discard packets accumulated while identifying the stream so
+            # playback starts near live time after PortAudio opens the device.
+            self._clear_audio_queue()
+            self.playing = False
+            print(f"\n[AUTO] RTP clock rate detected: {candidate} Hz")
+
     def _clear_audio_queue(self):
         while True:
             try:
@@ -136,12 +241,14 @@ class RtpAudioReceiver:
             expected = self.expected_sequence
             item = self.pending.pop(expected, None)
             if item is not None:
-                self._enqueue_audio(item[1])
+                arrival, rtp_timestamp, pcm = item
+                self._observe_sample_rate(rtp_timestamp, arrival)
+                self._enqueue_audio(pcm)
                 self.expected_sequence = (expected + 1) & 0xFFFF
                 continue
 
             ahead = []
-            for sequence, (arrival, pcm) in self.pending.items():
+            for sequence, (arrival, rtp_timestamp, pcm) in self.pending.items():
                 distance = (sequence - expected) & 0xFFFF
                 if 0 < distance < 0x8000:
                     ahead.append((distance, arrival, pcm))
@@ -160,7 +267,7 @@ class RtpAudioReceiver:
             self.expected_sequence = (expected + 1) & 0xFFFF
 
     def _handle_packet(self, packet: bytes, sender):
-        marker, sequence, _timestamp, ssrc, pcm = parse_rtp(packet)
+        marker, sequence, rtp_timestamp, ssrc, pcm = parse_rtp(packet)
         self.last_sender = f"{sender[0]}:{sender[1]}"
 
         if self.ssrc != ssrc or marker:
@@ -171,6 +278,8 @@ class RtpAudioReceiver:
             self.pending.clear()
             self._clear_audio_queue()
             self.playing = False
+            if self.manual_sample_rate is None:
+                self._reset_rate_detector()
 
         if self.expected_sequence is None:
             self.expected_sequence = sequence
@@ -190,7 +299,7 @@ class RtpAudioReceiver:
             self.duplicate_packets += 1
             return
 
-        self.pending[sequence] = (time.monotonic(), pcm)
+        self.pending[sequence] = (time.monotonic(), rtp_timestamp, pcm)
         self.packets += 1
         self.bytes_received += len(packet)
         self._flush_reorder_buffer(time.monotonic())
@@ -287,6 +396,9 @@ class RtpAudioReceiver:
             "underruns": self.underruns,
             "ssrc": self.ssrc,
             "sender": self.last_sender,
+            "rate": self.detected_rate,
+            "rate_estimate": self.rate_estimate_hz,
+            "rate_candidate": self.rate_candidate,
         }
 
 
@@ -296,8 +408,8 @@ def main():
     )
     parser.add_argument("--bind", default="0.0.0.0", help="local IPv4 bind address")
     parser.add_argument("--port", type=int, default=5004, help="RTP UDP port")
-    parser.add_argument("--rate", type=int, default=96000,
-                        help="PCM sample rate; must match the playing track")
+    parser.add_argument("--rate", default="auto",
+                        help="PCM sample rate (44100/48000/88200/96000) or auto")
     parser.add_argument("--device", default=None,
                         help="PortAudio output device index or name")
     parser.add_argument("--prebuffer-ms", type=int, default=100)
@@ -309,42 +421,93 @@ def main():
         print(sd.query_devices())
         return
 
+    try:
+        sample_rate = None if args.rate.lower() == "auto" else int(args.rate)
+    except ValueError:
+        parser.error("--rate must be auto, 44100, 48000, 88200 or 96000")
+    if sample_rate is not None and sample_rate not in (44100, 48000, 88200, 96000):
+        parser.error("supported rates: 44100, 48000, 88200, 96000")
+
     receiver = RtpAudioReceiver(
-        sample_rate=args.rate,
+        sample_rate=sample_rate,
         prebuffer_ms=args.prebuffer_ms,
         queue_packets=args.queue_packets,
     )
     receiver.start(args.bind, args.port)
 
     print(f"Listening RTP L24 stereo on {args.bind}:{args.port}")
-    print(f"Expected format: {args.rate} Hz, 24-bit, 2 channels")
-    print(f"Prebuffer: {args.prebuffer_ms} ms ({receiver.prebuffer_packets} packets)")
+    print(
+        "Sample rate: automatic detection from RTP timestamps"
+        if sample_rate is None
+        else f"Sample rate: fixed at {sample_rate} Hz"
+    )
     print("Press Ctrl+C to stop.")
     print()
 
+    output_stream = None
+    output_rate = None
+    attempted_rate = None
+    previous = receiver.stats_snapshot()
+    previous_time = time.monotonic()
+    last_stats_time = previous_time
+
     try:
-        with sd.OutputStream(
-            device=args.device,
-            samplerate=args.rate,
-            channels=2,
-            dtype="float32",
-            blocksize=0,
-            latency="high",
-            callback=receiver.audio_callback,
-        ):
-            previous = receiver.stats_snapshot()
-            previous_time = time.monotonic()
-            while True:
-                time.sleep(1.0)
-                current = receiver.stats_snapshot()
-                now = time.monotonic()
+        while True:
+            current = receiver.stats_snapshot()
+            requested_rate = current["rate"]
+
+            # PortAudio streams cannot change sample rate in-place. Reopen the
+            # output stream when a new RTP session is detected after a track
+            # sample-rate change.
+            if requested_rate != output_rate and requested_rate != attempted_rate:
+                if output_stream is not None:
+                    try:
+                        output_stream.stop()
+                    finally:
+                        output_stream.close()
+                    output_stream = None
+                    output_rate = None
+
+                attempted_rate = requested_rate
+                if requested_rate is not None:
+                    try:
+                        output_stream = sd.OutputStream(
+                            device=args.device,
+                            samplerate=requested_rate,
+                            channels=2,
+                            dtype="float32",
+                            blocksize=0,
+                            latency="high",
+                            callback=receiver.audio_callback,
+                        )
+                        output_stream.start()
+                        output_rate = requested_rate
+                        print(f"[AUDIO] Windows output opened at {requested_rate} Hz")
+                    except Exception as exc:
+                        output_stream = None
+                        output_rate = None
+                        print(
+                            f"[AUDIO] Cannot open output at {requested_rate} Hz: {exc}. "
+                            "Check the selected Windows output device."
+                        )
+
+            now = time.monotonic()
+            if now - last_stats_time >= 1.0:
                 elapsed = max(0.001, now - previous_time)
                 packet_rate = (current["packets"] - previous["packets"]) / elapsed
                 mbps = (
                     (current["bytes"] - previous["bytes"]) * 8.0
                     / elapsed / 1_000_000.0
                 )
+                rate_text = (
+                    f"{current['rate']} Hz"
+                    if current["rate"] is not None
+                    else "detecting"
+                )
+                estimate = current["rate_estimate"]
+                estimate_text = f"{estimate:.0f}" if estimate is not None else "-"
                 print(
+                    f"rate={rate_text} est={estimate_text} Hz  "
                     f"rx={packet_rate:6.1f} pkt/s  {mbps:5.2f} Mbps  "
                     f"lost={current['lost']} late={current['late']} "
                     f"dup={current['duplicate']} bad={current['bad']} "
@@ -354,9 +517,17 @@ def main():
                 )
                 previous = current
                 previous_time = now
+                last_stats_time = now
+
+            time.sleep(0.1)
     except KeyboardInterrupt:
         print("\nStopping receiver...")
     finally:
+        if output_stream is not None:
+            try:
+                output_stream.stop()
+            finally:
+                output_stream.close()
         receiver.stop()
 
 
