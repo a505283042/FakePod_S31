@@ -20,6 +20,7 @@
 #include "ble_remote_service.h"
 #include "bt_audio_source.h"
 #include "bt_audio_sink.h"
+#include "bt_audio_avrc.h"
 #include "device_settings.h"
 #include "font/font_manager.h"
 #include "font/usb_service_font.h"
@@ -1808,6 +1809,15 @@ static void format_bt_sink_value(char *out, size_t cap)
     else snprintf(out, cap, "等待手机配对");
 }
 
+static const char *bluetooth_volume_sync_value()
+{
+    if (!bt_audio_avrc_is_sink_mode()) return "仅发射模式";
+    BtAudioAvrcSnapshot avrc = {};
+    (void)bt_audio_avrc_get_snapshot(&avrc);
+    if (!avrc.connected) return "未连接";
+    return avrc.absolute_volume_supported ? "已同步" : "未同步";
+}
+
 static void bluetooth_transmit_click_cb(lv_event_t *event)
 {
     if (!click_is_valid(event) || g_page != SettingsPage::Bluetooth) return;
@@ -2096,10 +2106,7 @@ static void create_bluetooth_page(const DeviceSettingsSnapshot &settings)
     add_clickable_detail_row(3, "音频接收", rx_value,
         SettingsDetailIcon::Bluetooth, bluetooth_receive_click_cb);
 
-    add_detail_row(4, "音频方向",
-        ble.audio_role_switching ? "正在切换" :
-        (ble.audio_role == DeviceBluetoothAudioRole::Receive
-            ? "手机→有线" : "本机→耳机"),
+    add_detail_row(4, "音量同步", bluetooth_volume_sync_value(),
         SettingsDetailIcon::AudioOutput);
 }
 
@@ -2899,9 +2906,9 @@ static void refresh_timer_cb(lv_timer_t *timer)
             lv_label_set_text(g_detail_values[3], rx_value);
         }
         if (g_detail_values[4] != nullptr) {
-            lv_label_set_text(g_detail_values[4], ble.audio_role_switching
-                ? "正在切换" : (ble.audio_role == DeviceBluetoothAudioRole::Receive
-                    ? "手机→有线" : "本机→耳机"));
+            lv_label_set_text(g_detail_values[4],
+                ble.audio_role_switching ? "正在切换" :
+                bluetooth_volume_sync_value());
         }
     }
     if (g_page == SettingsPage::About) {
