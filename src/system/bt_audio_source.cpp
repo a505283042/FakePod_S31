@@ -141,6 +141,22 @@ static void register_source_endpoints()
 }
 #endif
 
+static esp_err_t source_media_control(esp_a2d_media_ctrl_t command)
+{
+#if FAKEPOD_A2DP_EXTERNAL_CODEC
+    esp_a2d_conn_hdl_t conn = 0U;
+    portENTER_CRITICAL(&s_lock);
+    conn = s_conn_hdl;
+    portEXIT_CRITICAL(&s_lock);
+    if (conn == 0U || conn == ESP_A2D_INVALID_CONN_HDL)
+        return ESP_ERR_INVALID_STATE;
+    // S31 ESP-IDF 6.x: target the actual connected A2DP peer.
+    return esp_a2d_media_ctrl_by_handle(conn, command);
+#else
+    return esp_a2d_media_ctrl(command);
+#endif
+}
+
 static void flush_locked()
 {
     s_read = 0U;
@@ -225,7 +241,9 @@ static void a2dp_event(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         if (seid < 2U) {
             s_sep_reported[seid] = true;
             s_sep_ok[seid] = ok;
-            s_sep_ready = s_sep_reported[0] && s_sep_reported[1] && s_sep_ok[1];
+            // Successful mandatory SBC registration is sufficient to start.
+            // An optional AAC endpoint failure must not block audio forever.
+            s_sep_ready = s_sep_reported[1] && s_sep_ok[1];
         }
         portEXIT_CRITICAL(&s_lock);
         ESP_LOGI(TAG, "A2DP_TX SEP seid=%u registered=%u", unsigned(seid), unsigned(ok));
@@ -316,14 +334,15 @@ static void a2dp_event(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         s_retry_due = xTaskGetTickCount() + kMediaRetryTicks;
         portEXIT_CRITICAL(&s_lock);
         if (start) {
-            const esp_err_t err = esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+            const esp_err_t err = source_media_control(ESP_A2D_MEDIA_CTRL_START);
             if (err == ESP_OK) {
                 portENTER_CRITICAL(&s_lock);
                 s_media_ctrl_pending = true;
                 portEXIT_CRITICAL(&s_lock);
             }
         }
-        if (!ok) ESP_LOGW(TAG, "A2DP media ctrl %d failed", static_cast<int>(command));
+        ESP_LOGI(TAG, "A2DP_TX media ctrl ACK cmd=%d result=%s",
+            static_cast<int>(command), ok ? "OK" : "FAIL");
         break;
     }
     default: break;
@@ -817,11 +836,12 @@ void bt_audio_source_update()
                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)));
     }
     if (attempt) {
-        const esp_err_t err = esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
+        const esp_err_t err = source_media_control(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
         if (err != ESP_OK) {
             portENTER_CRITICAL(&s_lock);
             s_media_ctrl_pending = false;
             portEXIT_CRITICAL(&s_lock);
+            ESP_LOGW(TAG, "A2DP_TX CHECK_SRC_RDY request failed: %s", esp_err_to_name(err));
         }
     }
 #endif
