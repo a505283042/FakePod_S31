@@ -42,6 +42,9 @@ static uint8_t s_pressed_cmd = 0U;
 static bool s_release_pending = false;
 static TickType_t s_release_due = 0;
 static TickType_t s_poll_due = 0;
+static TickType_t s_caps_retry_due = 0;
+static TickType_t s_position_tick = 0;
+static bool s_tg_capabilities_configured = false;
 
 static uint8_t next_label()
 {
@@ -93,6 +96,8 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
         ++s_snapshot.metadata_revision;
         ++s_snapshot.playback_revision;
         s_capabilities_known = false;
+        s_caps_retry_due = 0;
+        s_position_tick = 0;
         s_peer_events = 0U;
         s_metadata_needed = connected;
         s_status_needed = connected;
@@ -142,6 +147,7 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
             s_snapshot.playing =
                 param->play_status_rsp.play_status == ESP_AVRC_PLAYBACK_PLAYING;
             s_snapshot.position_ms = param->play_status_rsp.song_position;
+            s_position_tick = xTaskGetTickCount();
             if (param->play_status_rsp.song_length != UINT32_MAX)
                 s_snapshot.duration_ms = param->play_status_rsp.song_length;
             ++s_snapshot.playback_revision;
@@ -173,6 +179,7 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
                 ++s_snapshot.playback_revision;
             } else if (evt == ESP_AVRC_RN_PLAY_POS_CHANGED) {
                 s_snapshot.position_ms = param->change_ntf.event_parameter.play_pos;
+                s_position_tick = xTaskGetTickCount();
                 s_notifications_needed |= 0x04U;
                 ++s_snapshot.playback_revision;
             }
@@ -241,6 +248,9 @@ static void reset_state()
     s_cmd_count = s_cmd_head = 0U;
     s_release_pending = false;
     s_poll_due = 0;
+    s_caps_retry_due = 0;
+    s_position_tick = 0;
+    s_tg_capabilities_configured = false;
     s_snapshot = {};
     s_snapshot.active = s_active;
 }
@@ -335,6 +345,16 @@ bool bt_audio_avrc_get_snapshot(BtAudioAvrcSnapshot *out)
     *out = s_snapshot;
     out->active = s_active;
     out->connected = s_connected;
+    if (s_position_tick != 0U && out->playback_known && out->playing &&
+        out->position_ms != UINT32_MAX) {
+        const uint32_t elapsed = static_cast<uint32_t>(
+            pdTICKS_TO_MS(xTaskGetTickCount() - s_position_tick));
+        const uint64_t advanced = static_cast<uint64_t>(out->position_ms) + elapsed;
+        out->position_ms = static_cast<uint32_t>(
+            advanced > UINT32_MAX ? UINT32_MAX : advanced);
+        if (out->duration_ms > 0U && out->position_ms > out->duration_ms)
+            out->position_ms = out->duration_ms;
+    }
     portEXIT_CRITICAL(&s_lock);
     return true;
 }
@@ -354,7 +374,7 @@ void bt_audio_avrc_update()
 {
     bool active, connected, ct_ready, tg_ready;
     bool volume_pending, volume_interim, volume_changed;
-    bool need_meta, need_status, need_caps;
+    bool need_meta, need_status, need_caps, config_tg_cap = false;
     uint8_t volume;
     uint8_t notif;
     uint16_t supported_events;
@@ -381,7 +401,14 @@ void bt_audio_avrc_update()
     need_status = s_status_needed;
     s_metadata_needed = false;
     s_status_needed = false;
-    need_caps = connected && !s_capabilities_known;
+    need_caps = connected && !s_capabilities_known &&
+        (s_caps_retry_due == 0U ||
+         static_cast<int32_t>(now - s_caps_retry_due) >= 0);
+    if (need_caps) s_caps_retry_due = now + pdMS_TO_TICKS(3000);
+    if (tg_ready && !s_tg_capabilities_configured) {
+        s_tg_capabilities_configured = true;
+        config_tg_cap = true;
+    }
     supported_events = s_peer_events;
     notif = s_notifications_needed;
     s_notifications_needed = 0U;
@@ -418,6 +445,19 @@ void bt_audio_avrc_update()
             ESP_LOGW(TAG, "绝对音量写入AudioTask队列失败 volume=%u", (unsigned)volume);
     }
 
+    if (config_tg_cap) {
+        esp_avrc_rn_evt_cap_mask_t mask = {};
+        esp_avrc_rn_evt_bit_mask_operation(
+            ESP_AVRC_BIT_MASK_OP_SET, &mask, ESP_AVRC_RN_VOLUME_CHANGE);
+        const esp_err_t cap_ret = esp_avrc_tg_set_rn_evt_cap(&mask);
+        if (cap_ret != ESP_OK) {
+            ESP_LOGW(TAG, "AVRCP Target volume notification registration: %s",
+                esp_err_to_name(cap_ret));
+            portENTER_CRITICAL(&s_lock);
+            s_tg_capabilities_configured = false;
+            portEXIT_CRITICAL(&s_lock);
+        }
+    }
     if (tg_ready && (volume_interim || volume_changed)) {
         esp_avrc_rn_param_t p = {};
         uint8_t effective_volume = volume;
