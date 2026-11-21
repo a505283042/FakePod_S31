@@ -124,6 +124,8 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
         // 1=playing, 2=track, 3=position. Register only supported events.
         s_notifications_needed = 0x07U;
         portEXIT_CRITICAL(&s_lock);
+        ESP_LOGI(TAG, "AVRCP_CT remote notifications mask=0x%04x",
+            static_cast<unsigned>(param->get_rn_caps_rsp.evt_set.bits));
         break;
     }
     case ESP_AVRC_CT_METADATA_RSP_EVT: {
@@ -147,6 +149,8 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
             ++s_snapshot.metadata_revision;
         }
         portEXIT_CRITICAL(&s_lock);
+        if (m.attr_id == 1U) ESP_LOGI(TAG,
+            "AVRCP_META title received bytes=%d", m.attr_length);
         break;
     }
     case ESP_AVRC_CT_PLAY_STATUS_RSP_EVT: {
@@ -236,6 +240,8 @@ static void tg_callback(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *pa
             s_snapshot.absolute_volume_supported = true;
         }
         portEXIT_CRITICAL(&s_lock);
+        ESP_LOGI(TAG, "AVRCP_VOLUME phone->DAC percent=%u",
+            static_cast<unsigned>(percent));
         break;
     }
     case ESP_AVRC_TG_REGISTER_NOTIFICATION_EVT:
@@ -245,6 +251,7 @@ static void tg_callback(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *pa
             s_volume_interim_pending = true;
             s_snapshot.absolute_volume_supported = true;
             portEXIT_CRITICAL(&s_lock);
+            ESP_LOGI(TAG, "AVRCP_VOLUME phone registered volume notifications");
         }
         break;
     default: break;
@@ -533,6 +540,8 @@ void bt_audio_avrc_update()
                 cmd_release ? ESP_AVRC_PT_CMD_STATE_RELEASED : ESP_AVRC_PT_CMD_STATE_PRESSED);
             if (err != ESP_OK) ESP_LOGW(TAG, "AVRCP key=%u %s: %s",
                 (unsigned)key, cmd_release ? "release" : "press", esp_err_to_name(err));
+            else if (cmd_send) ESP_LOGI(TAG, "AVRCP_KEY phone key=%u sent",
+                static_cast<unsigned>(key));
         }
     }
 }
