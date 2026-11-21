@@ -2128,6 +2128,11 @@ static esp_err_t start_stack()
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
     esp_bt_controller_config_t ctrl_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
 #pragma GCC diagnostic pop
+    ESP_LOGI(TAG, "BT_MODE: controller=%u expect_dual=%u, host_classic=%u, controller_bredr=%u",
+             static_cast<unsigned>(BTDM_CONTROLLER_MODE_EFF),
+             static_cast<unsigned>(ESP_BT_MODE_BTDM),
+             static_cast<unsigned>(CONFIG_BT_CLASSIC_ENABLED),
+             static_cast<unsigned>(CONFIG_BT_CTRL_BREDR_ENABLE));
     set_startup_stage(1U, "controller_init");
     esp_err_t ret = esp_bt_controller_init(&ctrl_cfg);
     if (ret != ESP_OK) {
