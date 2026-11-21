@@ -12,24 +12,17 @@
 
 #if defined(CONFIG_BT_BLUEDROID_ENABLED) && CONFIG_BT_BLUEDROID_ENABLED && \
     defined(CONFIG_BT_CLASSIC_ENABLED) && CONFIG_BT_CLASSIC_ENABLED && \
-    defined(CONFIG_BT_A2DP_ENABLE) && CONFIG_BT_A2DP_ENABLE && \
-    !defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC)
-#define FAKEPOD_A2DP_SUPPORTED 1
-#elif defined(CONFIG_BT_BLUEDROID_ENABLED) && CONFIG_BT_BLUEDROID_ENABLED && \
-      defined(CONFIG_BT_CLASSIC_ENABLED) && CONFIG_BT_CLASSIC_ENABLED && \
-      defined(CONFIG_BT_A2DP_ENABLE) && CONFIG_BT_A2DP_ENABLE && \
-      defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && !CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
+    defined(CONFIG_BT_A2DP_ENABLE) && CONFIG_BT_A2DP_ENABLE
 #define FAKEPOD_A2DP_SUPPORTED 1
 #else
 #define FAKEPOD_A2DP_SUPPORTED 0
 #endif
-
-// Keep the proven internal-codec A2DP Source in the regular SBC build.
-// The AAC experimental environment switches Bluedroid to external codec,
-// which disables the legacy Source PCM callback; its existing API stubs
-// return ESP_ERR_NOT_SUPPORTED instead of accidentally starting broken audio.
-#if !FAKEPOD_A2DP_SUPPORTED && \
-    !(defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC)
+#if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
+#define FAKEPOD_A2DP_EXTERNAL_CODEC 1
+#else
+#define FAKEPOD_A2DP_EXTERNAL_CODEC 0
+#endif
+#if !FAKEPOD_A2DP_SUPPORTED
 #error "FakePod S31 A2DP Source requires Classic BT/A2DP. Check generated sdkconfig."
 #endif
 
@@ -48,8 +41,13 @@
 
 #if FAKEPOD_A2DP_SUPPORTED
 #include "esp_a2dp_api.h"
-#include "esp_a2dp_legacy_api.h"
 #include "esp_gap_bt_api.h"
+#if FAKEPOD_A2DP_EXTERNAL_CODEC
+#include "bt_a2dp_ext_encoder.h"
+#include "device_settings.h"
+#else
+#include "esp_a2dp_legacy_api.h"
+#endif
 #endif
 
 #if FAKEPOD_A2DP_SUPPORTED
@@ -87,6 +85,58 @@ static esp_bd_addr_t s_peer_bda = {};
 static char s_candidate_name[48] = {};
 static char s_peer_name[48] = {};
 static int8_t s_best_rssi = -127;
+static uint8_t s_negotiated_codec = 0xFFU;
+#if FAKEPOD_A2DP_EXTERNAL_CODEC
+static esp_a2d_conn_hdl_t s_conn_hdl = 0U;
+static uint16_t s_audio_mtu = 0U;
+static esp_a2d_mcc_t s_negotiated_mcc = {};
+static bool s_mcc_ready = false;
+static bool s_sep_registration_requested = false;
+static bool s_sep_reported[2] = {};
+static bool s_sep_ok[2] = {};
+static bool s_sep_ready = false;
+static DeviceBluetoothSinkCodec s_codec_preference = DeviceBluetoothSinkCodec::AutoAac;
+static TickType_t s_encoder_retry_due = 0;
+
+static void register_source_endpoints()
+{
+    esp_a2d_mcc_t sbc = {};
+    sbc.type = ESP_A2D_MCT_SBC;
+    sbc.cie.sbc_info.samp_freq = ESP_A2D_SBC_CIE_SF_44K | ESP_A2D_SBC_CIE_SF_48K;
+    sbc.cie.sbc_info.ch_mode =
+        ESP_A2D_SBC_CIE_CH_MODE_DUAL_CHANNEL | ESP_A2D_SBC_CIE_CH_MODE_STEREO |
+        ESP_A2D_SBC_CIE_CH_MODE_JOINT_STEREO;
+    sbc.cie.sbc_info.block_len =
+        ESP_A2D_SBC_CIE_BLOCK_LEN_4 | ESP_A2D_SBC_CIE_BLOCK_LEN_8 |
+        ESP_A2D_SBC_CIE_BLOCK_LEN_12 | ESP_A2D_SBC_CIE_BLOCK_LEN_16;
+    sbc.cie.sbc_info.num_subbands =
+        ESP_A2D_SBC_CIE_NUM_SUBBANDS_4 | ESP_A2D_SBC_CIE_NUM_SUBBANDS_8;
+    sbc.cie.sbc_info.alloc_mthd =
+        ESP_A2D_SBC_CIE_ALLOC_MTHD_SNR | ESP_A2D_SBC_CIE_ALLOC_MTHD_LOUDNESS;
+    sbc.cie.sbc_info.min_bitpool = 2U;
+    sbc.cie.sbc_info.max_bitpool = 53U;
+
+    esp_a2d_mcc_t aac = {};
+    aac.type = ESP_A2D_MCT_M24;
+    aac.cie.m24_info.drc = ESP_A2D_M24_CIE_DRC_NS;
+    aac.cie.m24_info.obj_type =
+        ESP_A2D_M24_CIE_OBJ_TYPE_2_AAC_LC | ESP_A2D_M24_CIE_OBJ_TYPE_4_AAC_LC;
+    aac.cie.m24_info.samp_freq1 = ESP_A2D_M24_CIE_SF1_44K;
+    aac.cie.m24_info.samp_freq2 = ESP_A2D_M24_CIE_SF2_48K;
+    aac.cie.m24_info.ch = ESP_A2D_M24_CIE_CH_2;
+    aac.cie.m24_info.vbr = ESP_A2D_M24_CIE_VBR_NS;
+    aac.cie.m24_info.br1 = 0x02U & ESP_A2D_M24_CIE_BR1_MSK;
+    aac.cie.m24_info.br2 = 0x71U & ESP_A2D_M24_CIE_BR2_MSK;
+    aac.cie.m24_info.br3 = 0x00U & ESP_A2D_M24_CIE_BR3_MSK;
+
+    const bool prefer_aac = s_codec_preference == DeviceBluetoothSinkCodec::AutoAac;
+    const esp_err_t first = esp_a2d_source_register_stream_endpoint(
+        0U, prefer_aac ? &aac : &sbc);
+    const esp_err_t fallback = esp_a2d_source_register_stream_endpoint(1U, &sbc);
+    ESP_LOGI(TAG, "A2DP_TX SEPs 0=%s (%s) 1=SBC (%s)",
+        prefer_aac ? "AAC" : "SBC", esp_err_to_name(first), esp_err_to_name(fallback));
+}
+#endif
 
 static void flush_locked()
 {
@@ -115,6 +165,21 @@ static void a2dp_event(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         ESP_LOGI(TAG, "A2DP profile %s", ready ? "ready" : "stopped");
         break;
     }
+#if FAKEPOD_A2DP_EXTERNAL_CODEC
+    case ESP_A2D_SEP_REG_STATE_EVT: {
+        const uint8_t seid = param->a2d_sep_reg_stat.seid;
+        const bool ok = param->a2d_sep_reg_stat.reg_state == ESP_A2D_SEP_REG_SUCCESS;
+        portENTER_CRITICAL(&s_lock);
+        if (seid < 2U) {
+            s_sep_reported[seid] = true;
+            s_sep_ok[seid] = ok;
+            s_sep_ready = s_sep_reported[0] && s_sep_reported[1] && s_sep_ok[1];
+        }
+        portEXIT_CRITICAL(&s_lock);
+        ESP_LOGI(TAG, "A2DP_TX SEP seid=%u registered=%u", unsigned(seid), unsigned(ok));
+        break;
+    }
+#endif
     case ESP_A2D_CONNECTION_STATE_EVT: {
         const esp_a2d_connection_state_t state = param->conn_stat.state;
         portENTER_CRITICAL(&s_lock);
@@ -123,6 +188,12 @@ static void a2dp_event(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         s_streaming = false;
         s_media_ctrl_pending = false;
         s_retry_due = xTaskGetTickCount() + kMediaRetryTicks;
+        s_negotiated_codec = 0xFFU;
+#if FAKEPOD_A2DP_EXTERNAL_CODEC
+        s_mcc_ready = false;
+        s_conn_hdl = s_connected ? param->conn_stat.conn_hdl : 0U;
+        s_audio_mtu = s_connected ? param->conn_stat.audio_mtu : 0U;
+#endif
         if (s_connected) {
             memcpy(s_peer_bda, param->conn_stat.remote_bda, sizeof(s_peer_bda));
             if (s_candidate_found &&
@@ -135,6 +206,10 @@ static void a2dp_event(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             flush_locked();
         }
         portEXIT_CRITICAL(&s_lock);
+#if FAKEPOD_A2DP_EXTERNAL_CODEC
+        if (state != ESP_A2D_CONNECTION_STATE_CONNECTED)
+            bt_a2dp_ext_encoder_request_stop();
+#endif
         ESP_LOGI(TAG, "A2DP connection state=%d", static_cast<int>(state));
         break;
     }
@@ -146,12 +221,23 @@ static void a2dp_event(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             else if (sf & ESP_A2D_SBC_CIE_SF_44K) rate = 44100U;
             else if (sf & ESP_A2D_SBC_CIE_SF_32K) rate = 32000U;
             else if (sf & ESP_A2D_SBC_CIE_SF_16K) rate = 16000U;
+        } else if (param->audio_cfg.mcc.type == ESP_A2D_MCT_M24) {
+            const esp_a2d_cie_m24_t &aac = param->audio_cfg.mcc.cie.m24_info;
+            if (aac.samp_freq2 & ESP_A2D_M24_CIE_SF2_48K) rate = 48000U;
+            else if (aac.samp_freq1 & ESP_A2D_M24_CIE_SF1_44K) rate = 44100U;
         }
         portENTER_CRITICAL(&s_lock);
         s_target_rate = rate;
+        s_negotiated_codec = param->audio_cfg.mcc.type;
+#if FAKEPOD_A2DP_EXTERNAL_CODEC
+        s_negotiated_mcc = param->audio_cfg.mcc;
+        s_mcc_ready = true;
+#endif
         flush_locked();
         portEXIT_CRITICAL(&s_lock);
-        ESP_LOGI(TAG, "A2DP negotiated PCM %luHz/S16/stereo", static_cast<unsigned long>(rate));
+        ESP_LOGI(TAG, "A2DP_TX negotiated codec=%s PCM=%luHz/S16/stereo",
+            param->audio_cfg.mcc.type == ESP_A2D_MCT_M24 ? "AAC" : "SBC",
+            static_cast<unsigned long>(rate));
         break;
     }
     case ESP_A2D_AUDIO_STATE_EVT: {
@@ -160,6 +246,9 @@ static void a2dp_event(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         s_streaming = playing && s_connected;
         if (!s_streaming) flush_locked();
         portEXIT_CRITICAL(&s_lock);
+#if FAKEPOD_A2DP_EXTERNAL_CODEC
+        if (!playing) bt_a2dp_ext_encoder_request_stop();
+#endif
         ESP_LOGI(TAG, "A2DP audio %s", playing ? "STARTED" : "SUSPENDED");
         break;
     }
@@ -324,11 +413,18 @@ esp_err_t bt_audio_source_host_start()
         ESP_LOGE(TAG, "A2DP Profile回调注册失败：%s", esp_err_to_name(err));
         return err;
     }
+#if !FAKEPOD_A2DP_EXTERNAL_CODEC
     err = esp_a2d_source_register_data_callback(a2dp_pcm_callback);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "A2DP PCM回调注册失败：%s", esp_err_to_name(err));
         return err;
     }
+#endif
+#if FAKEPOD_A2DP_EXTERNAL_CODEC
+    DeviceBluetoothSinkCodec preference = DeviceBluetoothSinkCodec::AutoAac;
+    DeviceSettingsSnapshot settings = {};
+    if (device_settings_get_snapshot(&settings)) preference = settings.bluetooth_sink_codec;
+#endif
     portENTER_CRITICAL(&s_lock);
     s_init_requested = true;
     s_profile_ready = false;
@@ -343,6 +439,18 @@ esp_err_t bt_audio_source_host_start()
     s_stats_due = 0;
     s_underrun = 0;
     s_dropped = 0;
+    s_negotiated_codec = 0xFFU;
+#if FAKEPOD_A2DP_EXTERNAL_CODEC
+    s_conn_hdl = 0U;
+    s_audio_mtu = 0U;
+    s_mcc_ready = false;
+    s_sep_registration_requested = false;
+    memset(s_sep_reported, 0, sizeof(s_sep_reported));
+    memset(s_sep_ok, 0, sizeof(s_sep_ok));
+    s_sep_ready = false;
+    s_codec_preference = preference;
+    s_encoder_retry_due = 0;
+#endif
     flush_locked();
     portEXIT_CRITICAL(&s_lock);
 
@@ -377,6 +485,10 @@ void bt_audio_source_host_stop()
     flush_locked();
     portEXIT_CRITICAL(&s_lock);
     if (!old_init) return;
+#if FAKEPOD_A2DP_EXTERNAL_CODEC
+    if (!bt_a2dp_ext_encoder_stop())
+        ESP_LOGE(TAG, "A2DP Source encoder stop timeout");
+#endif
     if (scanning) (void)esp_bt_gap_cancel_discovery();
     if (connected) (void)esp_a2d_source_disconnect(s_peer_bda);
     const esp_err_t err = esp_a2d_source_deinit();
@@ -476,6 +588,16 @@ void bt_audio_source_update()
     uint32_t underrun = 0U;
     uint32_t dropped = 0U;
     size_t buffered = 0U;
+#if FAKEPOD_A2DP_EXTERNAL_CODEC
+    bool register_endpoints = false;
+    portENTER_CRITICAL(&s_lock);
+    if (s_init_requested && s_profile_ready && !s_sep_registration_requested) {
+        s_sep_registration_requested = true;
+        register_endpoints = true;
+    }
+    portEXIT_CRITICAL(&s_lock);
+    if (register_endpoints) register_source_endpoints();
+#endif
     portENTER_CRITICAL(&s_lock);
     // 兼容个别耳机丢失 CHECK_SRC_RDY/START ACK 的情况：超时后允许重试。
     if (s_media_ctrl_pending && s_connected &&
@@ -492,13 +614,38 @@ void bt_audio_source_update()
         log_stats = true;
     }
     const bool attempt = s_init_requested && s_profile_ready && s_connected &&
+#if FAKEPOD_A2DP_EXTERNAL_CODEC
+                         s_sep_ready &&
+#endif
                          !s_streaming && !s_media_ctrl_pending &&
                          static_cast<int32_t>(now - s_retry_due) >= 0;
     if (attempt) {
         s_media_ctrl_pending = true;
         s_retry_due = now + kMediaRetryTicks;
     }
+#if FAKEPOD_A2DP_EXTERNAL_CODEC
+    const bool need_worker = s_init_requested && s_streaming && s_connected &&
+        s_sep_ready && s_mcc_ready && s_conn_hdl != 0U && s_audio_mtu > 100U &&
+        (s_encoder_retry_due == 0U ||
+         static_cast<int32_t>(now - s_encoder_retry_due) >= 0);
+    const esp_a2d_conn_hdl_t conn = s_conn_hdl;
+    const uint16_t mtu = s_audio_mtu;
+    const uint32_t codec_rate = s_target_rate;
+    const esp_a2d_mcc_t codec = s_negotiated_mcc;
+#endif
     portEXIT_CRITICAL(&s_lock);
+#if FAKEPOD_A2DP_EXTERNAL_CODEC
+    if (need_worker && !bt_a2dp_ext_encoder_is_running()) {
+        const esp_err_t err = bt_a2dp_ext_encoder_start(
+            conn, mtu, &codec, codec_rate, a2dp_pcm_callback);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "A2DP Source编码器启动失败：%s", esp_err_to_name(err));
+            portENTER_CRITICAL(&s_lock);
+            s_encoder_retry_due = now + pdMS_TO_TICKS(1500);
+            portEXIT_CRITICAL(&s_lock);
+        }
+    }
+#endif
     if (log_stats) {
         ESP_LOGI(TAG, "A2DP_TX rate=%luHz queued=%u/%u frames underrun=%lu drop=%lu DMA_free=%u DMA_largest=%u",
                  static_cast<unsigned long>(rate),
@@ -534,6 +681,7 @@ bool bt_audio_source_get_snapshot(BtAudioSourceSnapshot *out)
     s.connected = s_connected;
     s.streaming = s_streaming;
     s.sample_rate_hz = s_target_rate;
+    s.negotiated_codec = s_connected ? s_negotiated_codec : 0xFFU;
     s.underrun_frames = s_underrun;
     s.dropped_frames = s_dropped;
     s.queued_frames = static_cast<uint32_t>(s_queued);

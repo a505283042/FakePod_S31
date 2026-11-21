@@ -30,6 +30,7 @@ idf_component_register(
         "system/device_settings.cpp"
         "system/ble_remote_service.cpp"
         "system/bt_audio_source.cpp"
+        "system/bt_a2dp_ext_encoder.cpp"
         "system/bt_audio_sink.cpp"
         "system/bt_a2dp_ext_decoder.cpp"
         "system/bt_audio_avrc.cpp"

@@ -1738,6 +1738,11 @@ static void format_bt_audio_value(char *out, size_t cap)
     (void)bt_audio_source_get_snapshot(&s);
     if (!s.available) snprintf(out, cap, "不支持");
     else if (!s.initialized) snprintf(out, cap, "未启动");
+    else if (s.streaming && s.negotiated_codec != 0xFFU)
+        snprintf(out, cap, "播放中·%s·%lu.%luk",
+            s.negotiated_codec == 2U ? "AAC" : "SBC",
+            static_cast<unsigned long>(s.sample_rate_hz / 1000U),
+            static_cast<unsigned long>((s.sample_rate_hz % 1000U) / 100U));
     else if (s.streaming) snprintf(out, cap, "播放中·%s", s.peer_name);
     else if (s.connected) snprintf(out, cap, "已连接·%s", s.peer_name);
     else if (s.connecting) snprintf(out, cap, "正在连接");
