@@ -378,7 +378,8 @@ bool bt_audio_avrc_get_snapshot(BtAudioAvrcSnapshot *out)
     if (s_position_tick != 0U && out->playback_known && out->playing &&
         out->position_ms != UINT32_MAX) {
         const uint32_t elapsed = static_cast<uint32_t>(
-            pdTICKS_TO_MS(xTaskGetTickCount() - s_position_tick));
+            (static_cast<uint64_t>(xTaskGetTickCount() - s_position_tick) * 1000ULL)
+            / configTICK_RATE_HZ);
         const uint64_t advanced = static_cast<uint64_t>(out->position_ms) + elapsed;
         out->position_ms = static_cast<uint32_t>(
             advanced > UINT32_MAX ? UINT32_MAX : advanced);
