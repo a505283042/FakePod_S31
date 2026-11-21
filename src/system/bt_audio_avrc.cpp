@@ -103,6 +103,10 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
     case ESP_AVRC_CT_CONNECTION_STATE_EVT: {
         const bool connected = param->conn_stat.connected;
         bt_phone_cover_track_changed();
+        // Never take a FreeRTOS mutex while holding the AVRCP spinlock.
+#if defined(CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED) && CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED
+        const uint32_t cover_epoch = bt_phone_cover_track_epoch();
+#endif
         portENTER_CRITICAL(&s_lock);
         s_connected = connected && s_active;
         s_snapshot.connected = s_connected;
@@ -139,11 +143,18 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
         s_cover_fetch_pending = false;
         s_cover_tried_connect = false;
         s_cover_fetching = false;
-        s_cover_epoch = bt_phone_cover_track_epoch();
+        s_cover_epoch = cover_epoch;
 #endif
         s_last_cover_submitted = 0U;
         portEXIT_CRITICAL(&s_lock);
         ESP_LOGI(TAG, "AVRCP_CT %s", connected ? "connected" : "disconnected");
+        break;
+    }
+    case ESP_AVRC_CT_REMOTE_FEATURES_EVT: {
+        ESP_LOGI(TAG,
+            "AVRCP_PEER features=0x%08lx tg_flag=0x%04x (RN flags alone do not imply Cover Art)",
+            static_cast<unsigned long>(param->rmt_feats.feat_mask),
+            static_cast<unsigned>(param->rmt_feats.tg_feat_flag));
         break;
     }
     case ESP_AVRC_CT_GET_RN_CAPABILITIES_RSP_EVT: {
@@ -159,6 +170,10 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
     }
     case ESP_AVRC_CT_METADATA_RSP_EVT: {
         const auto &m = param->meta_rsp;
+#if defined(CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED) && CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED
+        const uint32_t cover_epoch = m.attr_id == 8U
+            ? bt_phone_cover_track_epoch() : 0U;
+#endif
         portENTER_CRITICAL(&s_lock);
         if (s_active && s_connected) {
             // AVRCP metadata callback attr_id uses ordinal 1..7, not mask.
@@ -169,7 +184,7 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
                      m.attr_length == ESP_AVRC_CA_IMAGE_HANDLE_LEN) {
                 memcpy(s_cover_handle, m.attr_text, ESP_AVRC_CA_IMAGE_HANDLE_LEN);
                 s_cover_handle_ready = true;
-                s_cover_epoch = bt_phone_cover_track_epoch();
+                s_cover_epoch = cover_epoch;
                 if (s_cover_link) s_cover_fetch_pending = true;
                 else if (!s_cover_tried_connect) s_cover_connect_pending = true;
             }
@@ -190,6 +205,17 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
         portEXIT_CRITICAL(&s_lock);
         if (m.attr_id == 1U) ESP_LOGI(TAG,
             "AVRCP_META title received bytes=%d", m.attr_length);
+        // A received cover handle is NOT the image itself; it is required for
+        // establishing the OBEX/BIP cover-art data connection.
+        if (m.attr_id == 8U) ESP_LOGI(TAG,
+            "AVRCP_COVER image handle metadata bytes=%d expected=%u accepted=%u",
+            m.attr_length,
+#if defined(CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED) && CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED
+            static_cast<unsigned>(ESP_AVRC_CA_IMAGE_HANDLE_LEN),
+            (m.attr_text != nullptr && m.attr_length == ESP_AVRC_CA_IMAGE_HANDLE_LEN) ? 1U : 0U);
+#else
+            0U, 0U);
+#endif
         break;
     }
     case ESP_AVRC_CT_PLAY_STATUS_RSP_EVT: {
@@ -210,8 +236,11 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
         break;
     }
     case ESP_AVRC_CT_CHANGE_NOTIFY_EVT: {
-        if (param->change_ntf.event_id == ESP_AVRC_RN_TRACK_CHANGE)
-            bt_phone_cover_track_changed();
+        const bool track_changed = param->change_ntf.event_id == ESP_AVRC_RN_TRACK_CHANGE;
+        if (track_changed) bt_phone_cover_track_changed();
+#if defined(CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED) && CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED
+        const uint32_t cover_epoch = track_changed ? bt_phone_cover_track_epoch() : 0U;
+#endif
         portENTER_CRITICAL(&s_lock);
         if (s_active && s_connected) {
             const uint8_t evt = param->change_ntf.event_id;
@@ -220,7 +249,7 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
                 s_cover_handle_ready = false;
                 s_cover_fetch_pending = false;
                 s_cover_fetching = false;
-                s_cover_epoch = bt_phone_cover_track_epoch();
+                s_cover_epoch = cover_epoch;
 #endif
                 s_last_cover_submitted = 0U;
                 s_snapshot.title[0] = '\0';
@@ -402,6 +431,11 @@ esp_err_t bt_audio_avrc_host_start()
         s_active = false;
         portEXIT_CRITICAL(&s_lock);
     }
+#if defined(CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED) && CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED
+    ESP_LOGI(TAG, "AVRCP_COVER compile enabled=1, OBEX/BIP image handle requested");
+#else
+    ESP_LOGW(TAG, "AVRCP_COVER compile enabled=0; inspect generated sdkconfig.fakepod_s31_bt_dma");
+#endif
     ESP_LOGI(TAG, "AVRCP CT+TG init: %s", esp_err_to_name(err));
     return err;
 }
