@@ -124,6 +124,42 @@
 
 ## 蓝牙音频发射 + 手机遥控共存（实验分支）
 
+### 修复双模蓝牙下 96 kHz FLAC 的 I2S DMA 初始化失败（2026-11-21）
+
+实机确认：44.1kHz FLAC + MH-M18 蓝牙耳机 + BLE 手机遥控可以稳定工作，
+此前 SDMMC 临时 DMA 分配失败已消失。96kHz FLAC 起播仍因 I2S DMA 内存不足失败。
+原因：常规高采样率配置为 26×256 帧×8B = 53,248B DMA 数据区；
+蓝牙双模运行期间剩余 DMA 堆不足以再分配，I2S 报 ESP_ERR_NO_MEM。
+
+本分支增加高采样率蓝牙共存 I2S 档：
+
+- A2DP Profile 已初始化且播放 96/176.4kHz 普通音乐时，优先尝试 16×256 帧，
+  若仅因 NO_MEM 失败才回退 14×256、12×256；每档确保预留至少 4KB DMA 余量。
+- 保持原始 DAC 采样率和 32-bit stereo PCM：96kHz 仍然输出 96kHz，
+  仅缩短 I2S DMA 队列；A2DP 侧仍使用独立的 SBC 采样率转换。
+- 关闭蓝牙仍沿用原始 96kHz 的 26×256 I2S 配置；44.1/48kHz 既有路径不变。
+- 新增 I2S_BT_DMA: try/skip/ready/init failed 诊断，包括实际缓冲档、
+  可用 DMA 内存和 DMA runway。
+
+重要：16×256 在 96kHz 对应约 42.7ms 硬件 DMA runway，
+小于原来的约 69.3ms。能分配成功不等于播放一定无爆音；
+请结合实际试听与 PCM_FEED_PERF 观测确认。
+
+重新烧录：
+
+```powershell
+git switch feat/a2dp-source-ble-remote
+git pull --ff-only
+pio run -e fakepod_s31 -t clean
+pio run -e fakepod_s31 -t upload
+pio device monitor -e fakepod_s31
+```
+
+先连接耳机，再播放同一首 96kHz FLAC；应出现 I2S_BT_DMA: ready rate=96000。
+如失败，请提供 I2S_BT_DMA / A2DP_TX / AUDIO_FAULT 日志；
+如有爆音，请说明有线耳机还是蓝牙耳机、是否仅在切歌或 UI 刷新时出现。
+
+---
 ### 修复连接耳机后 FLAC 无法播放：SDMMC / I2S DMA 内存不足
 
 实机确认耳机 MH-M18 可被搜索、A2DP Profile 和媒体流已启动、手机 BLE GATT 遥控同时连接成功。
