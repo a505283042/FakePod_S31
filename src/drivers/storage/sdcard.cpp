@@ -6,6 +6,7 @@
 #include "driver/sdmmc_host.h"
 
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_vfs_fat.h"
 
 #include "sdmmc_cmd.h"
@@ -34,6 +35,14 @@ static bool g_mounted =
 
 static uint32_t g_capacity_mb =
     0;
+
+// ESP-IDF sdmmc_read_sectors() otherwise malloc/free's a DMA bounce buffer
+// for each PSRAM / non-DMA-aligned FAT read. With A2DP + I2S running, the
+// largest free DMA block can be <512B even when internal free is ~19KB.
+// Reserve 4KB at SD mount (BEFORE radio startup), and reuse for each transfer.
+// Host owns only its pointer copy; the application retains allocation ownership.
+static constexpr size_t kSdDmaBounceBytes = 4096U; // 8 x 512-byte sectors
+static void *g_sd_dma_bounce = nullptr;
 
 
 // ============================================================
@@ -85,6 +94,31 @@ esp_err_t sdcard_init()
     sdmmc_host_t host =
         SDMMC_HOST_DEFAULT();
 
+    // No SDMMC_HOST_FLAG_ALLOC_ALIGNED_BUF: ESP-IDF auto mode reserves just a
+    // single SDMMC_IO_BLOCK_SIZE buffer, too small for sustained FAT reads.
+    // Assign a larger caller-owned buffer and release it on unmount.
+    if (g_sd_dma_bounce == nullptr) {
+        g_sd_dma_bounce = heap_caps_malloc(
+            kSdDmaBounceBytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    }
+    if (g_sd_dma_bounce == nullptr) {
+        ESP_LOGE(TAG,
+            "SDMMC长期DMA缓冲分配失败：need=%uB internal=%u DMA_free=%u DMA_largest=%u",
+            static_cast<unsigned>(kSdDmaBounceBytes),
+            static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+            static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
+            static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)));
+        return ESP_ERR_NO_MEM;
+    }
+    host.dma_aligned_buffer = g_sd_dma_bounce;
+    // Max 8 sectors per unaligned operation, matching the reserved buffer.
+    host.unaligned_multi_block_rw_max_chunk_size = kSdDmaBounceBytes / 512U;
+    ESP_LOGI(TAG,
+        "SDMMC持久DMA缓存：%uB 内存=%uB DMA_free=%uB DMA_largest=%uB",
+        static_cast<unsigned>(kSdDmaBounceBytes),
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+        static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
+        static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)));
 
     // 40MHz High Speed 试验：板级参考值即 40MHz，驱动会自动用 CMD6 协商高速时序；
     // 卡片不支持 HS 时驱动仅回落 20MHz，不会导致挂载失败。
@@ -183,6 +217,10 @@ esp_err_t sdcard_init()
             esp_err_to_name(ret)
         );
 
+        // The host has already been torn down by esp_vfs_fat_sdmmc_mount.
+        // This buffer was passed as caller-owned (not ALLOC_ALIGNED_BUF).
+        heap_caps_free(g_sd_dma_bounce);
+        g_sd_dma_bounce = nullptr;
         return ret;
     }
 
@@ -268,6 +306,9 @@ esp_err_t sdcard_unmount_for_usb()
     g_card = nullptr;
     g_mounted = false;
     g_capacity_mb = 0;
+    // No card/SDMMC worker may access the host after successful unmount.
+    heap_caps_free(g_sd_dma_bounce);
+    g_sd_dma_bounce = nullptr;
     ESP_LOGI(TAG, "TF卡已从 /sdcard 卸载，VFS/普通SDMMC owner 已释放");
     return ESP_OK;
 }
