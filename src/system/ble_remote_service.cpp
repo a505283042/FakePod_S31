@@ -2552,7 +2552,7 @@ const char *ble_remote_service_state_name(BleRemoteState state)
     switch (state) {
         case BleRemoteState::Disabled: return "关闭";
         case BleRemoteState::Starting: return "启动中";
-        case BleRemoteState::Advertising: return "广播中";
+        case BleRemoteState::Advertising: return "遥控广播中";
         case BleRemoteState::Scanning: return "扫描手柄";
         case BleRemoteState::ControllerConnecting: return "连接手柄";
         case BleRemoteState::ControllerConnected: return "手柄已连接";
