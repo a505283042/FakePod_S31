@@ -31,6 +31,7 @@ idf_component_register(
         "system/ble_remote_service.cpp"
         "system/bt_audio_source.cpp"
         "system/bt_audio_sink.cpp"
+        "system/bt_a2dp_ext_decoder.cpp"
         "system/bt_audio_avrc.cpp"
         "system/bt_phone_cover.cpp"
         "system/gamepad_input_service.cpp"
@@ -172,6 +173,7 @@ idf_component_register(
 
     REQUIRES
         esp-dsp
+        esp_audio_codec
         esp_driver_i2c
         esp_driver_gpio
         esp_driver_i2s

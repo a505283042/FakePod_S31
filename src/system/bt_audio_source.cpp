@@ -24,10 +24,13 @@
 #define FAKEPOD_A2DP_SUPPORTED 0
 #endif
 
-// This experimental branch requires A2DP. A stale sdkconfig must fail the build
-// instead of flashing a firmware that silently displays 'not supported'.
-#if !FAKEPOD_A2DP_SUPPORTED
-#error "FakePod S31 A2DP source is disabled: check BT_CLASSIC_ENABLED, BT_A2DP_ENABLE and internal SBC codec."
+// Keep the proven internal-codec A2DP Source in the regular SBC build.
+// The AAC experimental environment switches Bluedroid to external codec,
+// which disables the legacy Source PCM callback; its existing API stubs
+// return ESP_ERR_NOT_SUPPORTED instead of accidentally starting broken audio.
+#if !FAKEPOD_A2DP_SUPPORTED && \
+    !(defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC)
+#error "FakePod S31 A2DP Source requires Classic BT/A2DP. Check generated sdkconfig."
 #endif
 
 // ESP-IDF S31 has two independent options: Host Classic Bluetooth and controller

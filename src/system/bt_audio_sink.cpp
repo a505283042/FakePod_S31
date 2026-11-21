@@ -9,15 +9,26 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_a2dp_api.h"
+#if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
+#include "bt_a2dp_ext_decoder.h"
+#else
 #include "esp_a2dp_legacy_api.h"
+#endif
 #include "esp_gap_bt_api.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 #if !defined(CONFIG_BT_CLASSIC_ENABLED) || !CONFIG_BT_CLASSIC_ENABLED || \
-    !defined(CONFIG_BT_A2DP_ENABLE) || !CONFIG_BT_A2DP_ENABLE || \
-    (defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC)
-#error "FakePod A2DP Sink requires Classic BT, A2DP and internal SBC codec"
+    !defined(CONFIG_BT_A2DP_ENABLE) || !CONFIG_BT_A2DP_ENABLE
+#error "FakePod A2DP Sink requires Classic BT and A2DP"
+#endif
+#if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
+#if !defined(CONFIG_BT_A2DP_CODEC_AAC_ENABLED) || !CONFIG_BT_A2DP_CODEC_AAC_ENABLED
+#error "AAC experiment must enable CONFIG_BT_A2DP_CODEC_AAC_ENABLED"
+#endif
+#if !defined(CONFIG_BT_A2DP_SEP_NUM_MAX) || CONFIG_BT_A2DP_SEP_NUM_MAX < 2
+#error "AAC + SBC Sink requires at least two A2DP SEPs"
+#endif
 #endif
 
 namespace {
@@ -45,6 +56,56 @@ static bool s_deinit_confirmed = false;
 static TickType_t s_stats_due = 0;
 static esp_bd_addr_t s_peer = {};
 static char s_peer_name[48] = {};
+#if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
+static bool s_sep_ok[2] = {};
+static bool s_sep_reported[2] = {};
+static bool s_sep_advertised = false;
+static bool s_sep_registration_requested = false;
+
+static void register_aac_sbc_endpoints()
+{
+    // ESP-IDF release/v6.1 pre-registers both slots as SBC. Replace SEID 0
+    // with preferred MPEG-2/4 AAC-LC; keep mandatory SBC in SEID 1.
+    esp_a2d_mcc_t aac = {};
+    aac.type = ESP_A2D_MCT_M24;
+    aac.cie.m24_info.drc = ESP_A2D_M24_CIE_DRC_NS;
+    aac.cie.m24_info.obj_type =
+        ESP_A2D_M24_CIE_OBJ_TYPE_2_AAC_LC |
+        ESP_A2D_M24_CIE_OBJ_TYPE_4_AAC_LC;
+    aac.cie.m24_info.samp_freq1 = ESP_A2D_M24_CIE_SF1_44K;
+    aac.cie.m24_info.samp_freq2 = ESP_A2D_M24_CIE_SF2_48K;
+    aac.cie.m24_info.ch = ESP_A2D_M24_CIE_CH_2;
+    aac.cie.m24_info.vbr = ESP_A2D_M24_CIE_VBR_SUPPORT;
+    aac.cie.m24_info.br1 = ESP_A2D_M24_CIE_BR1_MSK;
+    aac.cie.m24_info.br2 = ESP_A2D_M24_CIE_BR2_MSK;
+    aac.cie.m24_info.br3 = ESP_A2D_M24_CIE_BR3_MSK;
+
+    esp_a2d_mcc_t sbc = {};
+    sbc.type = ESP_A2D_MCT_SBC;
+    sbc.cie.sbc_info.samp_freq =
+        ESP_A2D_SBC_CIE_SF_44K | ESP_A2D_SBC_CIE_SF_48K;
+    sbc.cie.sbc_info.ch_mode =
+        ESP_A2D_SBC_CIE_CH_MODE_MONO |
+        ESP_A2D_SBC_CIE_CH_MODE_DUAL_CHANNEL |
+        ESP_A2D_SBC_CIE_CH_MODE_STEREO |
+        ESP_A2D_SBC_CIE_CH_MODE_JOINT_STEREO;
+    sbc.cie.sbc_info.block_len =
+        ESP_A2D_SBC_CIE_BLOCK_LEN_4 | ESP_A2D_SBC_CIE_BLOCK_LEN_8 |
+        ESP_A2D_SBC_CIE_BLOCK_LEN_12 | ESP_A2D_SBC_CIE_BLOCK_LEN_16;
+    sbc.cie.sbc_info.num_subbands =
+        ESP_A2D_SBC_CIE_NUM_SUBBANDS_4 | ESP_A2D_SBC_CIE_NUM_SUBBANDS_8;
+    sbc.cie.sbc_info.alloc_mthd =
+        ESP_A2D_SBC_CIE_ALLOC_MTHD_SNR | ESP_A2D_SBC_CIE_ALLOC_MTHD_LOUDNESS;
+    sbc.cie.sbc_info.min_bitpool = 2;
+    sbc.cie.sbc_info.max_bitpool = 250;
+
+    const esp_err_t aac_err = esp_a2d_sink_register_stream_endpoint(0, &aac);
+    const esp_err_t sbc_err = esp_a2d_sink_register_stream_endpoint(1, &sbc);
+    ESP_LOGI(TAG, "A2DP_EXT registering SEP0 AAC-LC=%s SEP1 SBC=%s",
+        esp_err_to_name(aac_err), esp_err_to_name(sbc_err));
+    // Wait for asynchronous SEP_REG_STATE callbacks before advertising.
+}
+#endif
 
 static void flush_locked()
 {
@@ -88,6 +149,14 @@ static void audio_data_cb(const uint8_t *data, uint32_t length)
     portEXIT_CRITICAL(&s_mux);
 }
 
+#if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
+static void encoded_audio_cb(esp_a2d_conn_hdl_t handle, esp_a2d_audio_buff_t *packet)
+{
+    // Ownership of packet transfers to worker or is released immediately.
+    bt_a2dp_ext_decoder_receive(handle, packet);
+}
+#endif
+
 static void a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
 {
     if (param == nullptr) return;
@@ -99,8 +168,39 @@ static void a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             if (!ready) s_deinit_confirmed = true;
             portEXIT_CRITICAL(&s_mux);
             ESP_LOGI(TAG, "A2DP Sink profile %s", ready ? "ready" : "stopped");
+#if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
+#endif
             break;
         }
+#if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
+        case ESP_A2D_SEP_REG_STATE_EVT: {
+            const uint8_t seid = param->a2d_sep_reg_stat.seid;
+            const auto status = param->a2d_sep_reg_stat.reg_state;
+            bool advertise = false, fallback_sbc = false;
+            portENTER_CRITICAL(&s_mux);
+            if (seid < 2U) {
+                s_sep_reported[seid] = true;
+                s_sep_ok[seid] = status == ESP_A2D_SEP_REG_SUCCESS;
+            }
+            if (!s_sep_advertised && s_sep_reported[0] && s_sep_reported[1] &&
+                s_sep_ok[1] && s_requested) {
+                s_sep_advertised = true;
+                advertise = true;
+                fallback_sbc = !s_sep_ok[0];
+            }
+            portEXIT_CRITICAL(&s_mux);
+            ESP_LOGI(TAG, "A2DP_EXT SEP seid=%u status=%d", seid, static_cast<int>(status));
+            if (advertise) {
+                ESP_LOGI(TAG, "A2DP_EXT discoverable AAC=%u SBC=1",
+                    fallback_sbc ? 0U : 1U);
+                const esp_err_t err = esp_bt_gap_set_scan_mode(
+                    ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+                if (err != ESP_OK)
+                    ESP_LOGE(TAG, "A2DP_EXT discoverable failed: %s", esp_err_to_name(err));
+            }
+            break;
+        }
+#endif
         case ESP_A2D_CONNECTION_STATE_EVT: {
             const esp_a2d_connection_state_t state = param->conn_stat.state;
             portENTER_CRITICAL(&s_mux);
@@ -116,6 +216,10 @@ static void a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
                 s_peer_name[0] = '\0';
             }
             portEXIT_CRITICAL(&s_mux);
+#if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
+            if (state == ESP_A2D_CONNECTION_STATE_DISCONNECTED)
+                bt_a2dp_ext_decoder_stream_state(false);
+#endif
             ESP_LOGI(TAG, "A2DP Sink connection state=%d", static_cast<int>(state));
             break;
         }
@@ -128,11 +232,21 @@ static void a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
                 else if (sf & ESP_A2D_SBC_CIE_SF_32K) rate = 32000U;
                 else if (sf & ESP_A2D_SBC_CIE_SF_16K) rate = 16000U;
             }
+#if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
+            else if (param->audio_cfg.mcc.type == ESP_A2D_MCT_M24) {
+                const auto &aac = param->audio_cfg.mcc.cie.m24_info;
+                if (aac.samp_freq2 & ESP_A2D_M24_CIE_SF2_48K) rate = 48000U;
+                else if (aac.samp_freq1 & ESP_A2D_M24_CIE_SF1_44K) rate = 44100U;
+            }
+            bt_a2dp_ext_decoder_configure(&param->audio_cfg.mcc);
+#endif
             portENTER_CRITICAL(&s_mux);
             s_rate_hz = rate;
             flush_locked();
             portEXIT_CRITICAL(&s_mux);
-            ESP_LOGI(TAG, "A2DP Sink PCM %luHz/S16/stereo", (unsigned long)rate);
+            ESP_LOGI(TAG, "A2DP Sink codec=%s PCM=%luHz/S16/stereo",
+                param->audio_cfg.mcc.type == ESP_A2D_MCT_M24 ? "AAC" : "SBC",
+                (unsigned long)rate);
             break;
         }
         case ESP_A2D_AUDIO_STATE_EVT: {
@@ -141,6 +255,9 @@ static void a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             s_streaming = playing && s_connected && s_requested;
             if (!s_streaming) flush_locked();
             portEXIT_CRITICAL(&s_mux);
+#if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
+            bt_a2dp_ext_decoder_stream_state(playing);
+#endif
             ESP_LOGI(TAG, "A2DP Sink audio %s", playing ? "STARTED" : "SUSPENDED");
             break;
         }
@@ -179,6 +296,12 @@ esp_err_t bt_audio_sink_host_start()
     s_startup_trim_frames = 0U;
     s_smooth_adjust_frames = 0U;
     s_peak_queued = 0U;
+#if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
+    memset(s_sep_ok, 0, sizeof(s_sep_ok));
+    memset(s_sep_reported, 0, sizeof(s_sep_reported));
+    s_sep_advertised = false;
+    s_sep_registration_requested = false;
+#endif
     flush_locked();
     portEXIT_CRITICAL(&s_mux);
 
@@ -190,6 +313,15 @@ esp_err_t bt_audio_sink_host_start()
         portEXIT_CRITICAL(&s_mux);
         return err;
     }
+#if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
+    if (!bt_a2dp_ext_decoder_start(audio_data_cb)) {
+        bt_audio_avrc_host_stop();
+        portENTER_CRITICAL(&s_mux);
+        s_requested = false;
+        portEXIT_CRITICAL(&s_mux);
+        return ESP_ERR_NO_MEM;
+    }
+#endif
     err = esp_bt_gap_register_callback(classic_gap_cb);
     if (err == ESP_OK) err = esp_bt_gap_set_device_name("FakePod Audio");
     if (err == ESP_OK) err = esp_a2d_register_callback(a2dp_cb);
@@ -198,12 +330,18 @@ esp_err_t bt_audio_sink_host_start()
         err = esp_a2d_sink_init();
         profile_start_sent = err == ESP_OK;
     }
-    // Follow the official release/v6.1 sink example: register the decoded SBC
-    // PCM callback after a successful sink init request, then advertise.
-    if (err == ESP_OK) err = esp_a2d_sink_register_data_callback(audio_data_cb);
-    if (err == ESP_OK) {
+#if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
+    // Raw SBC/AAC callback; the codec worker releases each esp_a2d_audio_buff_t.
+    // Advertising follows asynchronous SEP registration in PROFILE_STATE.
+    if (err == ESP_OK)
+        err = esp_a2d_sink_register_audio_data_callback(encoded_audio_cb);
+#else
+    // Original proven Bluedroid SBC decoder path, unchanged.
+    if (err == ESP_OK)
+        err = esp_a2d_sink_register_data_callback(audio_data_cb);
+    if (err == ESP_OK)
         err = esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
-    }
+#endif
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "A2DP Sink启动失败：%s", esp_err_to_name(err));
         if (profile_start_sent) {
@@ -212,6 +350,9 @@ esp_err_t bt_audio_sink_host_start()
             bt_audio_sink_host_stop();
         } else {
             bt_audio_avrc_host_stop();
+#if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
+            bt_a2dp_ext_decoder_stop();
+#endif
             portENTER_CRITICAL(&s_mux);
             s_requested = false;
             portEXIT_CRITICAL(&s_mux);
@@ -265,6 +406,9 @@ void bt_audio_sink_host_stop()
     } else {
         ESP_LOGW(TAG, "A2DP Sink停止失败：%s", esp_err_to_name(ret));
     }
+#if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
+    bt_a2dp_ext_decoder_stop();
+#endif
 }
 
 bool bt_audio_sink_get_snapshot(BtAudioSinkSnapshot *out)
@@ -386,6 +530,16 @@ void bt_audio_sink_update()
     // Non-Bluetooth SystemLoop processes remote metadata/control and enqueues
     // incoming phone absolute-volume changes to the sole AudioTask.
     bt_audio_avrc_update();
+#if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
+    bool register_seps = false;
+    portENTER_CRITICAL(&s_mux);
+    if (s_requested && s_profile_ready && !s_sep_registration_requested) {
+        s_sep_registration_requested = true;
+        register_seps = true;
+    }
+    portEXIT_CRITICAL(&s_mux);
+    if (register_seps) register_aac_sbc_endpoints();
+#endif
     const TickType_t now = xTaskGetTickCount();
     uint32_t q=0U, rate=0U, drop=0U, under=0U, trim=0U, smooth=0U, peak=0U;
     uint64_t received=0U, consumed=0U;
@@ -418,5 +572,16 @@ void bt_audio_sink_update()
             (unsigned long)trim, (unsigned long)smooth,
             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+#if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
+        const BtA2dpExtStats d = bt_a2dp_ext_decoder_stats();
+        ESP_LOGI(TAG,
+            "A2DP_EXT codec=%s open=%u raw=%lu raw_drop=%lu decode_err=%lu decoded_frames=%llu",
+            d.codec_type == ESP_A2D_MCT_M24 ? "AAC" :
+                d.codec_type == ESP_A2D_MCT_SBC ? "SBC" : "none",
+            d.decoder_open ? 1U : 0U,
+            (unsigned long)d.raw_packets, (unsigned long)d.raw_drop_packets,
+            (unsigned long)d.decode_errors,
+            (unsigned long long)d.decoded_frames);
+#endif
     }
 }
