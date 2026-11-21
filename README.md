@@ -173,6 +173,21 @@
 - **首轮限制**：仅内部 SBC，常见 44.1/48kHz 立体声优先；
   32kHz 可工作；16kHz 目前没有 DAC rate profile，返回不支持；
   手机高品质 AAC 音频并未在本轮开启。
+- **蓝牙接收：循环／随机模式控制（实验）**：
+  FakePod 现有四态顺序／列表循环／单曲循环／随机循环按钮在手机接收模式下
+  会转发 AVRCP Repeat 和 Shuffle 两项设置（0=OFF/OFF，
+  1=GROUP/OFF，2=SINGLE/OFF，3=OFF/ALL），
+  **绝不更改本地 TF/NAS 的 PlayerLoopMode**。手机是否实际接受命令取决于
+  AVRCP Target 和当前音乐 App。ESP-IDF 6.1 的
+  `esp_avrc_ct_send_set_player_value_cmd()` 返回 ESP_OK **仅表示入队**，
+  没有可靠的回读当前 Repeat/Shuffle 值的高层接口，因此不能将请求标为同步成功。
+  手机显示控制状态分为：检测中=灰色沙漏；
+  对端 AVRCP SDP 明确缺少播放器类别 CAT1=灰色 **X**（不可操作）；
+  可尝试但未确认=灰色 **?**（允许发送；提交后在选中模式图标上保留问号）。
+  未收到 SDP 特性也只会转到“未确认”，绝不误判为不支持。
+  歌词 Overlay 与主页保持相同图标规则，BLE Remote App 原有 0x10 命令会发送
+  手机循环设置但不回报假定成功；Remote UI 状态包的模式字节在蓝牙接收期间为
+  `0xFF`（未知／不支持），本地播放模式离开接收后原值恢复。
 - **第一阶段限制**：暂不把手机专辑封面和 LRC 歌词传入 FakePod，
   原本地封面/磁带资源仍与本地曲库绑定。蓝牙接收模式下只接入歌曲
   文本/进度及频谱；进度条暂为只读，不声明支持手机 AVRCP Seek。
@@ -215,6 +230,18 @@
     暂停/断开后应停止，并确认 `A2DP_RX drop` 没有持续增长。
 11. 重复发射↔接收切换至少 5 次，验证 AVRCP CT/TG 释放、
     BLE 手机遥控连接、I2S DMA 和 LVGL 16 行双缓冲保持正常。
+
+循环模式测试：
+
+12. 连接手机后观察 `AVRCP_LOOP features=0x...`。若未收到 SDP 特性，
+    约 3 秒后从灰色沙漏变为灰色问号（不表示手机已支持）。
+13. 依次发送列表循环、单曲循环、随机模式、顺序模式，观察
+    `AVRCP_LOOP request=... repeat=... shuffle=... phone_state=UNCONFIRMED`。
+    **必须在手机播放器上亲自检查是否真的改变**，`ESP_OK` 不作为通过标准。
+14. 手机明确缺少 AVRCP Category-1 时，确认灰色 X 且无法提交模式请求；
+    含 Category-1 但不实现具体 Repeat/Shuffle 的机型只能保持“未确认”。
+15. 返回 TF/NAS，检查原四种循环设置未变；歌词 Overlay 与主页图标一致；
+    BLE Remote App 0x10 命令应走手机请求而不改本地设置。
 
 
 **状态：已提交源码，未完成编译/实机验收。** 蓝牙 Sink 使用当前 ESP-IDF
