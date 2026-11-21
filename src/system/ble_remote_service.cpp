@@ -417,7 +417,9 @@ static void ensure_metadata_for_track(uint32_t track_index)
 
     if (!g_metadata_source_initialized || g_metadata_context != PhoneMediaContext::Music ||
         track_index != g_metadata_track_index ||
-        generation != g_metadata_catalog_generation) {
+        generation != g_metadata_catalog_generation ||
+        g_metadata_source_revision != 0U) {
+        // Clear former AVRCP phone media when returning to Local/NAS.
         queue_metadata(track_index, generation);
     }
 }
@@ -516,11 +518,11 @@ static void build_status_packet(
     if (audio_valid && audio.user_muted) flags |= 0x01U;
     if (battery_valid) flags |= 0x02U;
     if (track_index != UINT32_MAX) flags |= 0x04U;
-    if (video_valid) flags |= 0x08U; // media context = VIDEO
-    if (nsf_valid) flags |= 0x10U;   // R46.0.50: media context = NSF
+    if (!phone_mode && video_valid) flags |= 0x08U; // media context = VIDEO
+    if (!phone_mode && nsf_valid) flags |= 0x10U;   // R46.0.50: media context = NSF
     if (music_remote_ui_available()) flags |= 0x20U; // Music APP foreground
-    if (player_state_get_source() == PlayerMediaSource::Nas ||
-        (audio_valid && audio.source == AudioPlaybackSource::NasHttp)) flags |= 0x40U;
+    if (!phone_mode && (player_state_get_source() == PlayerMediaSource::Nas ||
+        (audio_valid && audio.source == AudioPlaybackSource::NasHttp))) flags |= 0x40U;
     if (!phone_mode && !nsf_valid && !video_valid && music_remote_ui_available() && audio_valid &&
         player_control_local_seek_available(audio)) flags |= 0x80U;
     packet[5] = flags;
