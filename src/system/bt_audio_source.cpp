@@ -141,22 +141,6 @@ static void register_source_endpoints()
 }
 #endif
 
-static esp_err_t source_media_control(esp_a2d_media_ctrl_t command)
-{
-#if FAKEPOD_A2DP_EXTERNAL_CODEC
-    esp_a2d_conn_hdl_t conn = 0U;
-    portENTER_CRITICAL(&s_lock);
-    conn = s_conn_hdl;
-    portEXIT_CRITICAL(&s_lock);
-    if (conn == 0U || conn == ESP_A2D_INVALID_CONN_HDL)
-        return ESP_ERR_INVALID_STATE;
-    // S31 ESP-IDF 6.x: target the actual connected A2DP peer.
-    return esp_a2d_media_ctrl_by_handle(conn, command);
-#else
-    return esp_a2d_media_ctrl(command);
-#endif
-}
-
 static void flush_locked()
 {
     s_read = 0U;
@@ -334,7 +318,7 @@ static void a2dp_event(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         s_retry_due = xTaskGetTickCount() + kMediaRetryTicks;
         portEXIT_CRITICAL(&s_lock);
         if (start) {
-            const esp_err_t err = source_media_control(ESP_A2D_MEDIA_CTRL_START);
+            const esp_err_t err = esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
             if (err == ESP_OK) {
                 portENTER_CRITICAL(&s_lock);
                 s_media_ctrl_pending = true;
@@ -836,7 +820,7 @@ void bt_audio_source_update()
                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)));
     }
     if (attempt) {
-        const esp_err_t err = source_media_control(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
+        const esp_err_t err = esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
         if (err != ESP_OK) {
             portENTER_CRITICAL(&s_lock);
             s_media_ctrl_pending = false;
