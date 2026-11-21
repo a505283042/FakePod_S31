@@ -39,6 +39,9 @@
 #if !defined(CONFIG_BT_CTRL_BREDR_ENABLE) || !CONFIG_BT_CTRL_BREDR_ENABLE
 #error "FakePod S31 controller BR/EDR disabled: check CONFIG_BTDM_CTRL_MODE_BTDM=y."
 #endif
+#if !defined(CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL) || CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL > 2048
+#error "FakePod S31 dual-mode requires CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL<=2048 to protect SDMMC/I2S DMA. Regenerate sdkconfig.fakepod_s31_bt_dma."
+#endif
 
 #if FAKEPOD_A2DP_SUPPORTED
 #include "esp_a2dp_api.h"
