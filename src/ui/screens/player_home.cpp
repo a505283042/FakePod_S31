@@ -338,8 +338,6 @@ static lv_obj_t *g_loop_button = nullptr;
 // R.34：播放模式按钮只在模式真正变化时重绘，避免每个 Audio Snapshot 无条件 invalidate。
 static PlayerLoopMode g_last_loop_mode = PlayerLoopMode::Sequential;
 static bool g_last_loop_mode_valid = false;
-static bool g_last_loop_phone_mode = false;
-static uint32_t g_last_loop_avrc_revision = UINT32_MAX;
 static lv_obj_t *g_volume_label = nullptr;
 static lv_obj_t *g_volume_slider = nullptr;
 static lv_obj_t *g_volume_mode_button = nullptr;
@@ -580,46 +578,7 @@ static void player_home_mode_icon_draw_cb(lv_event_t *event)
         draw(x + 6, y + 5, x, y);
     };
 
-    PlayerLoopMode visible_mode = player_control_get_loop_mode();
-    const bool phone_mode = bt_audio_avrc_is_sink_mode();
-    BtAudioAvrcSnapshot avrc = {};
-    if (phone_mode) {
-        (void)bt_audio_avrc_get_snapshot(&avrc);
-        line.color = lv_color_hex(0x8894A6);
-        if (!avrc.connected || avrc.loop_support == BtAvrcLoopSupport::Checking) {
-            // Grey hourglass: still checking the remote AVRCP capability.
-            draw(cx - 10, cy - 12, cx + 10, cy - 12);
-            draw(cx - 10, cy + 12, cx + 10, cy + 12);
-            draw(cx - 9, cy - 10, cx + 9, cy + 10);
-            draw(cx + 9, cy - 10, cx - 9, cy + 10);
-            return;
-        }
-        if (avrc.loop_support == BtAvrcLoopSupport::Unsupported) {
-            // Only a peer explicitly missing AVRCP Category-1 uses X.
-            draw(cx - 12, cy - 12, cx + 12, cy + 12);
-            draw(cx + 12, cy - 12, cx - 12, cy + 12);
-            return;
-        }
-        if (avrc.loop_support == BtAvrcLoopSupport::Unverified &&
-            !avrc.loop_request_pending && !avrc.loop_request_sent) {
-            // Grey question mark: commands may be attempted, but the phone's
-            // current repeat/shuffle mode cannot be read with IDF 6.1.
-            draw(cx - 8, cy - 9, cx - 4, cy - 13);
-            draw(cx - 4, cy - 13, cx + 7, cy - 13);
-            draw(cx + 7, cy - 13, cx + 11, cy - 8);
-            draw(cx + 11, cy - 8, cx + 4, cy + 1);
-            draw(cx + 4, cy + 1, cx + 4, cy + 4);
-            draw(cx + 4, cy + 11, cx + 4, cy + 12);
-            return;
-        }
-        // Requested-only mode: grey icon with '?' marker below.
-        // Never confuse command queue success with confirmed phone state.
-        visible_mode = static_cast<PlayerLoopMode>(avrc.loop_requested_mode);
-        if (avrc.loop_support == BtAvrcLoopSupport::Confirmed)
-            line.color = lv_color_hex(0xF5F7FA);
-    }
-
-    switch (visible_mode) {
+    switch (player_control_get_loop_mode()) {
         case PlayerLoopMode::Sequential:
             draw(cx - 15, cy, cx + 13, cy);
             arrow_right(cx + 13, cy);
@@ -633,7 +592,7 @@ static void player_home_mode_icon_draw_cb(lv_event_t *event)
             draw(cx + 13, cy + 9, cx - 11, cy + 9);
             arrow_left(cx - 11, cy + 9);
             draw(cx - 14, cy + 5, cx - 14, cy - 6);
-            if (visible_mode == PlayerLoopMode::SingleRepeat) {
+            if (player_control_get_loop_mode() == PlayerLoopMode::SingleRepeat) {
                 // 不依赖额外 Unicode glyph，用两根短线在中心画一个小“1”。
                 draw(cx, cy - 3, cx, cy + 4);
                 draw(cx - 2, cy - 1, cx, cy - 3);
@@ -652,14 +611,6 @@ static void player_home_mode_icon_draw_cb(lv_event_t *event)
             draw(cx + 6, cy - 9, cx + 14, cy - 9);
             arrow_right(cx + 14, cy - 9);
             break;
-    }
-    if (phone_mode && avrc.loop_support == BtAvrcLoopSupport::Unverified) {
-        // The tiny '?' is deliberately kept even after enqueue success.
-        line.width = 2;
-        draw(cx + 16, cy - 20, cx + 22, cy - 20);
-        draw(cx + 22, cy - 20, cx + 22, cy - 14);
-        draw(cx + 22, cy - 14, cx + 18, cy - 11);
-        draw(cx + 18, cy - 7, cx + 18, cy - 6);
     }
 }
 
@@ -3943,16 +3894,9 @@ static void player_home_refresh_track(const AudioStateSnapshot *audio_snapshot)
 static void player_home_refresh_transport_controls(const AudioStateSnapshot *snapshot)
 {
     const PlayerLoopMode loop_mode = player_control_get_loop_mode();
-    const bool phone_mode = bt_audio_avrc_is_sink_mode();
-    BtAudioAvrcSnapshot avrc = {};
-    if (phone_mode) (void)bt_audio_avrc_get_snapshot(&avrc);
-    if (!g_last_loop_mode_valid || g_last_loop_mode != loop_mode ||
-        g_last_loop_phone_mode != phone_mode ||
-        (phone_mode && g_last_loop_avrc_revision != avrc.loop_revision)) {
+    if (!g_last_loop_mode_valid || g_last_loop_mode != loop_mode) {
         g_last_loop_mode = loop_mode;
         g_last_loop_mode_valid = true;
-        g_last_loop_phone_mode = phone_mode;
-        g_last_loop_avrc_revision = phone_mode ? avrc.loop_revision : UINT32_MAX;
         if (g_loop_button != nullptr) {
             // 模式真正变化时才重绘这个小对象。
             lv_obj_invalidate(g_loop_button);
@@ -4175,29 +4119,6 @@ static void player_home_loop_cb(lv_event_t *event)
     }
     player_home_overlay_show();
     HOME_INTERACTION_LOGI("控件命中：播放模式");
-    if (bt_audio_avrc_is_sink_mode()) {
-        BtAudioAvrcSnapshot avrc = {};
-        (void)bt_audio_avrc_get_snapshot(&avrc);
-        if (!avrc.connected || avrc.loop_support == BtAvrcLoopSupport::Checking) {
-            ui_common_show_notice("循环模式", "正在检测手机 AVRCP 能力");
-            return;
-        }
-        if (avrc.loop_support == BtAvrcLoopSupport::Unsupported) {
-            ui_common_show_notice("循环模式不可用", "手机未提供所需的 AVRCP 播放控制类别");
-            return;
-        }
-        const uint8_t next = static_cast<uint8_t>((avrc.loop_requested_mode + 1U) % 4U);
-        if (!player_control_set_loop_mode(static_cast<PlayerLoopMode>(next))) {
-            ui_common_show_notice("循环模式", "向手机发送模式设置请求失败");
-            return;
-        }
-        if (g_loop_button != nullptr) lv_obj_invalidate(g_loop_button);
-        if (!avrc.loop_request_sent && !avrc.loop_request_pending) {
-            ui_common_show_notice("循环模式待确认",
-                "正在请求手机切换；本机无法确认音乐 App 是否已采用");
-        }
-        return;
-    }
     const PlayerLoopMode previous_mode = player_control_get_loop_mode();
     const PlayerLoopMode mode = player_control_cycle_loop_mode();
     if (mode != previous_mode) {

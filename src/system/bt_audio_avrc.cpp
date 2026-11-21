@@ -46,7 +46,6 @@ static TickType_t s_caps_retry_due = 0;
 static TickType_t s_metadata_poll_due = 0;
 static TickType_t s_position_tick = 0;
 static bool s_tg_capabilities_configured = false;
-static TickType_t s_loop_check_due = 0;
 
 static uint8_t next_label()
 {
@@ -109,16 +108,6 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
         ++s_snapshot.metadata_revision;
         ++s_snapshot.playback_revision;
         s_capabilities_known = false;
-        // AVRCP CT connection is not proof of support for player settings.
-        // Features either reveal a missing player/recorder category or leave
-        // support unverified. Reset every time the phone reconnects.
-        s_snapshot.loop_support = BtAvrcLoopSupport::Checking;
-        s_snapshot.loop_request_pending = false;
-        s_snapshot.loop_request_sent = false;
-        s_snapshot.loop_requested_mode = 0U;
-        ++s_snapshot.loop_revision;
-        s_loop_check_due = connected
-            ? xTaskGetTickCount() + pdMS_TO_TICKS(3000) : 0;
         s_caps_retry_due = 0;
         s_metadata_poll_due = 0;
         s_position_tick = 0;
@@ -130,30 +119,6 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
         s_cmd_count = 0U;
         portEXIT_CRITICAL(&s_lock);
         ESP_LOGI(TAG, "AVRCP_CT %s", connected ? "connected" : "disconnected");
-        break;
-    }
-    case ESP_AVRC_CT_REMOTE_FEATURES_EVT: {
-        const uint16_t flags = param->rmt_feats.tg_feat_flag;
-        BtAvrcLoopSupport support = BtAvrcLoopSupport::Unverified;
-        // Cat1 = AVRCP player/recorder. If the remote explicitly advertises
-        // other categories but no Cat1, it does not offer this control role.
-        // Cat1 present only means "can try": it DOES NOT prove Repeat/Shuffle.
-        if (flags != 0U && (flags & ESP_AVRC_FEAT_FLAG_CAT1) == 0U)
-            support = BtAvrcLoopSupport::Unsupported;
-        portENTER_CRITICAL(&s_lock);
-        if (s_active && s_connected) {
-            s_snapshot.loop_support = support;
-            s_loop_check_due = 0;
-            if (support == BtAvrcLoopSupport::Unsupported) {
-                s_snapshot.loop_request_pending = false;
-                s_snapshot.loop_request_sent = false;
-            }
-            ++s_snapshot.loop_revision;
-        }
-        portEXIT_CRITICAL(&s_lock);
-        ESP_LOGI(TAG, "AVRCP_LOOP features=0x%04x support=%s",
-            static_cast<unsigned>(flags),
-            support == BtAvrcLoopSupport::Unsupported ? "UNSUPPORTED" : "UNVERIFIED");
         break;
     }
     case ESP_AVRC_CT_GET_RN_CAPABILITIES_RSP_EVT: {
@@ -320,7 +285,6 @@ static void reset_state()
     s_metadata_poll_due = 0;
     s_position_tick = 0;
     s_tg_capabilities_configured = false;
-    s_loop_check_due = 0;
     s_snapshot = {};
     s_snapshot.active = s_active;
 }
@@ -408,24 +372,6 @@ bool bt_audio_avrc_queue_control(BtAvrcMediaCommand command)
     return ok;
 }
 
-bool bt_audio_avrc_request_loop_mode(uint8_t mode)
-{
-    if (mode > 3U) return false;
-    portENTER_CRITICAL(&s_lock);
-    const bool ready = s_active && s_ct_ready && s_connected &&
-        (s_snapshot.loop_support == BtAvrcLoopSupport::Unverified ||
-         s_snapshot.loop_support == BtAvrcLoopSupport::Confirmed);
-    if (ready) {
-        // Last request wins if the UI / BLE App changes mode quickly.
-        s_snapshot.loop_requested_mode = mode;
-        s_snapshot.loop_request_pending = true;
-        s_snapshot.loop_request_sent = false;
-        ++s_snapshot.loop_revision;
-    }
-    portEXIT_CRITICAL(&s_lock);
-    return ready;
-}
-
 bool bt_audio_avrc_get_snapshot(BtAudioAvrcSnapshot *out)
 {
     if (out == nullptr) return false;
@@ -464,8 +410,6 @@ void bt_audio_avrc_update()
     bool active, connected, ct_ready, tg_ready;
     bool volume_pending, volume_interim, volume_changed;
     bool need_meta, need_status, need_caps, config_tg_cap = false;
-    bool send_loop = false;
-    uint8_t requested_loop = 0U;
     uint8_t volume;
     uint8_t notif;
     uint16_t supported_events;
@@ -477,23 +421,6 @@ void bt_audio_avrc_update()
     active = s_active;
     connected = s_connected;
     ct_ready = s_ct_ready;
-    if (active && connected && ct_ready &&
-        s_snapshot.loop_support == BtAvrcLoopSupport::Checking &&
-        s_loop_check_due != 0U &&
-        static_cast<int32_t>(now - s_loop_check_due) >= 0) {
-        // Missing SDP feature callback is UNKNOWN, never "unsupported".
-        s_loop_check_due = 0;
-        s_snapshot.loop_support = BtAvrcLoopSupport::Unverified;
-        ++s_snapshot.loop_revision;
-    }
-    if (active && connected && ct_ready &&
-        s_snapshot.loop_request_pending &&
-        (s_snapshot.loop_support == BtAvrcLoopSupport::Unverified ||
-         s_snapshot.loop_support == BtAvrcLoopSupport::Confirmed)) {
-        requested_loop = s_snapshot.loop_requested_mode;
-        s_snapshot.loop_request_pending = false;
-        send_loop = true;
-    }
     tg_ready = s_tg_ready;
     volume_pending = s_volume_pending;
     volume = s_volume_pending_percent;
@@ -595,40 +522,6 @@ void bt_audio_avrc_update()
     }
 
     if (connected && ct_ready) {
-        if (send_loop) {
-            // AVRCP Repeat and Shuffle are INDEPENDENT player attributes.
-            // 0=sequential(off/off), 1=list(group/off), 2=single(single/off),
-            // 3=shuffle(off/all). Do not change the local TF/NAS loop mode.
-            const uint8_t repeat = requested_loop == 2U
-                ? ESP_AVRC_PS_REPEAT_SINGLE
-                : (requested_loop == 1U
-                    ? ESP_AVRC_PS_REPEAT_GROUP : ESP_AVRC_PS_REPEAT_OFF);
-            const uint8_t shuffle = requested_loop == 3U
-                ? ESP_AVRC_PS_SHUFFLE_ALL : ESP_AVRC_PS_SHUFFLE_OFF;
-            const esp_err_t repeat_err = esp_avrc_ct_send_set_player_value_cmd(
-                next_label(), ESP_AVRC_PS_REPEAT_MODE, repeat);
-            const esp_err_t shuffle_err = esp_avrc_ct_send_set_player_value_cmd(
-                next_label(), ESP_AVRC_PS_SHUFFLE_MODE, shuffle);
-            const bool queued = repeat_err == ESP_OK && shuffle_err == ESP_OK;
-            portENTER_CRITICAL(&s_lock);
-            if (s_active && s_connected &&
-                s_snapshot.loop_requested_mode == requested_loop) {
-                s_snapshot.loop_request_sent = queued;
-                ++s_snapshot.loop_revision;
-                // Only explicit not-supported may turn this control into X.
-                if (repeat_err == ESP_ERR_NOT_SUPPORTED ||
-                    shuffle_err == ESP_ERR_NOT_SUPPORTED) {
-                    s_snapshot.loop_support = BtAvrcLoopSupport::Unsupported;
-                }
-            }
-            portEXIT_CRITICAL(&s_lock);
-            ESP_LOGI(TAG, "AVRCP_LOOP request=%u repeat=%u shuffle=%u queue=%s/%s "
-                "phone_state=UNCONFIRMED",
-                static_cast<unsigned>(requested_loop),
-                static_cast<unsigned>(repeat),
-                static_cast<unsigned>(shuffle),
-                esp_err_to_name(repeat_err), esp_err_to_name(shuffle_err));
-        }
         if (need_caps) (void)esp_avrc_ct_send_get_rn_capabilities_cmd(next_label());
         if (need_meta) (void)esp_avrc_ct_send_metadata_cmd(next_label(),
             ESP_AVRC_MD_ATTR_TITLE | ESP_AVRC_MD_ATTR_ARTIST |
