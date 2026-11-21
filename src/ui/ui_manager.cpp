@@ -11,6 +11,7 @@
 #include "esp_timer.h"
 #include "esp_system.h"
 #include "esp_lvgl_port.h"
+#include "drivers/jpeg/jpeg_hw_decoder.h"
 #include "esp_lv_decoder.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -240,9 +241,14 @@ static constexpr uint32_t kTeSyncForceFullFramePixels =
     (FAKEPOD_LCD_WIDTH * FAKEPOD_LCD_HEIGHT * 9U) / 10U;
 static uint32_t g_te_animation_bypass_count = 0U;
 
-// LVGL RGB565 DMA 条带固定为 16 行，继续为 BoundedSPI 和音频保留内部 DMA headroom。
-// 双缓冲总像素 RAM = 460 * 16 * 2B * 2 = 29,440B，相比 24 行再回收 14,720B internal DMA。
+// A2DP + BLE and native 96kHz/24bit I2S contend for internal DMA-capable RAM.
+// Retain the same 16-line flush stripe and the official asynchronous flush
+// callback / bounded flush_wait synchronization, but use ONE draw buffer.
+// 460*16*2B = 14,720B instead of two buffers (29,440B), recovering 14,720B.
+// This trades potential render/transfer overlap for audio DMA headroom without
+// doubling the number of QSPI strips as an 8-line dual-buffer would.
 static constexpr uint32_t kLvglDmaBufferLines = 16U;
+static constexpr bool kLvglDoubleBuffer = false;
 
 static void ui_display_flush_sync_event_cb(lv_event_t *event)
 {
@@ -1341,7 +1347,7 @@ esp_err_t ui_manager_bootstrap_init()
     disp_cfg.io_handle = display_get_panel_io();
     disp_cfg.panel_handle = display_get_panel();
     disp_cfg.buffer_size = FAKEPOD_LCD_WIDTH * kLvglDmaBufferLines;
-    disp_cfg.double_buffer = true;
+    disp_cfg.double_buffer = kLvglDoubleBuffer;
     disp_cfg.hres = FAKEPOD_LCD_WIDTH;
     disp_cfg.vres = FAKEPOD_LCD_HEIGHT;
     disp_cfg.monochrome = false;
@@ -1378,13 +1384,24 @@ esp_err_t ui_manager_bootstrap_init()
     UI_BOOT_LOGI("LVGL flush：保留esp_lvgl_port官方回调，启用信号量等待 + %ums超时保护",
         static_cast<unsigned>(kDisplayFlushWaitTimeoutMs));
 
+    // One-time HW-JPEG engine creation before the dual-mode Bluetooth Host
+    // reserves internal RAM. The IDF 6.1 decoder's low-memory cleanup path
+    // can dereference a partially initialized codec handle, so never leave
+    // first-time engine creation until a 96kHz I2S DMA session is active.
+    if (!jpeg_hw_available()) {
+        ESP_LOGW(TAG, "启动期JPEG硬件预热未成功；封面继续允许软件JPEG回退");
+    } else {
+        ESP_LOGI(TAG, "启动期JPEG硬件预热成功；高采样率播放时复用既有引擎");
+    }
+
 #if APP_DIAG_BOOT_VERBOSE
     const size_t dma_free_after = heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     const size_t dma_largest_after = heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
     UI_BOOT_LOGI(
-        "LVGL DMA双缓冲：%u行/块 total=%uB DMAfree=%u->%u largest=%u->%u",
+        "LVGL DMA显示缓冲：%u行/块 buffers=%u total=%uB DMAfree=%u->%u largest=%u->%u",
         static_cast<unsigned>(kLvglDmaBufferLines),
-        static_cast<unsigned>(FAKEPOD_LCD_WIDTH * kLvglDmaBufferLines * 2U * 2U),
+        static_cast<unsigned>(kLvglDoubleBuffer ? 2U : 1U),
+        static_cast<unsigned>(FAKEPOD_LCD_WIDTH * kLvglDmaBufferLines * 2U * (kLvglDoubleBuffer ? 2U : 1U)),
         static_cast<unsigned>(dma_free_before),
         static_cast<unsigned>(dma_free_after),
         static_cast<unsigned>(dma_largest_before),
