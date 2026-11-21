@@ -28,6 +28,7 @@
 #include "system/device_settings.h"
 #include "system/screen_lock_simple.h"
 #include "system/bt_audio_avrc.h"
+#include "system/bt_audio_sink.h"
 #include "system/bt_phone_cover.h"
 #include "lyrics/lyrics_service.h"
 #include "nas_library_source.h"
@@ -628,8 +629,15 @@ static uint32_t cassette_view_current_index()
     if (!bt_audio_avrc_is_sink_mode())
         return static_cast<uint32_t>(player_state_get_index());
     BtPhoneCoverSnapshot snap = {};
-    return bt_phone_cover_get_snapshot(&snap) && snap.ready
-        ? snap.image_revision : 0U;
+    if (bt_phone_cover_get_snapshot(&snap) && snap.ready)
+        return snap.image_revision;
+    // A temporary !ready after RN_TRACK_CHANGE is NOT a new placeholder track.
+    // Keep the displayed phone Surface identity so controls snapshots and the
+    // cassette shell are not invalidated on a Play/Pause notification.
+    if (!snap.unavailable && g_cover_generation == kCassettePhoneGeneration &&
+        g_cover_lease.slot_index != 0xFFU)
+        return g_cover_track;
+    return 0U;
 }
 
 static bool cassette_view_acquire_current_cover(uint32_t track, CoverSurfaceLease *lease)
@@ -3435,8 +3443,25 @@ static bool cassette_view_bind_phone_cover()
     const uint32_t generation = kCassettePhoneGeneration;
     const uint32_t track = phone.ready ? phone.image_revision : 0U;
 
-    // No phone art yet: use existing cassette label fallback and pink shell.
+    // A2DP/AVRCP frequently raises RN_TRACK_CHANGE again when the user first
+    // presses Play. The phone cover staging then reports ready=false while a
+    // new JPEG/PNG is being transferred. This is NOT "no artwork": do not
+    // replace an already-visible phone cover (or shell tint) with the default.
     if (!phone.ready || track == 0U) {
+        BtAudioAvrcSnapshot avrc = {};
+        BtAudioSinkSnapshot sink = {};
+        (void)bt_audio_avrc_get_snapshot(&avrc);
+        (void)bt_audio_sink_get_snapshot(&sink);
+        const bool disconnected = !avrc.connected && !sink.connected;
+        if (!phone.unavailable && !disconnected) {
+            // Pending download: the previous RGB565 Surface remains pinned.
+            // No source changes, no default label, no shell recolor.
+            return g_cover_generation == generation &&
+                (g_cover_lease.slot_index != 0xFFU ||
+                 g_fallback_cover_lease.slot_index != 0xFFU);
+        }
+        // The peer has no cover, all retries failed, or the audio session
+        // ended. Only these terminal cases may display the default label.
         if (g_cover_generation == generation && g_cover_track == 0U &&
             g_cover_is_no_artwork_fallback) return true;
         return cassette_view_bind_no_artwork_label(generation, 0U);
@@ -3450,6 +3475,17 @@ static bool cassette_view_bind_phone_cover()
     if (!cover_surface_cache_acquire_phone(track, false, &next) ||
         next.normal_rgb565 == nullptr) {
         cover_surface_cache_release(&next);
+        CoverSurfaceSnapshot surface = {};
+        if (cover_surface_cache_get_snapshot(&surface) &&
+            surface.catalog_generation == generation &&
+            surface.track_index == track &&
+            surface.state == CoverSurfaceState::Failed &&
+            bt_phone_cover_render_failed(track)) {
+            // The compressed download succeeded but final RGB565 processing
+            // did not. This is a real terminal failure, unlike ready=false
+            // while the download/worker is in progress.
+            return cassette_view_bind_no_artwork_label(generation, 0U);
+        }
         return false;  // wait for the worker, keeping the old label visible
     }
     cassette_view_cancel_shell_tint_job();
