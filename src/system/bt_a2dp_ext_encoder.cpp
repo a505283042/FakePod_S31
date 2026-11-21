@@ -31,6 +31,7 @@ static constexpr UBaseType_t kTaskPriority = 6U;
 static constexpr BaseType_t kTaskCore = FAKEPOD_BT_TX_ENC_CORE;
 static constexpr uint32_t kMaxPcmBytes = 16384U;
 static constexpr uint32_t kMaxEncodedBytes = 8192U;
+static constexpr size_t kInternalScratchReserve = 32U * 1024U; // preserve BT/SD DMA headroom
 
 struct Stream {
     esp_a2d_conn_hdl_t connection = 0U;
@@ -113,7 +114,7 @@ static void worker(void *)
     uint32_t timestamp = 0U;
     uint32_t sent = 0U, failed = 0U, underrun = 0U;
     uint32_t max_lateness_us = 0U, late_over_40ms = 0U, late_over_80ms = 0U;
-    uint32_t max_encode_us = 0U, max_send_us = 0U;
+    uint32_t max_read_us = 0U, max_encode_us = 0U, max_send_us = 0U;
     uint32_t max_send_gap_us = 0U;
     int64_t last_accepted_us = 0;
     const bool ready = open_codec(stream, &encoder, &in_bytes, &out_bytes,
@@ -134,14 +135,43 @@ static void worker(void *)
                 static_cast<unsigned long>(encoded_size));
             goto finish;
         }
-        pcm = static_cast<uint8_t *>(heap_caps_malloc(pcm_size,
-            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-        encoded = static_cast<uint8_t *>(heap_caps_malloc(encoded_size,
-            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        // Keep large source PCM ring in PSRAM. The tiny encoder input/output
+        // scratch buffers are hot data and should avoid shared PSRAM during
+        // full-screen LVGL redraws. Reserve enough internal RAM for BT/SDMMC.
+        const uint32_t internal_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+        bool internal_scratch = false;
+        const size_t internal_free = heap_caps_get_free_size(internal_caps);
+        if (internal_free >= static_cast<size_t>(pcm_size) + encoded_size +
+                             kInternalScratchReserve) {
+            pcm = static_cast<uint8_t *>(heap_caps_malloc(pcm_size, internal_caps));
+            encoded = static_cast<uint8_t *>(heap_caps_malloc(encoded_size, internal_caps));
+            if (pcm != nullptr && encoded != nullptr) {
+                internal_scratch = true;
+            } else {
+                heap_caps_free(pcm);
+                heap_caps_free(encoded);
+                pcm = nullptr;
+                encoded = nullptr;
+            }
+        }
+        if (!internal_scratch) {
+            pcm = static_cast<uint8_t *>(heap_caps_malloc(
+                pcm_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+            encoded = static_cast<uint8_t *>(heap_caps_malloc(
+                encoded_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+        }
         if (pcm == nullptr || encoded == nullptr) {
-            ESP_LOGE(TAG, "Encoder PSRAM buffer allocation failed");
+            ESP_LOGE(TAG, "Encoder scratch allocation failed pcm=%lu encoded=%lu",
+                static_cast<unsigned long>(pcm_size),
+                static_cast<unsigned long>(encoded_size));
             goto finish;
         }
+        ESP_LOGI(TAG, "Encoder scratch=%s pcm=%luB encoded=%luB internal_free_before=%lu internal_free_after=%lu",
+            internal_scratch ? "SRAM" : "PSRAM",
+            static_cast<unsigned long>(pcm_size),
+            static_cast<unsigned long>(encoded_size),
+            static_cast<unsigned long>(internal_free),
+            static_cast<unsigned long>(heap_caps_get_free_size(internal_caps)));
         const uint32_t pcm_frames = pcm_size / 4U; // stereo S16
         const int64_t frame_us = std::max<int64_t>(1000,
             static_cast<int64_t>(pcm_frames) * 1000000LL / stream.sample_rate);
@@ -178,8 +208,12 @@ static void worker(void *)
                 if (late > 40000U) ++late_over_40ms;
                 if (late > 80000U) ++late_over_80ms;
             }
+            const int64_t read_start_us = esp_timer_get_time();
             memset(pcm, 0, pcm_size);
             const int32_t got = stream.reader(pcm, static_cast<int32_t>(pcm_size));
+            const uint32_t read_us = static_cast<uint32_t>(
+                esp_timer_get_time() - read_start_us);
+            if (read_us > max_read_us) max_read_us = read_us;
             if (got != static_cast<int32_t>(pcm_size)) ++underrun;
             esp_audio_enc_in_frame_t input = {};
             input.buffer = pcm;
@@ -247,19 +281,22 @@ static void worker(void *)
             timestamp += pcm_frames;
             if (((sent + failed) % 500U) == 0U && (sent + failed) > 0U) {
                 ESP_LOGI(TAG,
-                    "A2DP_TX_EXT sent=%lu failed=%lu short_pcm=%lu send_gap_max=%luus late_max=%luus late40=%lu late80=%lu encode_max=%luus send_max=%luus",
+                    "A2DP_TX_EXT sent=%lu failed=%lu short_pcm=%lu scratch=%s send_gap_max=%luus late_max=%luus late40=%lu late80=%lu read_max=%luus encode_max=%luus send_max=%luus",
                     static_cast<unsigned long>(sent),
                     static_cast<unsigned long>(failed),
                     static_cast<unsigned long>(underrun),
+                    internal_scratch ? "SRAM" : "PSRAM",
                     static_cast<unsigned long>(max_send_gap_us),
                     static_cast<unsigned long>(max_lateness_us),
                     static_cast<unsigned long>(late_over_40ms),
                     static_cast<unsigned long>(late_over_80ms),
+                    static_cast<unsigned long>(max_read_us),
                     static_cast<unsigned long>(max_encode_us),
                     static_cast<unsigned long>(max_send_us));
                 max_lateness_us = 0U;
                 late_over_40ms = 0U;
                 late_over_80ms = 0U;
+                max_read_us = 0U;
                 max_encode_us = 0U;
                 max_send_us = 0U;
                 max_send_gap_us = 0U;
