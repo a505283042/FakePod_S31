@@ -27,6 +27,8 @@
 #include "player_control.h"
 #include "system/device_settings.h"
 #include "system/screen_lock_simple.h"
+#include "system/bt_audio_avrc.h"
+#include "system/bt_phone_cover.h"
 #include "lyrics/lyrics_service.h"
 #include "nas_library_source.h"
 #include "lyrics/lyrics_text_layout.h"
@@ -612,10 +614,36 @@ static void cassette_view_clear_lyrics()
     g_last_lyrics_line = UINT32_MAX;
 }
 
+// Phone artwork uses its own CoverSurface generation/revision, never a TF/NAS index.
+static constexpr uint32_t kCassettePhoneGeneration = 0xFFFFFFFEU;
+
+static uint32_t cassette_view_current_generation()
+{
+    return bt_audio_avrc_is_sink_mode()
+        ? kCassettePhoneGeneration : artwork_source_active_generation();
+}
+
+static uint32_t cassette_view_current_index()
+{
+    if (!bt_audio_avrc_is_sink_mode())
+        return static_cast<uint32_t>(player_state_get_index());
+    BtPhoneCoverSnapshot snap = {};
+    return bt_phone_cover_get_snapshot(&snap) && snap.ready
+        ? snap.image_revision : 0U;
+}
+
+static bool cassette_view_acquire_current_cover(uint32_t track, CoverSurfaceLease *lease)
+{
+    return bt_audio_avrc_is_sink_mode()
+        ? cover_surface_cache_acquire_phone(track, false, lease)
+        : cover_surface_cache_acquire_normal(track, lease);
+}
+
 // Both catalogues feed the same ArtworkLoader -> CoverSurface -> Cassette pipeline.
 // The existing source-aware generation puts NAS in a separate namespace from TF.
 static bool cassette_view_current_track_valid()
 {
+    if (bt_audio_avrc_is_sink_mode()) return true;
     if (!player_state_is_ready()) return false;
     const size_t track = player_state_get_index();
     return artwork_source_is_nas()
@@ -640,6 +668,16 @@ static bool cassette_view_audio_matches_current(const AudioStateSnapshot &audio)
 
 static void cassette_view_update_track_text()
 {
+    if (bt_audio_avrc_is_sink_mode()) {
+        BtAudioAvrcSnapshot phone = {};
+        (void)bt_audio_avrc_get_snapshot(&phone);
+        cassette_view_set_text_if_changed(g_title_label,
+            phone.title[0] != '\0' ? phone.title : "手机蓝牙音频");
+        cassette_view_set_text_if_changed(g_artist_label,
+            phone.artist[0] != '\0' ? phone.artist : "");
+        cassette_view_clear_lyrics();
+        return;
+    }
     if (!cassette_view_current_track_valid()) {
         g_text_track = UINT32_MAX;
         g_text_generation = 0U;
@@ -684,6 +722,7 @@ static void cassette_view_update_track_text()
 
 static void cassette_view_update_mini_lyrics()
 {
+    if (bt_audio_avrc_is_sink_mode()) return;
     if (!lyrics_service_is_ready() || !cassette_view_current_track_valid()) {
         return;
     }
@@ -811,8 +850,8 @@ static bool cassette_view_controls_cache_matches_current()
         !cassette_view_current_track_valid()) {
         return false;
     }
-    return g_cover_generation == artwork_source_active_generation() &&
-        g_cover_track == static_cast<uint32_t>(player_state_get_index());
+    return g_cover_generation == cassette_view_current_generation() &&
+        g_cover_track == cassette_view_current_index();
 }
 
 static bool cassette_view_ensure_cache_buffer(uint8_t **buffer, size_t bytes, const char *name)
@@ -1489,12 +1528,20 @@ static void cassette_view_update_tape_amount(const AudioStateSnapshot &audio)
     // 换曲时 player_state 会先切到新曲，而 audio snapshot 可能仍短暂保留旧曲。
     // 过渡态直接显示新磁带的起始量，避免先回中间再跳到左边最少。
     int16_t shift = kTapeAmountStartShiftPx;
-    const uint64_t total_ms = cassette_view_audio_total_ms(audio);
-    const bool same_track = cassette_view_audio_matches_current(audio);
-    if (audio.ready && same_track && total_ms > 0U) {
+    uint64_t total_ms = cassette_view_audio_total_ms(audio);
+    bool same_track = cassette_view_audio_matches_current(audio);
+    uint64_t position_ms = audio.position_ms;
+    if (bt_audio_avrc_is_sink_mode()) {
+        BtAudioAvrcSnapshot phone = {};
+        (void)bt_audio_avrc_get_snapshot(&phone);
+        total_ms = phone.duration_ms;
+        position_ms = phone.position_ms;
+        same_track = phone.connected;
+    }
+    if (same_track && total_ms > 0U) {
         // C2 实机确认磁带量方向反了。C2.1 完全反转平移方向：
         // 0% 向左 31px；100% 向右 25px，两端按进度线性平移。
-        const uint64_t position_ms = audio.position_ms < total_ms ? audio.position_ms : total_ms;
+        position_ms = position_ms < total_ms ? position_ms : total_ms;
         const uint64_t travel = static_cast<uint64_t>(
             kTapeAmountEndShiftPx - kTapeAmountStartShiftPx);
         const uint64_t moved = (position_ms * travel) / total_ms;
@@ -1512,13 +1559,22 @@ static void cassette_view_update_tape_amount(const AudioStateSnapshot &audio)
 
 static uint32_t cassette_view_progress_q16(const AudioStateSnapshot &audio)
 {
-    const uint64_t total_ms = cassette_view_audio_total_ms(audio);
-    const bool same_track = cassette_view_audio_matches_current(audio);
+    uint64_t total_ms = cassette_view_audio_total_ms(audio);
+    bool same_track = cassette_view_audio_matches_current(audio);
+    uint64_t position_ms = audio.position_ms;
+    if (bt_audio_avrc_is_sink_mode()) {
+        BtAudioAvrcSnapshot phone = {};
+        (void)bt_audio_avrc_get_snapshot(&phone);
+        total_ms = phone.duration_ms;
+        position_ms = phone.position_ms;
+        same_track = phone.connected;
+    }
     // 新曲音频快照尚未 ready / 尚未切到当前 track 时，按 0% 起始状态显示。
     // 不再使用 50% 中位兜底，避免切歌瞬间走带几何先回中间。
-    if (!audio.ready || !same_track || total_ms == 0U) return 0U;
+    if ((!audio.ready && !bt_audio_avrc_is_sink_mode()) ||
+        !same_track || total_ms == 0U) return 0U;
 
-    const uint64_t position_ms = audio.position_ms < total_ms ? audio.position_ms : total_ms;
+    position_ms = position_ms < total_ms ? position_ms : total_ms;
     return static_cast<uint32_t>(
         (position_ms * static_cast<uint64_t>(kPhaseOneFrameQ16)) / total_ms);
 }
@@ -1550,7 +1606,7 @@ static void cassette_view_update_mechanics()
     if (!g_mechanics_ready || !g_active || g_seek_frozen || g_controls_visible || g_launcher_suspended) return;
 
     AudioStateSnapshot audio = {};
-    if (!audio_service_get_snapshot(&audio)) return;
+    if (!audio_service_get_snapshot(&audio) && !bt_audio_avrc_is_sink_mode()) return;
     const bool high_rate_flac =
         audio.format == MediaFormat::FLAC && audio.sample_rate_hz >= 96000U;
 
@@ -1562,9 +1618,14 @@ static void cassette_view_update_mechanics()
     const uint32_t progress_q16 = cassette_view_progress_q16(audio);
     cassette_view_update_tape_path_geometry(progress_q16);
 
-    const bool moving = cassette_view_audio_matches_current(audio) &&
+    bool moving = cassette_view_audio_matches_current(audio) &&
         (audio.state == AudioPlaybackState::Playing ||
          audio.state == AudioPlaybackState::Seeking);
+    if (bt_audio_avrc_is_sink_mode()) {
+        BtAudioAvrcSnapshot phone = {};
+        (void)bt_audio_avrc_get_snapshot(&phone);
+        moving = phone.connected && phone.playback_known && phone.playing;
+    }
     if (!moving) {
         // Pause/Stopped 时机械运动与亮点跳动都冻结；恢复后不补跑暂停期间的相位。
         g_last_mechanics_frame_us = now_us;
@@ -2488,8 +2549,8 @@ static void cassette_view_handle_cache_result()
             fallback_cover_image_release(&result.fallback_lease);
         }
         const bool still_current = cassette_view_current_track_valid() &&
-            artwork_source_active_generation() == result.generation &&
-            static_cast<uint32_t>(player_state_get_index()) == result.track &&
+            cassette_view_current_generation() == result.generation &&
+            cassette_view_current_index() == result.track &&
             g_cover_generation == result.generation && g_cover_track == result.track;
         if (!result.ok || !still_current || g_controls_cache_back_pixels == nullptr) {
             return;
@@ -2649,8 +2710,8 @@ static bool cassette_view_schedule_current_cache()
     }
     // 当前快照始终优先于 next 预取，但不销毁已经准备好的 next。
     // 后台任务单实例串行执行，因此 current/next 可以安全长期各保留一张快照。
-    const uint32_t generation = artwork_source_active_generation();
-    const uint32_t track = static_cast<uint32_t>(player_state_get_index());
+    const uint32_t generation = cassette_view_current_generation();
+    const uint32_t track = cassette_view_current_index();
     CassetteCacheBuildJob job = {};
     job.role = CassetteCacheBuildRole::Current;
     job.generation = generation;
@@ -2665,7 +2726,7 @@ static bool cassette_view_schedule_current_cache()
 
     // 无封面 current 也让 Core1 任务自行 acquire fallback：命中已解码缓存时是快路径，
     // 缺省 JPG 缺失时则直接合成黑标签+粉色磁带，不在 UI tick 反复读 SD。
-    if (!job.no_artwork && !cover_surface_cache_acquire_normal(track, &job.cover_lease)) {
+    if (!job.no_artwork && !cassette_view_acquire_current_cover(track, &job.cover_lease)) {
         return false;
     }
 
@@ -2742,6 +2803,7 @@ static bool cassette_view_current_lyrics_settled()
 
 static void cassette_view_service_next_prefetch()
 {
+    if (bt_audio_avrc_is_sink_mode()) return;
     if (!g_active || g_cache_build_busy || !cassette_view_current_track_valid()) {
         return;
     }
@@ -2914,8 +2976,8 @@ static void cassette_view_tick_shell_tint_chunk()
     // TintJob 可能在 100ms 封面轮询发现切歌之前先跑完。提交前再核对一次真实曲目，
     // 过期结果只丢弃，绝不能把上一首的新颜色覆盖到当前歌曲。
     const bool still_current = cassette_view_current_track_valid() &&
-        static_cast<uint32_t>(player_state_get_index()) == completed_track &&
-        artwork_source_active_generation() == completed_generation;
+        cassette_view_current_index() == completed_track &&
+        cassette_view_current_generation() == completed_generation;
     if (!still_current) {
         if (g_pending_cover_valid && g_pending_cover_generation == completed_generation &&
             g_pending_cover_track == completed_track) {
@@ -3057,8 +3119,8 @@ static void cassette_view_sync_tint_setting()
     }
 
     if (!cassette_view_current_track_valid()) return;
-    const uint32_t current_track = static_cast<uint32_t>(player_state_get_index());
-    const uint32_t current_generation = artwork_source_active_generation();
+    const uint32_t current_track = cassette_view_current_index();
+    const uint32_t current_generation = cassette_view_current_generation();
 
     // 新封面已经 acquire 但尚未上屏：只允许它自己的 TintJob 继续跑。
     // 显示层此时仍保持上一首完整封面+壳体，不能因为 g_cover_track 还是上一首而误取消任务。
@@ -3360,8 +3422,60 @@ static bool cassette_view_try_promote_next_visual(uint32_t generation, uint32_t 
     return true;
 }
 
+static bool cassette_view_bind_phone_cover()
+{
+    if (g_cover_image == nullptr) return false;
+    if (g_next_prefetch.state != CassetteNextPrefetchState::Idle)
+        cassette_view_cancel_next_prefetch("进入手机蓝牙模式");
+    BtPhoneCoverSnapshot phone = {};
+    (void)bt_phone_cover_get_snapshot(&phone);
+    const uint32_t generation = kCassettePhoneGeneration;
+    const uint32_t track = phone.ready ? phone.image_revision : 0U;
+
+    // No phone art yet: use existing cassette label fallback and pink shell.
+    if (!phone.ready || track == 0U) {
+        if (g_cover_generation == generation && g_cover_track == 0U &&
+            g_cover_is_no_artwork_fallback) return true;
+        return cassette_view_bind_no_artwork_label(generation, 0U);
+    }
+    if (g_cover_generation == generation && g_cover_track == track &&
+        g_cover_lease.slot_index != 0xFFU) return true;
+    if (g_pending_cover_valid && g_pending_cover_generation == generation &&
+        g_pending_cover_track == track) return true;
+
+    CoverSurfaceLease next = {};
+    if (!cover_surface_cache_acquire_phone(track, false, &next) ||
+        next.normal_rgb565 == nullptr) {
+        cover_surface_cache_release(&next);
+        return false;  // wait for the worker, keeping the old label visible
+    }
+    cassette_view_cancel_shell_tint_job();
+    cassette_view_release_pending_cover();
+    g_pending_cover_lease = next;
+    g_pending_cover_generation = generation;
+    g_pending_cover_track = track;
+    g_pending_cover_y_offset_px = 0;
+    g_pending_cover_valid = true;
+
+    DeviceSettingsSnapshot settings = {};
+    const bool dynamic = device_settings_get_snapshot(&settings) &&
+        settings.cassette_dynamic_tint_enabled;
+    if (!dynamic) {
+        cassette_view_restore_shell_default();
+        cassette_view_restore_small_roller_default();
+        (void)cassette_view_commit_pending_cover(generation, track);
+    } else if (!cassette_view_start_shell_tint_job(generation, track,
+            g_pending_cover_lease)) {
+        cassette_view_restore_shell_default();
+        cassette_view_restore_small_roller_default();
+        (void)cassette_view_commit_pending_cover(generation, track);
+    }
+    return true;
+}
+
 static bool cassette_view_bind_current_cover()
 {
+    if (bt_audio_avrc_is_sink_mode()) return cassette_view_bind_phone_cover();
     if (!cassette_view_current_track_valid() || g_cover_image == nullptr) {
         return false;
     }
@@ -3486,8 +3600,8 @@ static bool cassette_view_bind_current_cover()
 static bool cassette_view_current_visual_ready()
 {
     if (!cassette_view_current_track_valid()) return false;
-    const uint32_t generation = artwork_source_active_generation();
-    const uint32_t track = static_cast<uint32_t>(player_state_get_index());
+    const uint32_t generation = cassette_view_current_generation();
+    const uint32_t track = cassette_view_current_index();
     if (g_cover_generation != generation || g_cover_track != track) return false;
     if (g_cover_is_no_artwork_fallback) return true;
     if (g_cover_lease.slot_index == 0xFFU || g_cover_lease.normal_rgb565 == nullptr) return false;
@@ -3787,6 +3901,7 @@ bool cassette_view_set_temporary_hidden(bool hidden)
 bool cassette_view_prepare_track_transition_hold()
 {
     cassette_view_release_transition_hold();
+    if (bt_audio_avrc_is_sink_mode()) return false;
     if (!cassette_view_current_track_valid() || !cover_surface_cache_is_ready()) {
         return false;
     }
@@ -3887,6 +4002,11 @@ void cassette_view_update()
 
 static void cassette_view_revalidate_next_prefetch(const char *cancel_reason)
 {
+    if (bt_audio_avrc_is_sink_mode()) {
+        if (g_next_prefetch.state != CassetteNextPrefetchState::Idle)
+            cassette_view_cancel_next_prefetch("手机模式不预取本地下一曲");
+        return;
+    }
     if (!cassette_view_current_track_valid()) {
         return;
     }

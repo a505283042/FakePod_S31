@@ -610,6 +610,11 @@ void bt_audio_avrc_update()
         }
     }
 #endif
+    // CoverSurface service normally starts from the TF catalog path. Phone playback
+    // must also work when no SD card is inserted.
+    if (connected && !cover_surface_cache_is_ready())
+        (void)cover_surface_cache_start();
+
     // Schedule phone JPEG/PNG conversion only from the normal service pump, never
     // inside Bluedroid callbacks. Old Surface remains pinned during decoding.
     BtPhoneCoverSnapshot cover = {};

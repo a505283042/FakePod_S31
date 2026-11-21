@@ -173,9 +173,18 @@
 - **首轮限制**：仅内部 SBC，常见 44.1/48kHz 立体声优先；
   32kHz 可工作；16kHz 目前没有 DAC rate profile，返回不支持；
   手机高品质 AAC 音频并未在本轮开启。
-- **第一阶段限制**：暂不把手机专辑封面和 LRC 歌词传入 FakePod，
-  原本地封面/磁带资源仍与本地曲库绑定。蓝牙接收模式下只接入歌曲
-  文本/进度及频谱；进度条暂为只读，不声明支持手机 AVRCP Seek。
+- **第二阶段 Cover Art（实验分支，未通过编译/实机验收）**：启用
+  ESP-IDF AVRCP 1.6 Cover Art CT；收到手机的图片 Handle 后尝试连接
+  BIP/OBEX 并读取 Linked Thumbnail（需手机播放器支持）。
+  JPEG/PNG 分片接收限制 192 KiB，储存在 PSRAM，不在蓝牙回调中解码。
+  现有 CoverSurfaceTask 生成 460×460 RGB565 normal/dimmed 与封面主色；
+  手机图使用单独 generation + revision，既有封面页面和磁带标签
+  共享该 Surface、动态壳体配色及切歌安全替换机制。
+  Android Remote 回退**仅实现了固件 BLE 分片接收端**，Android App 的
+  读取 MediaSession 封面、压缩和 BLE 发送逻辑仍需在 App 工程中增加；
+  不能将其当作现有 Android App 已支持的功能。
+- **其余限制**：暂不向设备传入手机 LRC 歌词；手机进度条仅为只读，
+  不声明支持手机 AVRCP Seek。
   具体手机 App 是否向 AVRCP 暴露时长/元数据/绝对音量取决于其实现。
   AVRCP 模式切换不会重新初始化已有 BLE GATT 服务。
 - **已有 LVGL 修复**：实际运行恢复了 16 行 × 双 DMA 绘图缓冲，
@@ -216,6 +225,36 @@
 11. 重复发射↔接收切换至少 5 次，验证 AVRCP CT/TG 释放、
     BLE 手机遥控连接、I2S DMA 和 LVGL 16 行双缓冲保持正常。
 
+
+第二阶段 Cover Art 验收计划（实验分支 feat/phone-avrcp-cover-art）：
+
+12. 检查重新生成的 sdkconfig 中实际含有
+    `CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED=y`；这是 AVRCP 1.6
+    OBEX/BIP 功能，单纯修改 sdkconfig.defaults 不能保证旧构建缓存生效。
+13. 支持 Cover Art 的 Android 播放器应出现
+    `AVRCP_COVER OBEX=CONNECTED`、`AVRCP_COVER surface requested`，
+    然后 CoverSurface 解码成功；仅返回 `ESP_OK` 不算已经获得封面。
+14. 封面页、磁带页（含动态取色、滚轮、控件 Overlay）切换，
+    检查两者使用同一 Surface、切歌不串图、不闪本地封面。
+15. 手机不支持 Cover Art / 不返回图片 Handle / 图像格式异常 /
+    PSRAM 不足 / 蓝牙断线时，应安全显示缺省封面，播放不中断。
+16. 重点测试 TF 卡未插入时的手机封面、TF/NAS 与手机接收角色切换，
+    验证 CoverSurfaceTask 和音频 DMA 不争抢内存或反复启动。
+17. Android 回退使用原加密 GATT Command Characteristic、MTU=23 可用，
+    每笔传输完整按顺序写以下分片，均为小端序：
+    - Begin：`40 tx size32`，共 6 字节，size=压缩图片总字节数，范围 32..196608。
+    - Data：`41 tx offset32 jpeg_or_png[1..238]`。默认 MTU=23
+      时每包最多 14 字节图片数据；协商 MTU=247 后最多 238 字节，
+      因此固件允许最长 244 字节的封面专用 Command 写入，
+      其他历史控制命令仍限制为 20 字节。
+      offset 从 0 开始，严格连续，写入需成功后再发送下一段。
+    - Finish：`42 tx`，共 2 字节；若当前手机歌曲切换、断开、超出限额
+      或实际长度不符，则拒绝此次上传。
+    - 推荐 Android App 通过已授权 MediaSession 获取 bitmap，
+      压缩为不超过 192 KiB 的 300～460px JPEG 后传输；
+      如手机直接提供 AVRCP 图片，优先使用 AVRCP 来源。
+    - 当前仓库未包含 Android App 的发送端，本流程属固件接口规范，
+      需要 App 完整接入后才能进行端到端验收。
 
 **状态：已提交源码，未完成编译/实机验收。** 蓝牙 Sink 使用当前 ESP-IDF
 release/v6.1 的 legacy 内部 SBC PCM callback；后续实机日志用于收敛延迟、

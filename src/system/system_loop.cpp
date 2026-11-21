@@ -22,6 +22,7 @@
 #include "media_catalog_v2.h"
 #include "sdcard.h"
 #include "artwork_loader.h"
+#include "bt_audio_avrc.h"
 #include "artwork_source_context.h"
 #include "nas_library_source.h"
 #include "cover_surface_cache.h"
@@ -391,6 +392,8 @@ static void system_artwork_begin_context(uint32_t generation, uint32_t current_t
 
 static void system_artwork_current_update()
 {
+    // Never enqueue TF/NAS CoverSurface jobs while phone AVRCP owns the player.
+    if (bt_audio_avrc_is_sink_mode()) return;
     // CoverSurface 是性能优化层，不是封面可用性的硬依赖；它没起来时仍允许 ArtworkLoader
     // 读取压缩图，并由 NowPlaying 直接走 LVGL compressed fallback。
     if (!artwork_loader_is_ready() || !player_state_is_ready()) return;

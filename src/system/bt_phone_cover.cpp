@@ -94,7 +94,8 @@ bool bt_phone_cover_append(BtPhoneCoverSource source, const uint8_t *data, size_
         size <= BT_PHONE_COVER_MAX_BYTES - s_received &&
         (s_expected == 0U || s_received + size <= s_expected);
     if (!valid) {
-        s_receiving = false;
+        // An old AVRCP callback must not cancel a newer Android transaction.
+        if (s_receiving && source == s_incoming) s_receiving = false;
         unlock();
         return false;
     }
