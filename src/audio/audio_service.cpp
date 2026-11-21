@@ -1,4 +1,5 @@
 #include "audio_service.h"
+#include "bt_audio_source.h"
 
 #include <stdlib.h>
 #include <stdint.h>
@@ -3068,6 +3069,8 @@ static void audio_task_service_pcm_playback()
         return;
     }
     audio_task_note_music_pcm(g_pcm_block, frames);
+    bt_audio_source_feed_pcm32(g_pcm_block, frames, g_task_sample_rate_hz,
+                               g_task_user_muted ? 0U : g_task_volume_percent);
 
     // i2s_output_stream_write_pcm32() 成功表示整块真实 PCM 已复制进 DMA。
     // 启动 prime、暂停保持时钟和 EOF drain 都走 silence API，因此不会污染该计数。
@@ -3985,6 +3988,9 @@ static void audio_task_service_video_mp3()
         audio_task_publish_video_clock_snapshot();
         return;
     }
+    // 蓝牙旁路不能阻塞视频或改变原 I2S 时钟。
+    bt_audio_source_feed_pcm32(g_pcm_block, frames, g_video_mp3_sample_rate_hz,
+                               g_task_user_muted ? 0U : g_video_mp3_volume_percent);
     // 记录最后提交的样本，seek/暂停时用它做数字淡出。
     audio_task_note_video_pcm(g_pcm_block, frames);
     audio_playback_clock_commit_pcm(&g_video_playback_clock, frames);
@@ -5556,6 +5562,8 @@ static void audio_task_service_nsf()
         return;
     }
 
+    bt_audio_source_feed_pcm32(g_pcm_block, frames, g_nsf_renderer.sample_rate_hz,
+                               g_task_user_muted ? 0U : g_task_volume_percent);
     audio_playback_clock_commit_pcm(&g_nsf_playback_clock, frames);
     if (fade_eof) {
         audio_task_finish_nsf_track(
