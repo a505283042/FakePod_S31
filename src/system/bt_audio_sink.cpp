@@ -1,4 +1,5 @@
 #include "bt_audio_sink.h"
+#include "bt_audio_avrc.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -166,7 +167,15 @@ esp_err_t bt_audio_sink_host_start()
     flush_locked();
     portEXIT_CRITICAL(&s_mux);
 
-    esp_err_t err = esp_bt_gap_register_callback(classic_gap_cb);
+    // ESP-IDF contract: AVRCP CT/TG must initialize before A2DP Sink.
+    esp_err_t err = bt_audio_avrc_host_start();
+    if (err != ESP_OK) {
+        portENTER_CRITICAL(&s_mux);
+        s_requested = false;
+        portEXIT_CRITICAL(&s_mux);
+        return err;
+    }
+    err = esp_bt_gap_register_callback(classic_gap_cb);
     if (err == ESP_OK) err = esp_bt_gap_set_device_name("FakePod Audio");
     if (err == ESP_OK) err = esp_a2d_register_callback(a2dp_cb);
     bool profile_start_sent = false;
@@ -187,6 +196,7 @@ esp_err_t bt_audio_sink_host_start()
             // subsequent GAP setup fails, before Source may register callbacks.
             bt_audio_sink_host_stop();
         } else {
+            bt_audio_avrc_host_stop();
             portENTER_CRITICAL(&s_mux);
             s_requested = false;
             portEXIT_CRITICAL(&s_mux);
@@ -222,6 +232,8 @@ void bt_audio_sink_host_stop()
     portEXIT_CRITICAL(&s_mux);
     if (!active) return;
     (void)esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+    // AVRCP deinit BEFORE A2DP Sink deinit, preserving BLE GATT lifetime.
+    bt_audio_avrc_host_stop();
     if (connected) (void)esp_a2d_sink_disconnect(peer);
     const esp_err_t ret = esp_a2d_sink_deinit();
     if (ret == ESP_OK) {
@@ -291,6 +303,9 @@ void bt_audio_sink_flush()
 
 void bt_audio_sink_update()
 {
+    // Non-Bluetooth SystemLoop processes remote metadata/control and enqueues
+    // incoming phone absolute-volume changes to the sole AudioTask.
+    bt_audio_avrc_update();
     const TickType_t now = xTaskGetTickCount();
     uint32_t q=0U, rate=0U, drop=0U;
     bool should_log = false;
