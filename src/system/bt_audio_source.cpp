@@ -59,6 +59,7 @@ static bool s_streaming = false;
 static bool s_media_ctrl_pending = false;
 static bool s_deinit_confirmed = false;
 static TickType_t s_retry_due = 0U;
+static TickType_t s_stats_due = 0U;
 static esp_bd_addr_t s_candidate_bda = {};
 static esp_bd_addr_t s_peer_bda = {};
 static char s_candidate_name[48] = {};
@@ -296,6 +297,9 @@ esp_err_t bt_audio_source_host_start()
     s_streaming = false;
     s_target_rate = 44100U;
     s_best_rssi = -127;
+    s_stats_due = 0;
+    s_underrun = 0;
+    s_dropped = 0;
     flush_locked();
     portEXIT_CRITICAL(&s_lock);
 
@@ -424,7 +428,26 @@ void bt_audio_source_update()
 {
 #if FAKEPOD_A2DP_SUPPORTED
     const TickType_t now = xTaskGetTickCount();
+    bool log_stats = false;
+    uint32_t rate = 0U;
+    uint32_t underrun = 0U;
+    uint32_t dropped = 0U;
+    size_t buffered = 0U;
     portENTER_CRITICAL(&s_lock);
+    // 兼容个别耳机丢失 CHECK_SRC_RDY/START ACK 的情况：超时后允许重试。
+    if (s_media_ctrl_pending && s_connected &&
+        static_cast<int32_t>(now - (s_retry_due + pdMS_TO_TICKS(1500))) >= 0) {
+        s_media_ctrl_pending = false;
+    }
+    if (s_init_requested && s_streaming &&
+        (s_stats_due == 0U || static_cast<int32_t>(now - s_stats_due) >= 0)) {
+        s_stats_due = now + pdMS_TO_TICKS(10000);
+        rate = s_target_rate;
+        underrun = s_underrun;
+        dropped = s_dropped;
+        buffered = s_queued;
+        log_stats = true;
+    }
     const bool attempt = s_init_requested && s_profile_ready && s_connected &&
                          !s_streaming && !s_media_ctrl_pending &&
                          static_cast<int32_t>(now - s_retry_due) >= 0;
@@ -433,6 +456,14 @@ void bt_audio_source_update()
         s_retry_due = now + kMediaRetryTicks;
     }
     portEXIT_CRITICAL(&s_lock);
+    if (log_stats) {
+        ESP_LOGI(TAG, "A2DP_TX rate=%luHz queued=%u/%u frames underrun=%lu drop=%lu",
+                 static_cast<unsigned long>(rate),
+                 static_cast<unsigned>(buffered),
+                 static_cast<unsigned>(kRingFrames),
+                 static_cast<unsigned long>(underrun),
+                 static_cast<unsigned long>(dropped));
+    }
     if (attempt) {
         const esp_err_t err = esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
         if (err != ESP_OK) {
