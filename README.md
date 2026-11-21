@@ -124,6 +124,31 @@
 
 ## 蓝牙音频发射 + 手机遥控共存（实验分支）
 
+### 修复96kHz播放时JPEG硬件驱动内存失败引发Core1崩溃
+
+2026-11-21 14:10 新日志：第一个96kHz/24bit FLAC在BTDM模式下成功以14×256
+启动I2S，但DMA剩余仅4071B；封面硬件JPEG尝试首次初始化时
+`jpeg_new_decoder_engine(): no memory for jpeg decode rxlink`，
+紧接着在ESP-IDF 6.1 `jpeg_release_codec_handle` 清理部分初始化实例时Core1访问异常。
+下一次测试DMA_free=27615B，低于12×256 DMA+4KB安全余量，正常拒绝起播。
+
+实验分支改动：
+
+- `ui_manager.cpp` 将LVGL的16行RGB565 DMA绘图缓存由双缓冲改为单缓冲：
+  29,440B → 14,720B，回收14,720B DMA能力内存；仍然维持16行SPI刷屏
+  以及已有LVGL FLUSH_FINISH信号量等待逻辑。单缓冲会损失部分绘制/传输并行度，需实机观察流畅度。
+- 初始化UI显示设备后，在双模蓝牙服务启动前调用`jpeg_hw_available()`，
+  预先创建并长期复用硬件JPEG引擎，避免高采样率播放期间首次申请内部DMA描述符。
+- `jpeg_hw_decoder.cpp` 增加JPEG引擎未初始化时的DMA安全门槛
+  （DMA总空闲至少16KB、最大连续空闲至少4KB）。不足时不触发IDF的危险半初始化清理路径，
+  直接回退已有软件JPEG；以后内存恢复可重试，而不是永久标记失败。
+- 96kHz默认的26×256保持于蓝牙关闭时；蓝牙连接时继续优先
+  16×256，必要时回退14×256、12×256；数据仍以原生96kHz/32-bit I2S输出。
+
+重点测试：连接MH-M18，连续切换44.1kHz与96kHz带封面FLAC、显示当前
+封面和磁带动画、手机BLE切歌，至少多次重复。检查 `I2S_BT_DMA: ready`、
+`启动期JPEG硬件预热成功`、`DMA_remaining`，以及有无新JPEG/DMA报错、
+LVGL刷新超时、爆音。此修改已提交GitHub，尚未实际编译/烧录验证。
 ### 修复双模蓝牙下 96 kHz FLAC 的 I2S DMA 初始化失败（2026-11-21）
 
 实机确认：44.1kHz FLAC + MH-M18 蓝牙耳机 + BLE 手机遥控可以稳定工作，
