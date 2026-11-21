@@ -46,6 +46,9 @@ void ble_remote_service_update();
 // Returns false if a Bluetooth stack transition is busy or unavailable.
 // Successful switches are stored in NVS by the transition worker.
 bool ble_remote_service_request_audio_role(DeviceBluetoothAudioRole role);
+// Restart only the active phone A2DP Sink after changing its AAC/SBC
+// advertising preference. Existing Transmit/Receive selection is unchanged.
+bool ble_remote_service_restart_audio_sink();
 
 // 第一阶段 HID Host 关闭，手柄（Controller）模式不可用；UI 据此跳过该选项。
 bool ble_remote_service_controller_supported();

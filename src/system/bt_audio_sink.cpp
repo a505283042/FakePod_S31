@@ -56,6 +56,8 @@ static bool s_deinit_confirmed = false;
 static TickType_t s_stats_due = 0;
 static esp_bd_addr_t s_peer = {};
 static char s_peer_name[48] = {};
+static uint8_t s_negotiated_codec = 0xFFU;
+static DeviceBluetoothSinkCodec s_codec_preference = DeviceBluetoothSinkCodec::AutoAac;
 #if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
 static bool s_sep_ok[2] = {};
 static bool s_sep_reported[2] = {};
@@ -99,10 +101,15 @@ static void register_aac_sbc_endpoints()
     sbc.cie.sbc_info.min_bitpool = 2;
     sbc.cie.sbc_info.max_bitpool = 250;
 
-    const esp_err_t aac_err = esp_a2d_sink_register_stream_endpoint(0, &aac);
+    // A2DP requires at least one SBC endpoint. Two SBC endpoints offer
+    // compatibility-only mode; otherwise AAC SEP0 is preferred, SBC SEP1 fallback.
+    const bool prefer_aac = s_codec_preference == DeviceBluetoothSinkCodec::AutoAac;
+    const esp_err_t first_err =
+        esp_a2d_sink_register_stream_endpoint(0, prefer_aac ? &aac : &sbc);
     const esp_err_t sbc_err = esp_a2d_sink_register_stream_endpoint(1, &sbc);
-    ESP_LOGI(TAG, "A2DP_EXT registering SEP0 AAC-LC=%s SEP1 SBC=%s",
-        esp_err_to_name(aac_err), esp_err_to_name(sbc_err));
+    ESP_LOGI(TAG, "A2DP_EXT registering SEP0 %s=%s SEP1 SBC=%s",
+        prefer_aac ? "AAC-LC" : "SBC",
+        esp_err_to_name(first_err), esp_err_to_name(sbc_err));
     // Wait for asynchronous SEP_REG_STATE callbacks before advertising.
 }
 #endif
@@ -206,6 +213,7 @@ static void a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             portENTER_CRITICAL(&s_mux);
             s_connected = state == ESP_A2D_CONNECTION_STATE_CONNECTED;
             s_streaming = false;
+            s_negotiated_codec = 0xFFU;
             flush_locked();
             if (s_connected) {
                 memcpy(s_peer, param->conn_stat.remote_bda, sizeof(s_peer));
@@ -242,6 +250,7 @@ static void a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
 #endif
             portENTER_CRITICAL(&s_mux);
             s_rate_hz = rate;
+            s_negotiated_codec = param->audio_cfg.mcc.type;
             flush_locked();
             portEXIT_CRITICAL(&s_mux);
             ESP_LOGI(TAG, "A2DP Sink codec=%s PCM=%luHz/S16/stereo",
@@ -281,6 +290,10 @@ esp_err_t bt_audio_sink_host_start()
             kRingFrames * 4U, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     }
     if (s_ring == nullptr) return ESP_ERR_NO_MEM;
+    // Read persisted intent once per profile start. Settings never directly
+    // touches Bluedroid; a preference change restarts this Sink profile.
+    DeviceSettingsSnapshot settings_snapshot = {};
+    const bool have_settings = device_settings_get_snapshot(&settings_snapshot);
     portENTER_CRITICAL(&s_mux);
     if (s_requested) { portEXIT_CRITICAL(&s_mux); return ESP_OK; }
     s_requested = true;
@@ -296,6 +309,9 @@ esp_err_t bt_audio_sink_host_start()
     s_startup_trim_frames = 0U;
     s_smooth_adjust_frames = 0U;
     s_peak_queued = 0U;
+    s_negotiated_codec = 0xFFU;
+    s_codec_preference = have_settings
+        ? settings_snapshot.bluetooth_sink_codec : DeviceBluetoothSinkCodec::AutoAac;
 #if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
     memset(s_sep_ok, 0, sizeof(s_sep_ok));
     memset(s_sep_reported, 0, sizeof(s_sep_reported));
@@ -411,6 +427,13 @@ void bt_audio_sink_host_stop()
 #endif
 }
 
+const char *bt_audio_sink_codec_name(uint8_t negotiated_codec)
+{
+    if (negotiated_codec == ESP_A2D_MCT_M24) return "AAC";
+    if (negotiated_codec == ESP_A2D_MCT_SBC) return "SBC";
+    return "未知";
+}
+
 bool bt_audio_sink_get_snapshot(BtAudioSinkSnapshot *out)
 {
     if (out == nullptr) return false;
@@ -421,6 +444,8 @@ bool bt_audio_sink_get_snapshot(BtAudioSinkSnapshot *out)
     s.connected = s_connected;
     s.streaming = s_streaming;
     s.sample_rate_hz = s_rate_hz;
+    s.negotiated_codec = s_negotiated_codec;
+    s.preferred_codec = s_codec_preference;
     s.queued_frames = static_cast<uint32_t>(s_queued);
     s.dropped_frames = s_dropped_frames;
     s.underrun_frames = s_underrun_frames;

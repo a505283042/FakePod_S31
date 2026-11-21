@@ -81,3 +81,28 @@ AVRCP_COVER request=thumbnail ...
 已完成 GitHub 云端源码变更、ESP-IDF 6.1 官方接口/示例的源码交叉核对。**没有在用户 PC 上完成整套固件编译，没有对 ESP32-S31、QQ 音乐、CS43131 做真实 AAC 播放验证**；切勿直接覆盖唯一可工作的固件而不保留回退方式。
 
 参考：ESP-IDF release/v6.1 官方 `examples/bluetooth/bluedroid/classic_bt/a2dp_sink_stream_aac`；`esp_a2dp_api.h`、`components/bt/host/bluedroid/Kconfig.in`。
+
+## 蓝牙设置 / 控件页实际编码显示
+
+本分支现在允许通过 **设置 → 连接 → 蓝牙 → 接收编码** 选择：
+- `自动·AAC优先`：优先公布 AAC-LC（SEID 0）和必需的 SBC（SEID 1），手机自主协商 AAC 或 SBC；
+- `仅SBC`：两个 SEP 均以 SBC 注册，手机不会与 FakePod 协商 AAC；
+- 选择结果持久化到 `device_cfg/btaacpref` NVS。切换时若 A2DP 正处于接收模式，沿用既有蓝牙角色转换 worker 异步重启 Sink，**会断开音乐连接，需要手机重新连接**；BLE 遥控不重启。若未在接收模式，下一次启动 Sink 时生效。
+
+蓝牙设置中的 **音频发射、音频接收两个入口保持不变**，不会在控件页提供 codec 切换。当前 AAC 实验固件还没有外部 SBC Source 编码器，因此该环境下「音频发射」明确显示为「暂不支持」；原 `fakepod_s31` SBC 环境中发射完全保留。
+
+播放器控件页已移除写死的 `蓝牙接收 · SBC · 44100 Hz`。现在从 `ESP_A2D_AUDIO_CFG_EVT` 捕获双方实际协商的 `mcc.type` 与采样率，更新为：
+- `蓝牙接收 · AAC · 44.1 kHz`
+- `蓝牙接收 · SBC · 48.0 kHz`
+- `蓝牙接收 · 编码协商中`（还没有合法 Audio Config）
+- `蓝牙接收 · 等待手机连接`（未连接）
+
+**重要：设置里的「自动·AAC优先」不是“已使用AAC”。以控件页显示及串口 `A2DP Sink codec=` 为准。** 断连时清除上次编码，防止保留过期的 SBC/AAC 标签。
+
+### 代码核验 / 测试建议
+
+1. AAC 环境编译后，在蓝牙设置找到第六行「接收编码」，点选「仅SBC」；手机重新连接，控件页应显示 SBC。
+2. 切换到「自动·AAC优先」，重新连接，控件页根据手机协商显示 AAC 或 SBC，不能总显示 SBC。
+3. 暂停/恢复不改变显示编码；断开蓝牙应显示等待连接；快速切歌不影响编码标签。
+4. 原 `fakepod_s31` 环境第五、第六行显示「音量同步」「接收编码: 固定SBC」，但其蓝牙发射仍正常。
+5. 尚未完成本机 ESP-IDF 6.1 全量编译和真机测试，以上为期望测试结果，非已验证事实。

@@ -2490,7 +2490,7 @@ static void audio_role_transition_task(void *)
     vTaskDelete(nullptr);
 }
 
-static bool start_audio_role_transition_task()
+static bool start_audio_role_transition_task(bool restart_current = false)
 {
 #if FAKEPOD_BLE_FOUNDATION_ENABLED
     portENTER_CRITICAL(&g_lock);
@@ -2499,7 +2499,7 @@ static bool start_audio_role_transition_task()
         portEXIT_CRITICAL(&g_lock);
         return false;
     }
-    if (g_audio_role_target == g_audio_role_active) {
+    if (g_audio_role_target == g_audio_role_active && !restart_current) {
         portEXIT_CRITICAL(&g_lock);
         return true;
     }
@@ -2642,6 +2642,21 @@ void ble_remote_service_set_mode(DeviceBluetoothMode mode)
     portEXIT_CRITICAL(&g_lock);
     if (mode == DeviceBluetoothMode::Off) gamepad_disconnect_if_enabled();
     ESP_LOGI(TAG, "BLE工作模式：%s", device_settings_bluetooth_mode_name(mode));
+}
+
+bool ble_remote_service_restart_audio_sink()
+{
+    portENTER_CRITICAL(&g_lock);
+    const bool allowed = g_ready && g_stack_initialized && g_desired_enabled &&
+        g_audio_role_active == DeviceBluetoothAudioRole::Receive &&
+        g_audio_role_target == DeviceBluetoothAudioRole::Receive &&
+        !g_transition_running && !g_audio_role_switching;
+    portEXIT_CRITICAL(&g_lock);
+    if (!allowed) return false;
+    // This uses the same safe worker as the Receive/Transmit switch. A2DP
+    // deinit/init is required because advertised SEPs cannot change in-place.
+    // BLE GATT and Bluedroid remain active. The phone must reconnect.
+    return start_audio_role_transition_task(true);
 }
 
 bool ble_remote_service_request_audio_role(DeviceBluetoothAudioRole role)

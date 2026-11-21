@@ -18,6 +18,13 @@ enum class DeviceBluetoothMode : uint8_t {
     Controller,
 };
 
+// A2DP Sink codec advertisement preference (not a guarantee of peer choice).
+// A2DP keeps SBC mandatory; an AAC-only mode cannot be advertised.
+enum class DeviceBluetoothSinkCodec : uint8_t {
+    AutoAac = 0, // AAC-LC preferred, mandatory SBC fallback.
+    SbcOnly = 1, // Disable AAC SEP; SBC-only compatibility.
+};
+
 // Classic A2DP role, independent of the BLE GATT phone remote switch.
 enum class DeviceBluetoothAudioRole : uint8_t {
     Transmit = 0, // FakePod music -> Bluetooth headphones/speaker
@@ -80,6 +87,7 @@ struct DeviceSettingsSnapshot {
     bool ble_enabled = true;
     DeviceBluetoothMode bluetooth_mode = DeviceBluetoothMode::PhoneRemote;
     DeviceBluetoothAudioRole bluetooth_audio_role = DeviceBluetoothAudioRole::Transmit;
+    DeviceBluetoothSinkCodec bluetooth_sink_codec = DeviceBluetoothSinkCodec::AutoAac;
     bool wifi_enabled = false;
     DeviceAudioOutputMode audio_output_mode = DeviceAudioOutputMode::NormalHeadphones;
     uint8_t brightness_level = 60U;          // CO5300 正常显示亮度 5~100%；0 保留给熄屏。
@@ -114,6 +122,8 @@ esp_err_t device_settings_set_usb_mode(DeviceUsbMode mode);
 esp_err_t device_settings_set_ble_enabled(bool enabled);
 esp_err_t device_settings_set_bluetooth_mode(DeviceBluetoothMode mode);
 esp_err_t device_settings_set_bluetooth_audio_role(DeviceBluetoothAudioRole role);
+esp_err_t device_settings_set_bluetooth_sink_codec(DeviceBluetoothSinkCodec codec);
+const char *device_settings_bluetooth_sink_codec_name(DeviceBluetoothSinkCodec codec);
 // 原子保存互斥无线意图：允许 BLE/Wi-Fi 都关闭，但不允许同时开启。
 esp_err_t device_settings_set_wireless_enabled(bool ble_enabled, bool wifi_enabled);
 esp_err_t device_settings_set_audio_output_mode(DeviceAudioOutputMode mode);

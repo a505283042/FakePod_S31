@@ -3,6 +3,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "device_settings.h"
 
 // Classic A2DP Sink: phone -> FakePod (internal SBC decode) -> PSRAM PCM ring.
 // Bluetooth callbacks NEVER access I2S, CS43131, LVGL or the SD card.
@@ -13,6 +14,9 @@ struct BtAudioSinkSnapshot {
     bool connected = false;
     bool streaming = false;
     uint32_t sample_rate_hz = 44100U;
+    // 0xFF = not yet negotiated, 0=SBC, 2=MPEG-2/4 AAC.
+    uint8_t negotiated_codec = 0xFFU;
+    DeviceBluetoothSinkCodec preferred_codec = DeviceBluetoothSinkCodec::AutoAac;
     uint32_t queued_frames = 0U;
     uint32_t dropped_frames = 0U;       // Actual ring overflow (unwanted)
     uint32_t underrun_frames = 0U;      // Missing PCM while output was active
@@ -38,4 +42,5 @@ size_t bt_audio_sink_read_pcm32_adjusted(int32_t *pcm, size_t max_frames);
 // AudioTask-only: after DAC initialization, retain at most max_frames of the
 // newest PCM, avoiding permanent 200ms+ startup latency.
 size_t bt_audio_sink_trim_latency(size_t max_frames);
+const char *bt_audio_sink_codec_name(uint8_t negotiated_codec);
 void bt_audio_sink_flush();

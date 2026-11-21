@@ -3808,9 +3808,17 @@ static void player_home_refresh_track(const AudioStateSnapshot *audio_snapshot)
             phone.artist[0] ? phone.artist :
             (stream.connected ? "等待手机歌曲信息" : "等待手机连接"));
         char detail[80] = {};
-        snprintf(detail, sizeof(detail),
-            "蓝牙接收 · SBC · %lu Hz",
-            static_cast<unsigned long>(stream.sample_rate_hz));
+        if (!stream.connected) {
+            snprintf(detail, sizeof(detail), "蓝牙接收 · 等待手机连接");
+        } else if (stream.negotiated_codec == 0xFFU) {
+            snprintf(detail, sizeof(detail), "蓝牙接收 · 编码协商中");
+        } else {
+            const uint32_t rate = stream.sample_rate_hz;
+            snprintf(detail, sizeof(detail), "蓝牙接收 · %s · %lu.%01lu kHz",
+                bt_audio_sink_codec_name(stream.negotiated_codec),
+                static_cast<unsigned long>(rate / 1000U),
+                static_cast<unsigned long>((rate % 1000U) / 100U));
+        }
         player_home_label_set_text_if_changed(g_track_info, detail);
         return;
     }

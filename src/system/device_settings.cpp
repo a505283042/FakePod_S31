@@ -78,6 +78,7 @@ static DeviceSettingsSnapshot make_defaults()
     defaults.ble_enabled = true;
     defaults.bluetooth_mode = DeviceBluetoothMode::PhoneRemote;
     defaults.bluetooth_audio_role = DeviceBluetoothAudioRole::Transmit;
+    defaults.bluetooth_sink_codec = DeviceBluetoothSinkCodec::AutoAac;
     defaults.wifi_enabled = false;
     defaults.audio_output_mode = DeviceAudioOutputMode::NormalHeadphones;
     defaults.brightness_level = 60U;
@@ -274,6 +275,9 @@ esp_err_t device_settings_init()
     }
     if (nvs_get_u8(handle, "btaudiorole", &u8) == ESP_OK && u8 <= 1U) {
         g_settings.bluetooth_audio_role = static_cast<DeviceBluetoothAudioRole>(u8);
+    }
+    if (nvs_get_u8(handle, "btaacpref", &u8) == ESP_OK && u8 <= 1U) {
+        g_settings.bluetooth_sink_codec = static_cast<DeviceBluetoothSinkCodec>(u8);
     }
     if (nvs_get_u8(handle, "wifi", &u8) == ESP_OK && u8 <= 1U) {
         g_settings.wifi_enabled = u8 != 0U;
@@ -507,6 +511,25 @@ esp_err_t device_settings_set_bluetooth_audio_role(DeviceBluetoothAudioRole role
     if (ret == ESP_OK) g_settings.bluetooth_audio_role = role;
     else log_commit_failure("btaudiorole", ret);
     return ret;
+}
+
+esp_err_t device_settings_set_bluetooth_sink_codec(DeviceBluetoothSinkCodec codec)
+{
+    if (static_cast<uint8_t>(codec) > 1U || !g_settings.ready)
+        return ESP_ERR_INVALID_ARG;
+    const esp_err_t ret = commit_u8("btaacpref", static_cast<uint8_t>(codec));
+    if (ret == ESP_OK) g_settings.bluetooth_sink_codec = codec;
+    else log_commit_failure("btaacpref", ret);
+    return ret;
+}
+
+const char *device_settings_bluetooth_sink_codec_name(DeviceBluetoothSinkCodec codec)
+{
+    switch (codec) {
+        case DeviceBluetoothSinkCodec::AutoAac: return "自动·AAC优先";
+        case DeviceBluetoothSinkCodec::SbcOnly: return "仅SBC";
+    }
+    return "未知";
 }
 
 esp_err_t device_settings_set_audio_output_mode(DeviceAudioOutputMode mode)
