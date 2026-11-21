@@ -19,6 +19,9 @@
 
 static const char *TAG = "播放器控制";
 static SemaphoreHandle_t g_transport_lock = nullptr;
+// Phone receiving mode has a single master-volume control. Mute is sent as
+// volume=0 instead of introducing an independent local DAC mute latch.
+static uint8_t g_phone_volume_before_mute = 50U;
 
 // 自然 EOF 只在 SystemLoop 观察边沿；真正的 Playlist/Transport 续播统一投递到
 // LVGL/Player 上下文。状态 0=空闲，1=等待投递，2=已进入 LVGL async 队列。
@@ -462,8 +465,14 @@ bool player_control_volume_down(uint8_t step)
 bool player_control_toggle_mute()
 {
     AudioStateSnapshot snapshot = {};
-    if (!audio_service_get_snapshot(&snapshot) || !snapshot.ready) {
-        return false;
+    if (!audio_service_get_snapshot(&snapshot) || !snapshot.ready) return false;
+    if (bt_audio_avrc_is_sink_mode()) {
+        if (snapshot.volume_percent > 0U) {
+            g_phone_volume_before_mute = snapshot.volume_percent;
+            return player_control_set_volume(0U);
+        }
+        return player_control_set_volume(g_phone_volume_before_mute != 0U
+            ? g_phone_volume_before_mute : 50U);
     }
     return audio_service_set_mute(!snapshot.user_muted, true);
 }
