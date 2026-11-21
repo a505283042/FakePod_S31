@@ -18,6 +18,7 @@
 #include "audio_service.h"
 #include "battery_service.h"
 #include "ble_remote_service.h"
+#include "bt_audio_source.h"
 #include "device_settings.h"
 #include "font/font_manager.h"
 #include "font/usb_service_font.h"
@@ -345,7 +346,7 @@ static void detail_apply_scroll_y(int32_t y)
 static uint16_t detail_row_count_for_page(SettingsPage page)
 {
     switch (page) {
-        case SettingsPage::Connection: return 6U;
+        case SettingsPage::Connection: return 7U;
         case SettingsPage::Applications: return 5U;
         case SettingsPage::MusicPlayer: return 5U;
         case SettingsPage::ElectronicFlow: return 1U;
@@ -1704,6 +1705,56 @@ static void bluetooth_switch_click_cb(lv_event_t *event)
 
     ESP_LOGI(TAG, "蓝牙模式切换：%s", device_settings_bluetooth_mode_name(next));
 }
+// 手机 BLE 遥控保持现有 GATT；此入口只控制独立的 Classic A2DP Source。
+static void format_bt_audio_value(char *out, size_t cap)
+{
+    if (out == nullptr || cap == 0U) return;
+    BtAudioSourceSnapshot s = {};
+    (void)bt_audio_source_get_snapshot(&s);
+    if (!s.available) snprintf(out, cap, "不支持");
+    else if (!s.initialized) snprintf(out, cap, "需先开启蓝牙");
+    else if (s.streaming) snprintf(out, cap, "播放中·%s", s.peer_name);
+    else if (s.connected) snprintf(out, cap, "已连接·%s", s.peer_name);
+    else if (s.connecting) snprintf(out, cap, "正在连接");
+    else if (s.scanning) snprintf(out, cap, "搜索耳机中");
+    else if (s.candidate_found) snprintf(out, cap, "连接·%s", s.peer_name);
+    else snprintf(out, cap, "点击搜索耳机");
+}
+
+static void bluetooth_audio_click_cb(lv_event_t *event)
+{
+    if (!click_is_valid(event) || g_page != SettingsPage::Connection) return;
+    BtAudioSourceSnapshot s = {};
+    (void)bt_audio_source_get_snapshot(&s);
+    if (!s.available) {
+        ui_common_show_notice("蓝牙音频不可用", "请检查Classic/A2DP编译配置");
+        return;
+    }
+    if (!s.initialized) {
+        ui_common_show_notice("蓝牙尚未启动", "请先开启手机蓝牙遥控模式");
+        return;
+    }
+    if (s.scanning || s.connecting) return;
+
+    esp_err_t ret = ESP_ERR_INVALID_STATE;
+    if (s.connected) {
+        ret = bt_audio_source_disconnect();
+    } else if (s.candidate_found) {
+        ret = bt_audio_source_connect_candidate();
+    } else {
+        ret = bt_audio_source_scan();
+    }
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "蓝牙音频操作失败：%s", esp_err_to_name(ret));
+        ui_common_show_notice("蓝牙音频操作失败", "请检查耳机是否进入配对模式");
+    }
+    if (g_detail_values[6] != nullptr) {
+        char value[72] = {};
+        format_bt_audio_value(value, sizeof(value));
+        lv_label_set_text(g_detail_values[6], value);
+    }
+}
+
 static void wifi_switch_click_cb(lv_event_t *event)
 {
     if (!click_is_valid(event) || g_page != SettingsPage::Connection) return;
@@ -1923,6 +1974,11 @@ static void create_connection_page(const DeviceSettingsSnapshot &settings)
     format_nas_catalog_value(nas_value, sizeof(nas_value));
     add_clickable_detail_row(4, "NAS曲库更新", nas_value, SettingsDetailIcon::NasSync, nas_catalog_sync_click_cb);
     add_clickable_detail_row(5, "NAS服务器配对", "手机配置", SettingsDetailIcon::NasPair, nas_pair_click_cb);
+
+    char a2dp_value[72] = {};
+    format_bt_audio_value(a2dp_value, sizeof(a2dp_value));
+    add_clickable_detail_row(6, "蓝牙音频发射", a2dp_value,
+                             SettingsDetailIcon::Bluetooth, bluetooth_audio_click_cb);
 }
 
 static PlayerFolderScope player_folder_scope_from_setting(DeviceMusicListScope scope)
@@ -2674,6 +2730,11 @@ static void refresh_timer_cb(lv_timer_t *timer)
                         ? ble_remote_service_state_name(ble.state)
                         : device_settings_bluetooth_mode_name(settings.bluetooth_mode));
             }
+        }
+        if (g_detail_values[6] != nullptr) {
+            char bt_value[72] = {};
+            format_bt_audio_value(bt_value, sizeof(bt_value));
+            lv_label_set_text(g_detail_values[6], bt_value);
         }
 
         if (g_detail_values[3] != nullptr) {
