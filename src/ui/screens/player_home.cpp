@@ -374,6 +374,7 @@ static uint8_t g_volume_drag_start_percent = 0U;
 static uint8_t g_volume_preview_percent = 0U;
 static uint32_t g_volume_drag_sequence = 0U;
 static uint32_t g_last_audio_state_revision = UINT32_MAX;
+static bool g_last_audio_phone_mode = false;
 // P1.5.3.2R.19：记录主页最后已经绑定的 Player Track。切歌后不再等待 100ms Artwork timer，
 // 而是在当前 LVGL 线程立即把预热好的 RGB565 Surface 绑定到主页；20ms watcher 同时覆盖自然 EOF。
 static uint32_t g_last_artwork_bound_track = UINT32_MAX;
@@ -4013,15 +4014,22 @@ static void player_home_audio_timer_cb(lv_timer_t *timer)
     if (!audio_service_get_snapshot(&snapshot)) {
         return;
     }
-    if (snapshot.state_revision == g_last_audio_state_revision) {
+    const bool phone_mode = bt_audio_avrc_is_sink_mode();
+    if (!phone_mode && !g_last_audio_phone_mode &&
+        snapshot.state_revision == g_last_audio_state_revision) {
         return;
     }
+    // The local AudioTask revision does not change when remote AVRCP metadata,
+    // position, or playback state changes. Read phone snapshots while active,
+    // then refresh once more when returning to local music.
+    g_last_audio_phone_mode = phone_mode;
     g_last_audio_state_revision = snapshot.state_revision;
     player_home_apply_audio_snapshot(snapshot);
 }
 
 static bool player_home_nas_wifi_enabled_for_new_playback()
 {
+    if (bt_audio_avrc_is_sink_mode()) return true;
     if (player_state_get_source() != PlayerMediaSource::Nas) return true;
 
     DeviceSettingsSnapshot settings = {};
@@ -4036,6 +4044,7 @@ static bool player_home_nas_wifi_enabled_for_new_playback()
 
 static bool player_home_play_action_needs_network()
 {
+    if (bt_audio_avrc_is_sink_mode()) return false;
     if (player_state_get_source() != PlayerMediaSource::Nas) return false;
 
     AudioStateSnapshot snapshot = {};
