@@ -500,6 +500,11 @@ esp_err_t bt_audio_source_host_start()
                 static_cast<unsigned>(kRingFrames * 4U));
         return ESP_ERR_NO_MEM;
     }
+#if FAKEPOD_A2DP_EXTERNAL_CODEC
+    ESP_LOGI(TAG, "A2DP_TX_BACKEND=EXTERNAL_SBC_AAC (built at compile time)");
+#else
+    ESP_LOGI(TAG, "A2DP_TX_BACKEND=IDF_INTERNAL_SBC (built at compile time)");
+#endif
     ESP_LOGI(TAG, "A2DP启动：internal_free=%u psram_free=%u",
              static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
              static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));

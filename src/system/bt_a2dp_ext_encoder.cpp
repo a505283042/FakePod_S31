@@ -20,7 +20,15 @@ namespace {
 static const char *TAG = "BT_TX_ENC";
 static constexpr uint32_t kTaskStack = 8192U;
 static constexpr UBaseType_t kTaskPriority = 6U;
-static constexpr BaseType_t kTaskCore = 1;
+// Controlled A/B experiment: leave production AAC/SBC on Core1 unless
+// -DFAKEPOD_BT_TX_ENC_CORE=0 is explicitly selected in platformio.ini.
+#ifndef FAKEPOD_BT_TX_ENC_CORE
+#define FAKEPOD_BT_TX_ENC_CORE 1
+#endif
+#if FAKEPOD_BT_TX_ENC_CORE != 0 && FAKEPOD_BT_TX_ENC_CORE != 1
+#error "FAKEPOD_BT_TX_ENC_CORE must be 0 or 1"
+#endif
+static constexpr BaseType_t kTaskCore = FAKEPOD_BT_TX_ENC_CORE;
 static constexpr uint32_t kMaxPcmBytes = 16384U;
 static constexpr uint32_t kMaxEncodedBytes = 8192U;
 
@@ -106,6 +114,8 @@ static void worker(void *)
     uint32_t sent = 0U, failed = 0U, underrun = 0U;
     uint32_t max_lateness_us = 0U, late_over_40ms = 0U, late_over_80ms = 0U;
     uint32_t max_encode_us = 0U, max_send_us = 0U;
+    uint32_t max_send_gap_us = 0U;
+    int64_t last_accepted_us = 0;
     const bool ready = open_codec(stream, &encoder, &in_bytes, &out_bytes,
                                   &frames_per_packet);
     if (!ready) {
@@ -136,8 +146,9 @@ static void worker(void *)
         const int64_t frame_us = std::max<int64_t>(1000,
             static_cast<int64_t>(pcm_frames) * 1000000LL / stream.sample_rate);
         int64_t next_us = esp_timer_get_time();
-        ESP_LOGI(TAG, "Encoder running codec=%s rate=%lu mtu=%u pcm=%lu packet_frames=%u",
+        ESP_LOGI(TAG, "Encoder running codec=%s core=%d priority=%u rate=%lu mtu=%u pcm=%lu packet_frames=%u",
             stream.codec.type == ESP_A2D_MCT_M24 ? "AAC" : "SBC",
+            static_cast<int>(kTaskCore), static_cast<unsigned>(kTaskPriority),
             static_cast<unsigned long>(stream.sample_rate),
             unsigned(stream.mtu), static_cast<unsigned long>(pcm_size),
             unsigned(frames_per_packet));
@@ -220,15 +231,27 @@ static void worker(void *)
             const uint32_t send_us = static_cast<uint32_t>(
                 esp_timer_get_time() - send_start_us);
             if (send_us > max_send_us) max_send_us = send_us;
-            if (accepted) ++sent;
-            else { ++failed; esp_a2d_audio_buff_free(packet); }
+            if (accepted) {
+                ++sent;
+                const int64_t accepted_us = esp_timer_get_time();
+                if (last_accepted_us != 0 && accepted_us > last_accepted_us) {
+                    const uint32_t send_gap_us = static_cast<uint32_t>(
+                        std::min<int64_t>(accepted_us - last_accepted_us, UINT32_MAX));
+                    if (send_gap_us > max_send_gap_us) max_send_gap_us = send_gap_us;
+                }
+                last_accepted_us = accepted_us;
+            } else {
+                ++failed;
+                esp_a2d_audio_buff_free(packet);
+            }
             timestamp += pcm_frames;
             if (((sent + failed) % 500U) == 0U && (sent + failed) > 0U) {
                 ESP_LOGI(TAG,
-                    "A2DP_TX_EXT sent=%lu failed=%lu short_pcm=%lu late_max=%luus late40=%lu late80=%lu encode_max=%luus send_max=%luus",
+                    "A2DP_TX_EXT sent=%lu failed=%lu short_pcm=%lu send_gap_max=%luus late_max=%luus late40=%lu late80=%lu encode_max=%luus send_max=%luus",
                     static_cast<unsigned long>(sent),
                     static_cast<unsigned long>(failed),
                     static_cast<unsigned long>(underrun),
+                    static_cast<unsigned long>(max_send_gap_us),
                     static_cast<unsigned long>(max_lateness_us),
                     static_cast<unsigned long>(late_over_40ms),
                     static_cast<unsigned long>(late_over_80ms),
@@ -239,6 +262,7 @@ static void worker(void *)
                 late_over_80ms = 0U;
                 max_encode_us = 0U;
                 max_send_us = 0U;
+                max_send_gap_us = 0U;
             }
         }
     }
