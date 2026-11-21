@@ -6,6 +6,8 @@
 
 #include "audio/audio_service.h"
 #include "audio/audio_types.h"
+#include "system/bt_audio_sink.h"
+#include "system/bt_audio_avrc.h"
 #include "esp_log.h"
 #include "app_diag_config.h"
 #include "font/font_manager.h"
@@ -168,6 +170,7 @@ bool g_idle_collapsed = true;
 uint32_t g_frame = 0U;
 uint32_t g_last_pcm_revision = 0U;
 uint32_t g_last_track = UINT32_MAX;
+uint32_t g_last_phone_metadata_revision = UINT32_MAX;
 uint32_t g_lyrics_requested_track = UINT32_MAX;
 bool g_lyrics_requested_is_nas = false;
 uint32_t g_last_lyrics_document_revision = 0U;
@@ -226,9 +229,25 @@ static lv_obj_t *spectrum_create_label(
 
 static void spectrum_refresh_header(uint32_t track_index)
 {
-    if (g_title == nullptr || g_artist == nullptr || track_index == g_last_track) {
+    if (g_title == nullptr || g_artist == nullptr) return;
+    if (bt_audio_avrc_is_sink_mode()) {
+        BtAudioAvrcSnapshot remote = {};
+        (void)bt_audio_avrc_get_snapshot(&remote);
+        if (g_last_phone_metadata_revision != remote.metadata_revision) {
+            lv_label_set_text(g_title,
+                remote.title[0] ? remote.title : "手机蓝牙音频");
+            lv_label_set_text(g_artist,
+                remote.artist[0] ? remote.artist : "等待歌曲信息");
+            g_last_phone_metadata_revision = remote.metadata_revision;
+            g_last_track = UINT32_MAX;
+        }
         return;
     }
+    if (g_last_phone_metadata_revision != UINT32_MAX) {
+        g_last_phone_metadata_revision = UINT32_MAX;
+        g_last_track = UINT32_MAX;
+    }
+    if (track_index == g_last_track) return;
 
     const char *title = "未选择歌曲";
     const char *artist = "";
@@ -250,6 +269,7 @@ static void spectrum_refresh_header(uint32_t track_index)
 
 static uint32_t spectrum_current_track(const AudioStateSnapshot &audio)
 {
+    if (bt_audio_avrc_is_sink_mode()) return UINT32_MAX;
     if (audio.track_index != UINT32_MAX) {
         return audio.track_index;
     }
@@ -460,6 +480,13 @@ static bool spectrum_snapshot_matches(
     const AudioSpectrumSnapshot &spectrum,
     const AudioStateSnapshot &audio)
 {
+    if (bt_audio_avrc_is_sink_mode()) {
+        BtAudioSinkSnapshot bt = {};
+        (void)bt_audio_sink_get_snapshot(&bt);
+        return spectrum.valid && bt.streaming &&
+            spectrum.track_index == UINT32_MAX &&
+            spectrum.sample_rate_hz == bt.sample_rate_hz;
+    }
     return
         spectrum.valid &&
         spectrum.playback_revision == audio.playback_revision &&
@@ -1220,7 +1247,10 @@ static void spectrum_timer_cb(lv_timer_t *timer)
         spectrum_update_current_lyric(audio, track_index);
     }
 
-    const bool playing = audio.state == AudioPlaybackState::Playing;
+    BtAudioSinkSnapshot phone_audio = {};
+    (void)bt_audio_sink_get_snapshot(&phone_audio);
+    const bool playing = bt_audio_avrc_is_sink_mode()
+        ? phone_audio.streaming : audio.state == AudioPlaybackState::Playing;
     // Hi-Res Guard 时页面仍保留歌名/歌词/时间，但不读取或绘制FFT数据。
     // 其他格式继续沿用原有防烧屏规则。
     g_idle_collapsed = g_hi_res_guard_active || !playing;
@@ -1355,6 +1385,7 @@ void spectrum_view_open()
 
     g_visible = true;
     g_last_track = UINT32_MAX;
+    g_last_phone_metadata_revision = UINT32_MAX;
     g_frame = 0U;
     g_last_pcm_revision = 0U;
     g_last_displayed_second = UINT64_MAX;
@@ -1379,7 +1410,11 @@ void spectrum_view_open()
         const uint32_t track_index = spectrum_current_track(audio);
         spectrum_refresh_header(track_index);
         spectrum_update_current_lyric(audio, track_index);
-        if (audio.state == AudioPlaybackState::Playing && !g_hi_res_guard_active) {
+        BtAudioSinkSnapshot phone_audio = {};
+        (void)bt_audio_sink_get_snapshot(&phone_audio);
+        const bool playing_now = bt_audio_avrc_is_sink_mode()
+            ? phone_audio.streaming : audio.state == AudioPlaybackState::Playing;
+        if (playing_now && !g_hi_res_guard_active) {
             AudioSpectrumSnapshot spectrum = {};
             if (
                 audio_service_get_spectrum_snapshot(&spectrum) &&
