@@ -12,6 +12,7 @@
 #include "freertos/semphr.h"
 #include "lvgl.h"
 #include "audio_service.h"
+#include "bt_audio_avrc.h"
 #include "device_settings.h"
 #include "player_state.h"
 #include "ui/screens/library_view.h"
@@ -282,6 +283,10 @@ bool player_control_play_current()
 
 bool player_control_toggle_play_pause()
 {
+    // Phone A2DP Sink owns the transport: route existing physical keys,
+    // screen buttons and BLE Remote App to one AVRCP controller.
+    if (bt_audio_avrc_is_sink_mode())
+        return bt_audio_avrc_queue_control(BtAvrcMediaCommand::TogglePause);
     if (!player_control_lock(pdMS_TO_TICKS(100))) {
         return false;
     }
@@ -323,6 +328,8 @@ bool player_control_toggle_play_pause()
 
 bool player_control_previous()
 {
+    if (bt_audio_avrc_is_sink_mode())
+        return bt_audio_avrc_queue_control(BtAvrcMediaCommand::Previous);
     if (!player_control_lock(pdMS_TO_TICKS(100))) {
         return false;
     }
@@ -334,6 +341,8 @@ bool player_control_previous()
 
 bool player_control_next()
 {
+    if (bt_audio_avrc_is_sink_mode())
+        return bt_audio_avrc_queue_control(BtAvrcMediaCommand::Next);
     if (!player_control_lock(pdMS_TO_TICKS(100))) {
         return false;
     }
@@ -420,7 +429,12 @@ bool player_control_set_volume(uint8_t percent)
     if (percent > 100U) {
         percent = 100U;
     }
-    return audio_service_set_volume(percent, true);
+    if (!audio_service_set_volume(percent, true)) return false;
+    // The DAC is the ONLY renderer attenuation in receiving mode.
+    // Report its new single master volume back to Android via AVRCP TG.
+    if (bt_audio_avrc_is_sink_mode())
+        bt_audio_avrc_local_volume_changed(percent);
+    return true;
 }
 
 bool player_control_volume_up(uint8_t step)
