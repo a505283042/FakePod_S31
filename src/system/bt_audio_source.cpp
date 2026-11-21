@@ -638,12 +638,13 @@ void bt_audio_source_update()
     if (need_worker && !bt_a2dp_ext_encoder_is_running()) {
         const esp_err_t err = bt_a2dp_ext_encoder_start(
             conn, mtu, &codec, codec_rate, a2dp_pcm_callback);
-        if (err != ESP_OK) {
+        // If codec initialization fails inside the new worker, it can exit
+        // immediately after task creation. Always rate-limit relaunches.
+        portENTER_CRITICAL(&s_lock);
+        s_encoder_retry_due = now + pdMS_TO_TICKS(err == ESP_OK ? 250 : 1500);
+        portEXIT_CRITICAL(&s_lock);
+        if (err != ESP_OK)
             ESP_LOGW(TAG, "A2DP Source编码器启动失败：%s", esp_err_to_name(err));
-            portENTER_CRITICAL(&s_lock);
-            s_encoder_retry_due = now + pdMS_TO_TICKS(1500);
-            portEXIT_CRITICAL(&s_lock);
-        }
     }
 #endif
     if (log_stats) {
