@@ -59,8 +59,9 @@ static void copy_string(char *out, size_t cap, const uint8_t *src, int len)
     size_t n = static_cast<size_t>(len) < cap - 1U
         ? static_cast<size_t>(len) : cap - 1U;
     // Do not leave a partial UTF-8 codepoint in the UI string.
-    while (n > 0U && (src[n] & 0xC0U) == 0x80U &&
-           n < static_cast<size_t>(len)) --n;
+    if (n < static_cast<size_t>(len)) {
+        while (n > 0U && (src[n] & 0xC0U) == 0x80U) --n;
+    }
     memcpy(out, src, n);
     out[n] = '\0';
 }
