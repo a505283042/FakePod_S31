@@ -242,12 +242,22 @@ static void a2dp_event(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         s_streaming = false;
         s_media_ctrl_pending = false;
         s_retry_due = xTaskGetTickCount() + kMediaRetryTicks;
-        s_negotiated_codec = 0xFFU;
+        // ESP-IDF may deliver AUDIO_CFG before CONNECTION_STATE_CONNECTED.
+        // Never erase the negotiated codec at CONNECTED: external encoder
+        // startup must retain the earlier AUDIO_CFG_EVT's s_mcc_ready=true.
+        if (state == ESP_A2D_CONNECTION_STATE_CONNECTING ||
+            state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
+            s_negotiated_codec = 0xFFU;
+#if FAKEPOD_A2DP_EXTERNAL_CODEC
+            s_negotiated_mcc = {};
+            s_mcc_ready = false;
+#endif
+        }
         discovery_revision_bump_locked();
 #if FAKEPOD_A2DP_EXTERNAL_CODEC
-        s_mcc_ready = false;
         s_conn_hdl = s_connected ? param->conn_stat.conn_hdl : 0U;
         s_audio_mtu = s_connected ? param->conn_stat.audio_mtu : 0U;
+        const bool codec_ready_on_event = s_mcc_ready;
 #endif
         if (s_connected) {
             memcpy(s_peer_bda, param->conn_stat.remote_bda, sizeof(s_peer_bda));
@@ -266,7 +276,15 @@ static void a2dp_event(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         if (state != ESP_A2D_CONNECTION_STATE_CONNECTED)
             bt_a2dp_ext_encoder_request_stop();
 #endif
+#if FAKEPOD_A2DP_EXTERNAL_CODEC
+        ESP_LOGI(TAG, "A2DP connection state=%d conn=%u mtu=%u codec_ready=%u",
+            static_cast<int>(state),
+            static_cast<unsigned>(param->conn_stat.conn_hdl),
+            static_cast<unsigned>(param->conn_stat.audio_mtu),
+            static_cast<unsigned>(codec_ready_on_event));
+#else
         ESP_LOGI(TAG, "A2DP connection state=%d", static_cast<int>(state));
+#endif
         break;
     }
     case ESP_A2D_AUDIO_CFG_EVT: {
@@ -805,8 +823,14 @@ void bt_audio_source_update()
         portENTER_CRITICAL(&s_lock);
         s_encoder_retry_due = now + pdMS_TO_TICKS(err == ESP_OK ? 250 : 1500);
         portEXIT_CRITICAL(&s_lock);
-        if (err != ESP_OK)
+        if (err != ESP_OK) {
             ESP_LOGW(TAG, "A2DP Source编码器启动失败：%s", esp_err_to_name(err));
+        } else {
+            ESP_LOGI(TAG, "A2DP_TX encoder task created conn=%u mtu=%u codec=%s rate=%lu",
+                static_cast<unsigned>(conn), static_cast<unsigned>(mtu),
+                codec.type == ESP_A2D_MCT_M24 ? "AAC" : "SBC",
+                static_cast<unsigned long>(codec_rate));
+        }
     }
 #endif
     if (log_stats) {
