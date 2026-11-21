@@ -27,7 +27,17 @@
 // This experimental branch requires A2DP. A stale sdkconfig must fail the build
 // instead of flashing a firmware that silently displays 'not supported'.
 #if !FAKEPOD_A2DP_SUPPORTED
-#error "FakePod S31 A2DP source is disabled in generated sdkconfig. Check CONFIG_BT_CLASSIC_ENABLED=y, CONFIG_BT_A2DP_ENABLE=y, and CONFIG_BT_A2DP_USE_EXTERNAL_CODEC=n; rebuild with sdkconfig.fakepod_s31_a2dp."
+#error "FakePod S31 A2DP source is disabled: check BT_CLASSIC_ENABLED, BT_A2DP_ENABLE and internal SBC codec."
+#endif
+
+// ESP-IDF S31 has two independent options: Host Classic Bluetooth and controller
+// BR/EDR + BLE dual mode. A2DP Host on a BLE-only controller can hang at
+// esp_bluedroid_enable() while waiting indefinitely for the controller HCI reply.
+#if !defined(CONFIG_BTDM_CTRL_MODE_BTDM) || !CONFIG_BTDM_CTRL_MODE_BTDM
+#error "FakePod S31 requires CONFIG_BTDM_CTRL_MODE_BTDM=y (NOT BLE_ONLY). Regenerate sdkconfig.fakepod_s31_bt_dualmode."
+#endif
+#if !defined(CONFIG_BT_CTRL_BREDR_ENABLE) || !CONFIG_BT_CTRL_BREDR_ENABLE
+#error "FakePod S31 controller BR/EDR disabled: check CONFIG_BTDM_CTRL_MODE_BTDM=y."
 #endif
 
 #if FAKEPOD_A2DP_SUPPORTED
