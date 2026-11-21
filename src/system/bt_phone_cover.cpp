@@ -79,6 +79,35 @@ uint32_t bt_phone_cover_track_epoch()
     return epoch;
 }
 
+bool bt_phone_cover_mark_unavailable(uint32_t epoch)
+{
+    if (epoch == 0U || !lock()) return false;
+    const bool changed = epoch == s_epoch && !s_receiving &&
+        !s_ready.ready && !s_ready.unavailable;
+    if (changed) {
+        s_ready.unavailable = true;
+        ESP_LOGI(TAG, "Phone cover unavailable after requests epoch=%lu",
+            static_cast<unsigned long>(epoch));
+    }
+    unlock();
+    return changed;
+}
+
+bool bt_phone_cover_render_failed(uint32_t image_revision)
+{
+    if (image_revision == 0U || !lock()) return false;
+    const bool changed = s_ready.ready &&
+        s_ready.image_revision == image_revision;
+    if (changed) {
+        s_ready = {};
+        s_ready.unavailable = true;
+        ESP_LOGW(TAG, "Phone cover Surface decode failed revision=%lu",
+            static_cast<unsigned long>(image_revision));
+    }
+    unlock();
+    return changed;
+}
+
 bool bt_phone_cover_begin(BtPhoneCoverSource source, uint32_t epoch, size_t expected_bytes)
 {
     if (source == BtPhoneCoverSource::None || epoch == 0U || s_buffer == nullptr ||

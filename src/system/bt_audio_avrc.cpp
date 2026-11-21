@@ -59,6 +59,9 @@ static bool s_cover_fetch_pending = false;
 static bool s_cover_tried_connect = false;
 static bool s_cover_fetching = false;
 static bool s_cover_peer_supported = false;
+static bool s_cover_features_known = false;
+static bool s_cover_terminal_failure = false;
+static TickType_t s_cover_epoch_started = 0U;
 static bool s_cover_handle_requested = false; // Same image handle must not be fetched every 15s.
 static uint32_t s_cover_epoch = 0U;
 
@@ -77,6 +80,11 @@ static TickType_t s_cover_last_data = 0U;
 static constexpr TickType_t kCoverNoProgressTimeout = pdMS_TO_TICKS(10000);
 static constexpr TickType_t kCoverTotalTimeout = pdMS_TO_TICKS(45000);
 static constexpr TickType_t kCoverRetryDelay = pdMS_TO_TICKS(1200);
+// Some players omit the Cover Art image-handle metadata entirely. Do not
+// leave the old cover on screen indefinitely; allow initial OBEX/metadata
+// setup to finish before declaring the current song artwork unavailable.
+static constexpr TickType_t kCoverHandleWaitTimeout = pdMS_TO_TICKS(15000);
+static constexpr TickType_t kCoverConnectExhaustedTimeout = pdMS_TO_TICKS(20000);
 
 // Called ONLY under s_lock. Never call Bluetooth APIs or FreeRTOS mutexes here.
 static void cover_complete_download_locked(bool success, TickType_t now)
@@ -96,6 +104,9 @@ static void cover_complete_download_locked(bool success, TickType_t now)
     } else {
         s_cover_handle_requested = true;
         s_cover_fetch_pending = false;
+        // Do not mark unavailable on a successful transfer: Surface conversion
+        // still runs asynchronously on the CoverTask.
+        s_cover_terminal_failure = !success;
     }
 }
 #endif
@@ -183,6 +194,9 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
         s_cover_tried_connect = false;
         s_cover_fetching = false;
         s_cover_peer_supported = false;
+        s_cover_features_known = false;
+        s_cover_terminal_failure = false;
+        s_cover_epoch_started = connected ? xTaskGetTickCount() : 0U;
         s_cover_handle_requested = false;
         s_cover_epoch = cover_epoch;
         s_cover_discard_active = false;
@@ -208,6 +222,7 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
         portENTER_CRITICAL(&s_lock);
         if (s_active && s_connected) {
             s_cover_peer_supported = supports_cover;
+            s_cover_features_known = true;
             // Follow ESP-IDF release/v6.1 example: SDP feature -> OBEX connect.
             // Never wait for a 0x80 image handle before opening OBEX.
             if (supports_cover && !s_cover_link && !s_cover_tried_connect)
@@ -257,6 +272,7 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
                     s_cover_handle_requested = false;
                     s_cover_epoch = cover_epoch;
                     s_cover_thumbnail_retries = 0U;
+                    s_cover_terminal_failure = false;
                     s_cover_due = 0U;
                     // Do not overlap a new BIP operation with a previous song.
                     // Drain its remaining callbacks, then request the new handle.
@@ -330,6 +346,8 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
                 if (s_cover_fetching) s_cover_discard_active = true;
                 s_cover_handle_requested = false;
                 s_cover_thumbnail_retries = 0U;
+                s_cover_terminal_failure = false;
+                s_cover_epoch_started = xTaskGetTickCount();
                 s_cover_epoch = cover_epoch;
 #endif
                 s_last_cover_submitted = 0U;
@@ -531,6 +549,9 @@ static void reset_state()
     s_cover_tried_connect = false;
     s_cover_fetching = false;
     s_cover_peer_supported = false;
+    s_cover_features_known = false;
+    s_cover_terminal_failure = false;
+    s_cover_epoch_started = 0U;
     s_cover_handle_requested = false;
     s_cover_epoch = 0U;
     s_cover_discard_active = false;
@@ -681,7 +702,8 @@ void bt_audio_avrc_update()
     uint8_t cmd=0U;
 #if defined(CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED) && CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED
     bool connect_cover = false, fetch_cover = false, request_cover_metadata = false;
-    bool disconnect_cover = false;
+    bool disconnect_cover = false, mark_cover_unavailable = false;
+    uint32_t unavailable_epoch = 0U;
     uint8_t cover_handle[ESP_AVRC_CA_IMAGE_HANDLE_LEN] = {};
     uint32_t cover_epoch = 0U;
 #endif
@@ -781,6 +803,22 @@ void bt_audio_avrc_update()
         cover_epoch = s_cover_epoch;
     }
     request_cover_metadata = s_cover_peer_supported && s_cover_link;
+    if (connected && ct_ready && s_cover_epoch != 0U) {
+        const bool no_cover_support = s_cover_features_known && !s_cover_peer_supported;
+        const bool no_handle = !s_cover_handle_ready && s_cover_epoch_started != 0U &&
+            (now - s_cover_epoch_started >= kCoverHandleWaitTimeout);
+        const bool connect_exhausted = s_cover_peer_supported && !s_cover_link &&
+            !s_cover_connect_pending && s_cover_connect_attempts >= 3U &&
+            s_cover_epoch_started != 0U &&
+            (now - s_cover_epoch_started >= kCoverConnectExhaustedTimeout);
+        // A failed thumbnail is retried twice before the terminal result.
+        // Never fallback while a transfer is still active or a retry is due.
+        if (!s_cover_fetching && !s_cover_fetch_pending &&
+            (no_cover_support || no_handle || connect_exhausted || s_cover_terminal_failure)) {
+            unavailable_epoch = s_cover_epoch;
+            mark_cover_unavailable = true;
+        }
+    }
 #endif
     if (connected && ct_ready && (s_poll_due == 0U ||
         static_cast<int32_t>(now - s_poll_due) >= 0)) {
@@ -791,6 +829,10 @@ void bt_audio_avrc_update()
     if (!active) return;
 
 #if defined(CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED) && CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED
+    // Publish terminal status outside the AVRCP spinlock; bt_phone_cover
+    // serializes its epoch with a FreeRTOS mutex.
+    if (mark_cover_unavailable)
+        (void)bt_phone_cover_mark_unavailable(unavailable_epoch);
     if (disconnect_cover) {
         ESP_LOGW(TAG, "AVRCP_COVER BIP timed out; resetting OBEX for fallback/recovery");
         (void)esp_avrc_ct_cover_art_disconnect();
@@ -824,6 +866,11 @@ void bt_audio_avrc_update()
             portEXIT_CRITICAL(&s_lock);
         }
     }
+#else
+    // The build does not support native phone cover transfer; no image can
+    // arrive for this AVRCP session.
+    if (connected && ct_ready)
+        (void)bt_phone_cover_mark_unavailable(bt_phone_cover_track_epoch());
 #endif
     // CoverSurface service normally starts from the TF catalog path. Phone playback
     // must also work when no SD card is inserted.

@@ -8,6 +8,10 @@
 enum class BtPhoneCoverSource : uint8_t { None = 0, Avrcp = 2 };
 struct BtPhoneCoverSnapshot {
     bool ready = false;
+    // Pending on track change/download; terminal only when the peer has no
+    // artwork, all requests fail, or the decoded Surface cannot be built.
+    // This prevents the UI treating a transient !ready as "show default".
+    bool unavailable = false;
     uint32_t track_epoch = 0;
     uint32_t image_revision = 0;
     size_t image_size = 0;
@@ -24,6 +28,12 @@ bool bt_phone_cover_init();
 void bt_phone_cover_release_staging();
 void bt_phone_cover_track_changed();
 uint32_t bt_phone_cover_track_epoch();
+// Called outside AVRCP spinlocks. No-op for an obsolete epoch or an image
+// that is already ready / still receiving.
+bool bt_phone_cover_mark_unavailable(uint32_t epoch);
+// Surface conversion failed for the exact published image. This is a terminal
+// failure even though the compressed JPEG/PNG had been downloaded successfully.
+bool bt_phone_cover_render_failed(uint32_t image_revision);
 bool bt_phone_cover_begin(BtPhoneCoverSource source, uint32_t epoch, size_t expected_bytes);
 bool bt_phone_cover_append(BtPhoneCoverSource source, const uint8_t *data, size_t size, bool final);
 bool bt_phone_cover_get_snapshot(BtPhoneCoverSnapshot *out);

@@ -15,6 +15,7 @@
 #include "board_pins.h"
 #include "cover_surface_cache.h"
 #include "system/bt_audio_avrc.h"
+#include "system/bt_audio_sink.h"
 #include "system/bt_phone_cover.h"
 #include "display.h"
 #include "display_bounded_spi.h"
@@ -618,30 +619,62 @@ static void artwork_ui_sync_context(bool force)
     if (g_container == nullptr) return;
     if (bt_audio_avrc_is_sink_mode()) {
         BtPhoneCoverSnapshot phone = {};
+        BtAudioAvrcSnapshot avrc = {};
+        BtAudioSinkSnapshot sink = {};
         (void)bt_phone_cover_get_snapshot(&phone);
-        const uint32_t revision = phone.ready ? phone.image_revision : 0U;
+        (void)bt_audio_avrc_get_snapshot(&avrc);
+        (void)bt_audio_sink_get_snapshot(&sink);
+        // AVRCP may reconnect briefly while A2DP audio stays connected.
+        // Do not flash the fallback image merely because metadata transport
+        // went down for one callback. Clear only after the audio session ends.
+        const bool session_connected = avrc.connected || sink.connected;
+        const bool previous_phone_context = g_context_phone;
+        const bool terminal_no_cover = !session_connected || phone.unavailable;
+        const uint32_t revision =
+            session_connected && phone.ready ? phone.image_revision : 0U;
+        const bool artwork_expected = !terminal_no_cover;
         if (!force && g_context_phone &&
             g_context_generation == kPhoneCoverGeneration &&
-            g_context_track == revision) return;
+            g_context_track == revision &&
+            g_context_has_artwork == artwork_expected) return;
+
         g_context_phone = true;
         g_context_generation = kPhoneCoverGeneration;
         g_context_track = revision;
-        g_context_has_artwork = phone.ready;
+        // !ready by itself is not NoArtwork: a new image may still be in
+        // OBEX download / JPEG conversion. Preserve the preceding phone lease.
+        g_context_has_artwork = artwork_expected;
         g_last_loader_state_revision = UINT32_MAX;
         g_last_surface_state_revision = UINT32_MAX;
-        if (!phone.ready) {
+
+        if (terminal_no_cover) {
             artwork_ui_release_transition_hold();
             artwork_ui_release_all_sources();
             artwork_ui_show_no_artwork_fallback();
-        } else if (!artwork_ui_apply_surface(revision)) {
-            // Keep visual hold only while the current phone image is preparing;
-            // old TF/NAS image must never masquerade as new phone artwork.
-            artwork_ui_release_all_sources();
-            artwork_ui_show_no_artwork_fallback();
+        } else if (revision != 0U && artwork_ui_source_matches_context()) {
+            // Already displaying this completed phone Surface.
+        } else if (revision != 0U && artwork_ui_apply_surface(revision)) {
+            // New Surface is ready: source replacement is atomic.
+        } else {
+            // Old PHONE Surface stays pinned until the new one is ready.
+            // Do not retain a TF/NAS lease when switching to phone input.
+            if (!previous_phone_context ||
+                (g_has_surface_source &&
+                 g_surface_lease.catalog_generation != kPhoneCoverGeneration) ||
+                g_has_compressed_source) {
+                artwork_ui_release_transition_hold();
+                artwork_ui_release_all_sources();
+            }
+            artwork_ui_show_waiting_without_placeholder();
         }
         return;
     }
     if (!player_state_is_ready()) return;
+    if (g_context_phone) {
+        // Switching back to TF/NAS must not keep a phone image as a local track.
+        artwork_ui_release_all_sources();
+        artwork_ui_set_no_artwork_fallback_visible(false);
+    }
     g_context_phone = false;
     const uint32_t track_index = static_cast<uint32_t>(player_state_get_index());
     const bool is_nas = artwork_source_is_nas();
@@ -830,8 +863,22 @@ void now_playing_artwork_update()
     if (!g_context_has_artwork) return;
 
     if (g_context_phone) {
-        if (!artwork_ui_source_matches_context()) {
-            (void)artwork_ui_apply_surface(g_context_track);
+        // 0 is the temporary pending revision, not an actual image.
+        if (g_context_track == 0U) return;
+        if (!artwork_ui_source_matches_context() &&
+            !artwork_ui_apply_surface(g_context_track)) {
+            CoverSurfaceSnapshot snapshot = {};
+            if (cover_surface_cache_get_snapshot(&snapshot) &&
+                snapshot.catalog_generation == kPhoneCoverGeneration &&
+                snapshot.track_index == g_context_track &&
+                snapshot.state == CoverSurfaceState::Failed) {
+                // A downloaded image failed RGB565 conversion. Display the
+                // default only on this explicit terminal failure.
+                if (bt_phone_cover_render_failed(g_context_track)) {
+                    artwork_ui_release_all_sources();
+                    artwork_ui_show_no_artwork_fallback();
+                }
+            }
         }
         return; // no TF/NAS ArtworkLoader lookup in phone mode
     }
