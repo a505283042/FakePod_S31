@@ -436,6 +436,7 @@ void bt_audio_avrc_host_stop()
     portENTER_CRITICAL(&s_lock);
     reset_state();
     portEXIT_CRITICAL(&s_lock);
+    bt_phone_cover_release_staging();
 }
 
 bool bt_audio_avrc_is_sink_mode()

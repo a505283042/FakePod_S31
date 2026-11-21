@@ -18,6 +18,8 @@ static constexpr size_t BT_PHONE_COVER_MAX_BYTES = 192U * 1024U;
 
 // Call from ordinary startup, not from a Bluetooth stack callback.
 bool bt_phone_cover_init();
+// Release compressed staging allocation on A2DP Sink -> Source role switch.
+void bt_phone_cover_release_staging();
 void bt_phone_cover_track_changed();
 uint32_t bt_phone_cover_track_epoch();
 bool bt_phone_cover_begin(BtPhoneCoverSource source, uint32_t epoch, size_t expected_bytes);

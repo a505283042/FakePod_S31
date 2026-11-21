@@ -18,7 +18,7 @@ size_t s_received = 0U;
 size_t s_expected = 0U;
 BtPhoneCoverSource s_incoming = BtPhoneCoverSource::None;
 
-bool lock() { return s_mutex != nullptr && xSemaphoreTake(s_mutex, 0) == pdTRUE; }
+bool lock() { return s_mutex != nullptr && xSemaphoreTake(s_mutex, pdMS_TO_TICKS(10)) == pdTRUE; }
 void unlock() { xSemaphoreGive(s_mutex); }
 bool valid_jpeg(const uint8_t *p, size_t n) {
     return n >= 4U && p[0] == 0xFFU && p[1] == 0xD8U &&
@@ -47,6 +47,18 @@ bool bt_phone_cover_init()
     return true;
 }
 
+void bt_phone_cover_release_staging()
+{
+    if (!lock()) return;
+    heap_caps_free(s_buffer);
+    s_buffer = nullptr;
+    s_ready = {};
+    s_receiving = false;
+    s_received = s_expected = 0U;
+    s_incoming = BtPhoneCoverSource::None;
+    unlock();
+}
+
 void bt_phone_cover_track_changed()
 {
     if (!lock()) return;
@@ -73,7 +85,8 @@ bool bt_phone_cover_begin(BtPhoneCoverSource source, uint32_t epoch, size_t expe
         expected_bytes > BT_PHONE_COVER_MAX_BYTES || !lock()) return false;
     const bool allow = epoch == s_epoch &&
         (source == BtPhoneCoverSource::Avrcp ||
-         (!s_ready.ready || s_ready.source != BtPhoneCoverSource::Avrcp));
+         ((!s_receiving || s_incoming != BtPhoneCoverSource::Avrcp) &&
+          (!s_ready.ready || s_ready.source != BtPhoneCoverSource::Avrcp)));
     if (allow) {
         s_receiving = true;
         s_received = 0U;
