@@ -440,6 +440,9 @@ static void spectrum_set_idle_targets()
 
 static bool spectrum_hi_res_guard_required(const AudioStateSnapshot &audio)
 {
+    // Phone SBC is always 16/32/44.1/48k; stale background NAS/FLAC
+    // snapshots must not disable the real-time phone PCM spectrum.
+    if (bt_audio_avrc_is_sink_mode()) return false;
     return audio.source == AudioPlaybackSource::NasHttp &&
         audio.format == MediaFormat::FLAC &&
         audio.sample_rate_hz >= SPECTRUM_HI_RES_GUARD_HZ;
