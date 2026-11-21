@@ -6546,6 +6546,12 @@ static void audio_task_handle_bluetooth_sink_enable(AudioRequest *request)
             ESP_LOGW(TAG, "蓝牙接收I2S停止返回：%s", esp_err_to_name(ret));
         }
     }
+    if (enable && g_task_user_muted) {
+        // A previous local music mute must not silently suppress incoming
+        // phone PCM while AVRCP reports a nonzero single master volume.
+        g_task_user_muted = false;
+        audio_task_publish_snapshot();
+    }
     g_bt_sink_output_enabled = enable;
     g_bt_sink_retry_due = 0;
     bt_audio_sink_flush();
