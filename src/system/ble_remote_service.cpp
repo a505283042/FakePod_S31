@@ -2467,7 +2467,15 @@ static void audio_role_transition_task(void *)
             ret = bt_audio_sink_host_start();
         else if (target == DeviceBluetoothAudioRole::Transmit)
             ret = bt_audio_source_host_start();
-        // Off is a successful transition with no A2DP profile.
+        // Off is a successful transition with no A2DP profile. Make the
+        // shared Classic controller non-discoverable while BLE GATT stays up.
+        if (ret == ESP_OK && target == DeviceBluetoothAudioRole::Off) {
+            const esp_err_t scan_ret = esp_bt_gap_set_scan_mode(
+                ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
+            if (scan_ret != ESP_OK)
+                ESP_LOGW(TAG, "仅手机遥控：设置Classic不可发现失败：%s",
+                    esp_err_to_name(scan_ret));
+        }
         if (ret == ESP_OK && target == DeviceBluetoothAudioRole::Receive &&
             !audio_service_bluetooth_sink_set_enabled(true, true)) {
             bt_audio_sink_host_stop();
