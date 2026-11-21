@@ -251,6 +251,39 @@ esp_err_t i2s_output_stream_start_32bit(uint32_t sample_rate_hz)
     return i2s_output_create_channel(sample_rate_hz, 0U);
 }
 
+// Phone A2DP Sink -> CS43131. AudioTask exclusively owns this I2S channel.
+// SBC decode and Bluetooth Host consume extra DMA/internal RAM; retry bounded
+// DMA profiles instead of exhausting memory with normal Hi-Fi allocations.
+esp_err_t i2s_output_stream_start_32bit_bt_sink(uint32_t sample_rate_hz)
+{
+    if (sample_rate_hz != 32000U && sample_rate_hz != 44100U &&
+        sample_rate_hz != 48000U) {
+        ESP_LOGE(TAG, "BT_SINK_I2S unsupported sample rate=%lu", (unsigned long)sample_rate_hz);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    const uint8_t desc_options[] = {8U, 6U, 4U};
+    for (unsigned i = 0U; i < sizeof(desc_options) / sizeof(desc_options[0]); ++i) {
+        const uint8_t desc = desc_options[i];
+        const size_t required = (size_t)desc * I2S_DMA_FRAME_NUM * 8U + 4096U;
+        const size_t available = heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        if (available < required) continue;
+        const esp_err_t ret = i2s_output_create_channel(sample_rate_hz, desc);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "BT_SINK_I2S ready rate=%lu desc=%u runway=%lums DMA_remaining=%u",
+                (unsigned long)sample_rate_hz, (unsigned)desc,
+                (unsigned long)((uint64_t)desc * I2S_DMA_FRAME_NUM * 1000U / sample_rate_hz),
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+            return ESP_OK;
+        }
+        if (ret != ESP_ERR_NO_MEM) return ret;
+    }
+    ESP_LOGE(TAG, "BT_SINK_I2S: DMA不足 rate=%lu free=%u largest=%u",
+        (unsigned long)sample_rate_hz,
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+    return ESP_ERR_NO_MEM;
+}
+
 // High-rate / Bluetooth coexistence deliberately changes only the I2S DMA
 // queue depth; DAC clock, original sample rate and 32-bit PCM remain unchanged.
 // 96kHz normal=26x256 ~69ms / ~52KB DMA. With A2DP+BLE enabled the measured

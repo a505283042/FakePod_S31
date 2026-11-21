@@ -27,6 +27,10 @@ struct BleRemoteSnapshot {
     bool connected = false;
     BleRemoteState state = BleRemoteState::Disabled;
     esp_err_t last_error = ESP_OK;
+    DeviceBluetoothAudioRole audio_role = DeviceBluetoothAudioRole::Transmit;
+    DeviceBluetoothAudioRole audio_role_target = DeviceBluetoothAudioRole::Transmit;
+    bool audio_role_switching = false;
+    esp_err_t audio_role_last_error = ESP_OK;
     uint8_t startup_stage = 0; // 0=准备, 1-10=控制器/Host/A2DP/GATT/广播启动阶段
 };
 
@@ -37,6 +41,11 @@ esp_err_t ble_remote_service_init();
 void ble_remote_service_set_enabled(bool enabled);
 void ble_remote_service_set_mode(DeviceBluetoothMode mode);
 void ble_remote_service_update();
+
+// Switch Classic A2DP Source/Sink without restarting the BLE GATT remote.
+// Returns false if a Bluetooth stack transition is busy or unavailable.
+// Successful switches are stored in NVS by the transition worker.
+bool ble_remote_service_request_audio_role(DeviceBluetoothAudioRole role);
 
 // 第一阶段 HID Host 关闭，手柄（Controller）模式不可用；UI 据此跳过该选项。
 bool ble_remote_service_controller_supported();

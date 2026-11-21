@@ -77,6 +77,7 @@ static DeviceSettingsSnapshot make_defaults()
     defaults.usb_mode = DeviceUsbMode::Serial;
     defaults.ble_enabled = true;
     defaults.bluetooth_mode = DeviceBluetoothMode::PhoneRemote;
+    defaults.bluetooth_audio_role = DeviceBluetoothAudioRole::Transmit;
     defaults.wifi_enabled = false;
     defaults.audio_output_mode = DeviceAudioOutputMode::NormalHeadphones;
     defaults.brightness_level = 60U;
@@ -270,6 +271,9 @@ esp_err_t device_settings_init()
     if (nvs_get_u8(handle, "blemode", &u8) == ESP_OK && u8 <= 2U) {
         g_settings.bluetooth_mode = static_cast<DeviceBluetoothMode>(u8);
         g_settings.ble_enabled = g_settings.bluetooth_mode != DeviceBluetoothMode::Off;
+    }
+    if (nvs_get_u8(handle, "btaudiorole", &u8) == ESP_OK && u8 <= 1U) {
+        g_settings.bluetooth_audio_role = static_cast<DeviceBluetoothAudioRole>(u8);
     }
     if (nvs_get_u8(handle, "wifi", &u8) == ESP_OK && u8 <= 1U) {
         g_settings.wifi_enabled = u8 != 0U;
@@ -492,6 +496,16 @@ esp_err_t device_settings_set_bluetooth_mode(DeviceBluetoothMode mode)
         g_settings.ble_enabled = old_enabled;
         log_commit_failure("blemode", ret);
     }
+    return ret;
+}
+
+esp_err_t device_settings_set_bluetooth_audio_role(DeviceBluetoothAudioRole role)
+{
+    if (static_cast<uint8_t>(role) > 1U || !g_settings.ready)
+        return ESP_ERR_INVALID_ARG;
+    const esp_err_t ret = commit_u8("btaudiorole", static_cast<uint8_t>(role));
+    if (ret == ESP_OK) g_settings.bluetooth_audio_role = role;
+    else log_commit_failure("btaudiorole", ret);
     return ret;
 }
 

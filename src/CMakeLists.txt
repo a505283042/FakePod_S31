@@ -30,6 +30,7 @@ idf_component_register(
         "system/device_settings.cpp"
         "system/ble_remote_service.cpp"
         "system/bt_audio_source.cpp"
+        "system/bt_audio_sink.cpp"
         "system/gamepad_input_service.cpp"
         "system/wifi_service.cpp"
         "system/wifi_remote_service.cpp"
@@ -194,6 +195,14 @@ idf_component_register(
         lwip
 
 )
+
+# GCC 15 reports -Wstringop-truncation inside ESP-IDF 6.1 Bluedroid's
+# BCM_STRNCPY_S macro (bta_dm_act.c). This is vendor code under the managed
+# PlatformIO framework. Silence only that diagnostic on the BT component;
+# retain all other project/source warnings, and never patch the SDK package.
+if(TARGET __idf_bt AND CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(__idf_bt PRIVATE -Wno-stringop-truncation)
+endif()
 
 # SRAM.1.3：LVGL 仍使用内置 TLSF，但把固定 pool 扩容到 128KB，并继续全部放在 PSRAM。
 # 64KB 在 Music PreserveBackground + Ebook 39 行目录 + 隐藏 Reader 控件同时存在时会逼近上限，

@@ -41,6 +41,18 @@ struct Payload {
     char config[900] = {};
 };
 
+// Payload contains the decrypted NAS credentials and an AES session key.
+// Volatile byte writes ensure the sensitive data is not optimized away on
+// release builds. The object has implicit lifetime in PSRAM-allocated storage.
+static void secure_wipe_payload(Payload *ctx)
+{
+    if (ctx == nullptr) return;
+    volatile uint8_t *bytes = reinterpret_cast<volatile uint8_t *>(ctx);
+    for (size_t i = 0; i < sizeof(*ctx); ++i) {
+        bytes[i] = 0U;
+    }
+}
+
 static bool read_exact(int fd, void* buffer, size_t size) {
     uint8_t* out = static_cast<uint8_t*>(buffer);
     while (size != 0) {
@@ -284,7 +296,7 @@ static void pairing_task(void*) {
                 Payload* ctx = static_cast<Payload*>(heap_caps_calloc(1, sizeof(Payload),
                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
                 const bool success = ctx && serve_once(fd, ctx, expires);
-                if (ctx) { memset(ctx, 0, sizeof(Payload)); heap_caps_free(ctx); }
+                if (ctx) { secure_wipe_payload(ctx); heap_caps_free(ctx); }
                 close(fd);
                 if (success) {
                     const esp_err_t ret = nas_catalog_service_request_pending_switch();

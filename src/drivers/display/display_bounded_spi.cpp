@@ -224,7 +224,9 @@ static void display_bounded_spi_prepare_transaction(
     uint32_t qspi_header,
     bool qio_data)
 {
-    memset(tx, 0, sizeof(*tx));
+    // Reset the entire SPI transaction including the required 4-byte ABI tail.
+    // C++ value-initialization preserves zeroed defaults without raw memset.
+    *tx = DisplayBoundedRawSpiTransaction{};
     tx->base.flags = SPI_TRANS_VARIABLE_ADDR;
     if (qio_data) {
         // 只让 data phase 走4线；32-bit address/header phase 仍保持单线，匹配 CO5300 官方驱动。

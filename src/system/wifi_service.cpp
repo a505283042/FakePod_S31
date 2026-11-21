@@ -764,7 +764,9 @@ esp_err_t wifi_service_submit_credentials(const char *ssid, const char *password
         portEXIT_CRITICAL(&g_lock);
         return ESP_ERR_INVALID_STATE;
     }
-    memset(&g_pending, 0, sizeof(g_pending));
+    // Reset the credential value object before writing a new SSID/password.
+    // Value-initialization clears both arrays without GCC class-memaccess warnings.
+    g_pending = WifiCredentials{};
     memcpy(g_pending.ssid, ssid, ssid_len);
     if (password_len > 0U) memcpy(g_pending.password, password, password_len);
     g_pending_valid = true;

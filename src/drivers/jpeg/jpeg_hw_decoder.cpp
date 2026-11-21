@@ -24,7 +24,6 @@ constexpr int kMaxFailureLogs = 3;
 constexpr size_t kJpegEngineInitMinDmaFree = 16U * 1024U;
 constexpr size_t kJpegEngineInitMinDmaLargest = 4U * 1024U;
 
-SemaphoreHandle_t g_lock = nullptr;
 jpeg_decoder_handle_t g_engine = nullptr;
 bool g_engine_init_failed = false;
 uint8_t *g_pad_buffer = nullptr;
@@ -39,7 +38,7 @@ SemaphoreHandle_t lock()
     return s_lock;
 }
 
-// 调用方需持有 g_lock。
+// 调用方需持有 lock() 返回的互斥量。
 bool ensure_engine_locked()
 {
     if (g_engine != nullptr) return true;
@@ -79,7 +78,7 @@ bool ensure_engine_locked()
     return true;
 }
 
-// 调用方需持有 g_lock。
+// 调用方需持有 lock() 返回的互斥量。
 bool ensure_pad_buffer_locked(size_t bytes)
 {
     if (g_pad_buffer != nullptr && g_pad_capacity >= bytes) return true;

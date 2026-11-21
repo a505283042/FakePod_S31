@@ -17,6 +17,9 @@ struct BtAudioSourceSnapshot {
     uint32_t sample_rate_hz = 44100U;
     uint32_t underrun_frames = 0U;
     uint32_t dropped_frames = 0U;
+    // Output PCM frames currently buffered in the A2DP PSRAM ring (target-rate).
+    // AudioTask uses this to pace BT-only decoding without I2S DMA backpressure.
+    uint32_t queued_frames = 0U;
     char peer_name[48] = {};
 };
 
@@ -32,8 +35,9 @@ esp_err_t bt_audio_source_disconnect();
 void bt_audio_source_update();
 bool bt_audio_source_get_snapshot(BtAudioSourceSnapshot *out);
 
-// AudioTask 非阻塞 PCM 旁路：32-bit 左对齐、交错立体声，内部转 S16 及重采样。
-// 播放主路径始终以 I2S/CS43131 为准，蓝牙慢时只丢弃蓝牙环形缓存旧帧。
+// AudioTask 非阻塞 PCM：32-bit 左对齐、交错立体声，内部转 S16 及重采样。
+// 有线模式旁路 I2S PCM；蓝牙专用模式不初始化 I2S/DAC，由 AudioTask 根据
+// queued_frames 限速直接送 A2DP。不得在 BT 回调里阻塞或读 SD。
 void bt_audio_source_feed_pcm32(const int32_t *pcm, size_t frames,
                                 uint32_t source_rate_hz, uint8_t volume_percent);
 void bt_audio_source_flush();

@@ -1,5 +1,6 @@
 #include "audio_service.h"
 #include "bt_audio_source.h"
+#include "bt_audio_sink.h"
 
 #include <stdlib.h>
 #include <stdint.h>
@@ -135,7 +136,8 @@ enum class AudioCommandType : uint8_t
     NsfPause,
     NsfResume,
     NsfSetTrack,
-    NsfStop
+    NsfStop,
+    BluetoothSinkEnable
 };
 
 struct AudioRequest
@@ -151,6 +153,7 @@ struct AudioRequest
     uint8_t volume_percent = 50;
     AudioOutputMode output_mode = AudioOutputMode::NormalHeadphones;
     bool mute = false;
+    bool bt_sink_enable = false;
     AudioMusicSuspendOwner music_suspend_owner = AudioMusicSuspendOwner::Video;
     bool music_restore_async = false;
     bool music_restore_resume = false;
@@ -574,11 +577,40 @@ static void audio_task_publish_video_clock_snapshot()
     portEXIT_CRITICAL(&g_video_clock_snapshot_mux);
 }
 
+// Per-Music-pipeline output routing. Only AudioTask mutates this flag.
+// BT-only bypasses CS43131/I2S entirely while leaving A2DP and BLE running.
+static bool g_music_bt_only = false;
+// AudioTask exclusively owns this mode and all I2S/DAC resources. The
+// Bluedroid PCM callback only fills PSRAM; it NEVER writes the I2S driver.
+static bool g_bt_sink_output_enabled = false;
+static bool g_bt_sink_output_active = false;
+static uint32_t g_bt_sink_output_rate = 0U;
+static TickType_t g_bt_sink_retry_due = 0;
+static constexpr uint32_t kBtMusicQueueGoalMs = 85U;
+static constexpr uint32_t kBtMusicDrainTimeoutMs = 250U;
+static constexpr uint32_t kBtMusicMediaStartTimeoutMs = 8000U;
+static int64_t g_bt_music_media_wait_started_us = 0LL;
+
 static bool g_pipeline_clock_prepared = false;
 static bool g_pipeline_i2s_started = false;
 static bool g_pipeline_asp_enabled = false;
 static bool g_pipeline_headphone_enabled = false;
 static int32_t g_pcm_block[AUDIO_STREAM_FRAMES * 2] = {};
+
+// AudioTask-only: bounded drain before pause and natural EOF. Never hold the
+// BT spinlock while sleeping: the A2DP callback must keep draining concurrently.
+static bool audio_task_wait_for_bt_pcm_drain(uint32_t timeout_ms)
+{
+    const int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000LL;
+    while (esp_timer_get_time() < deadline) {
+        BtAudioSourceSnapshot bt = {};
+        if (!bt_audio_source_get_snapshot(&bt) || !bt.connected || !bt.streaming) return false;
+        if (bt.queued_frames == 0U) return true;
+        vTaskDelay(pdMS_TO_TICKS(2) != 0U ? pdMS_TO_TICKS(2) : 1U);
+    }
+    BtAudioSourceSnapshot bt = {};
+    return bt_audio_source_get_snapshot(&bt) && bt.queued_frames == 0U;
+}
 
 static const char *audio_request_path(const AudioRequest *request)
 {
@@ -912,13 +944,19 @@ static bool audio_task_try_recover_flac_starvation(esp_err_t decoder_error)
 
     ++g_flac_starve_grace_attempts;
     const size_t silence_frames = nas_http ? AUDIO_STREAM_FRAMES * 4U : AUDIO_STREAM_FRAMES;
-    const esp_err_t silence_ret = i2s_output_stream_write_silence(
-        silence_frames, AUDIO_I2S_WRITE_TIMEOUT_MS);
-    if (silence_ret != ESP_OK) {
-        ESP_LOGE(TAG, "%sFLAC欠载恢复期间I2S静音写入失败：%s",
-            nas_http ? "NAS " : "", esp_err_to_name(silence_ret));
-        audio_task_reset_flac_starve_grace();
-        return false;
+    // BT-only has no I2S clock to maintain. The A2DP data callback supplies
+    // zero PCM while decoding/SD rebuffering, without advancing music time.
+    if (g_music_bt_only) {
+        vTaskDelay(pdMS_TO_TICKS(2) != 0U ? pdMS_TO_TICKS(2) : 1U);
+    } else {
+        const esp_err_t silence_ret = i2s_output_stream_write_silence(
+            silence_frames, AUDIO_I2S_WRITE_TIMEOUT_MS);
+        if (silence_ret != ESP_OK) {
+            ESP_LOGE(TAG, "%sFLAC欠载恢复期间I2S静音写入失败：%s",
+                nas_http ? "NAS " : "", esp_err_to_name(silence_ret));
+            audio_task_reset_flac_starve_grace();
+            return false;
+        }
     }
     if (nas_http) {
         if (g_task_sample_rate_hz != 0U)
@@ -999,12 +1037,18 @@ static bool audio_task_try_recover_http_mp3_starvation(esp_err_t decoder_error)
 
     ++g_http_mp3_starve_grace_attempts;
     // 20ms Source 等待后补约23ms静音，既让网络任务有时间回填，也持续喂I2S DMA。
-    const esp_err_t silence_ret = i2s_output_stream_write_silence(
-        AUDIO_STREAM_FRAMES * 4U, AUDIO_I2S_WRITE_TIMEOUT_MS);
-    if (silence_ret != ESP_OK) {
-        ESP_LOGE(TAG, "NAS MP3欠载恢复期间I2S静音写入失败：%s", esp_err_to_name(silence_ret));
-        audio_task_reset_http_mp3_starve_grace();
-        return false;
+    if (g_music_bt_only) {
+        // A2DP callback outputs zero PCM until the network source refills.
+        vTaskDelay(pdMS_TO_TICKS(2) != 0U ? pdMS_TO_TICKS(2) : 1U);
+    } else {
+        const esp_err_t silence_ret = i2s_output_stream_write_silence(
+            AUDIO_STREAM_FRAMES * 4U, AUDIO_I2S_WRITE_TIMEOUT_MS);
+        if (silence_ret != ESP_OK) {
+            ESP_LOGE(TAG, "NAS MP3欠载恢复期间I2S静音写入失败：%s",
+                esp_err_to_name(silence_ret));
+            audio_task_reset_http_mp3_starve_grace();
+            return false;
+        }
     }
     audio_task_reset_music_last_pcm();
 
@@ -1065,6 +1109,7 @@ static const char *audio_command_name(AudioCommandType type)
         case AudioCommandType::SetVolume: return "VOLUME";
         case AudioCommandType::SetOutputMode: return "OUTPUT_MODE";
         case AudioCommandType::SetMute: return "MUTE";
+        case AudioCommandType::BluetoothSinkEnable: return "BT_SINK_OUTPUT";
         case AudioCommandType::MusicDeepSuspend: return "MUSIC_DEEP_SUSPEND";
         case AudioCommandType::MusicDeepRestore: return "MUSIC_DEEP_RESTORE";
         case AudioCommandType::VideoMp3Start: return "VIDEO_MP3_START";
@@ -1630,6 +1675,8 @@ static esp_err_t audio_task_shutdown_pipeline(
     if (pcm_decoder_is_open(&g_decoder)) {
         pcm_decoder_close(&g_decoder);
     }
+    g_music_bt_only = false;
+    g_bt_music_media_wait_started_us = 0LL;
     audio_decode_workspace_trim(
         &g_decode_workspace,
         AUDIO_DECODE_WORKSPACE_RETAIN_INPUT_BYTES,
@@ -1783,7 +1830,8 @@ static esp_err_t audio_task_start_output_hardware(
     bool arm_unmute,
     const char *fade_reason,
     bool video_i2s_profile = false,
-    bool nsf_i2s_profile = false)
+    bool nsf_i2s_profile = false,
+    bool bt_sink_i2s_profile = false)
 {
     if (sample_rate_hz == 0U || channels == 0U) return ESP_ERR_INVALID_ARG;
     const char *label = owner != nullptr ? owner : "PCM";
@@ -1812,6 +1860,8 @@ static esp_err_t audio_task_start_output_hardware(
 
     if (video_i2s_profile) {
         ret = i2s_output_stream_start_32bit_video(sample_rate_hz);
+    } else if (bt_sink_i2s_profile) {
+        ret = i2s_output_stream_start_32bit_bt_sink(sample_rate_hz);
     } else if (nsf_i2s_profile) {
         ret = i2s_output_stream_start_32bit_nsf(sample_rate_hz);
     } else {
@@ -2785,24 +2835,52 @@ static esp_err_t audio_task_start_pcm_pipeline(
         g_task_sample_rate_hz);
     audio_task_publish_snapshot();
 
-    ret = audio_task_start_output_hardware(
-        g_task_sample_rate_hz,
-        g_task_bits_per_sample,
-        g_task_channels,
-        pcm_decoder_type_name(decoder_type),
-        check_transport_intent ? request : nullptr,
-        true,
-        "start");
-    if (ret != ESP_OK) {
-        audio_task_shutdown_pipeline();
-        return ret;
+    // Route selection is made after decoder open and before any DAC/I2S
+    // allocation. Keep BLE GATT and Classic A2DP enabled in either mode.
+    BtAudioSourceSnapshot bt_route = {};
+    const bool a2dp_connected =
+        bt_audio_source_get_snapshot(&bt_route) &&
+        bt_route.available && bt_route.initialized && bt_route.connected;
+    g_music_bt_only = a2dp_connected;
+    g_bt_music_media_wait_started_us = 0LL;
+    if (g_music_bt_only) {
+        // A2DP STARTED can arrive shortly after CONNECTED. The AudioTask PCM
+        // service will wait for that event rather than silently drop packets.
+        bt_audio_source_flush();
+        audio_task_begin_pcm_fade_in("bt_only_start", g_task_sample_rate_hz);
+        g_pcm_unmute_pending = false;
+        ret = ESP_OK;
+        ESP_LOGI(TAG,
+            "AUDIO_ROUTE=BT_ONLY: bypass I2S/CS43131 rate=%luHz bits=%u "
+            "bt_rate=%luHz connected=%u streaming=%u DMA_free=%u largest=%u",
+            (unsigned long)g_task_sample_rate_hz,
+            (unsigned)g_task_bits_per_sample,
+            (unsigned long)bt_route.sample_rate_hz,
+            (unsigned)bt_route.connected, (unsigned)bt_route.streaming,
+            (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+    } else {
+        ret = audio_task_start_output_hardware(
+            g_task_sample_rate_hz,
+            g_task_bits_per_sample,
+            g_task_channels,
+            pcm_decoder_type_name(decoder_type),
+            check_transport_intent ? request : nullptr,
+            true,
+            "start");
+        if (ret != ESP_OK) {
+            audio_task_shutdown_pipeline();
+            return ret;
+        }
+        ESP_LOGI(TAG, "AUDIO_ROUTE=I2S_DAC rate=%luHz", (unsigned long)g_task_sample_rate_hz);
     }
     audio_task_log_ram("pipeline_playing");
 
     const uint64_t duration_ms = g_task_sample_rate_hz > 0 && g_task_total_frames > 0
         ? (g_task_total_frames * 1000ULL) / g_task_sample_rate_hz
         : 0;
-    ESP_LOGI(TAG, "PCM硬件链路已开启：格式=%s %luHz / %ubit / %u声道，时长约=%llums，用户音量=%u%% mute=%u，等待首PCM帧解除静音",
+    ESP_LOGI(TAG, "%s：格式=%s %luHz / %ubit / %u声道，时长约=%llums，用户音量=%u%% mute=%u",
+        g_music_bt_only ? "A2DP专用PCM链路已开启(不使用I2S/DAC)" : "PCM硬件链路已开启(首PCM解除静音)",
         pcm_decoder_type_name(decoder_type),
         static_cast<unsigned long>(g_task_sample_rate_hz),
         static_cast<unsigned>(g_task_bits_per_sample),
@@ -2984,7 +3062,11 @@ static void audio_task_finish_stream()
     // i2s_channel_write() 返回代表 PCM 已复制进 DMA，不等于最后一个样本已经从引脚送出。
     // 文件尾先追加 4 个静音块，让已排队的最后 PCM 块自然播放完，再执行 DAC 软静音/掉电。
     // 这样不会因为 EOF 清理过快而截掉歌曲最后几毫秒。
-    if (g_pipeline_i2s_started && i2s_output_is_started()) {
+    if (g_music_bt_only) {
+        if (!audio_task_wait_for_bt_pcm_drain(kBtMusicDrainTimeoutMs)) {
+            ESP_LOGW(TAG, "A2DP曲末排空超时或耳机断开；停止等待，允许继续下一首");
+        }
+    } else if (g_pipeline_i2s_started && i2s_output_is_started()) {
         esp_err_t drain_ret = i2s_output_stream_write_silence(
             AUDIO_STREAM_FRAMES * 4,
             AUDIO_I2S_WRITE_TIMEOUT_MS
@@ -3012,6 +3094,65 @@ static void audio_task_service_pcm_playback()
 {
     if (g_task_state != AudioPlaybackState::Playing || !pcm_decoder_is_open(&g_decoder)) {
         return;
+    }
+
+    BtAudioSourceSnapshot bt = {};
+    (void)bt_audio_source_get_snapshot(&bt);
+    // Earphones may connect while wired Music is already playing. Switch once,
+    // safely quiescing the wired output before decoding the next PCM block.
+    // Do not change source/decoder/playback clock, so resume/seek keep context.
+    if (!g_music_bt_only && bt.initialized && bt.connected && bt.streaming &&
+        g_pipeline_i2s_started) {
+        ESP_LOGI(TAG, "AUDIO_ROUTE: A2DP已连接，运行中由I2S_DAC切换BT_ONLY");
+        const esp_err_t switch_ret = audio_task_shutdown_output_hardware(
+            g_task_sample_rate_hz, "Music");
+        if (switch_ret != ESP_OK) {
+            audio_task_fail_stream(switch_ret, "切换蓝牙输出");
+            return;
+        }
+        g_music_bt_only = true;
+        g_bt_music_media_wait_started_us = 0LL;
+        bt_audio_source_flush();
+        audio_task_begin_pcm_fade_in("bt_route_switch", g_task_sample_rate_hz);
+        g_pcm_unmute_pending = false;
+        ESP_LOGI(TAG, "AUDIO_ROUTE=BT_ONLY: live switched rate=%lu DMA_free=%u",
+            (unsigned long)g_task_sample_rate_hz,
+            (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA));
+    }
+    if (g_music_bt_only) {
+        if (!bt.initialized || !bt.connected) {
+            // No I2S exists to fall back to mid-track. Stop deliberately:
+            // restarting high-rate wired I2S while BTDM still owns its memory
+            // can OOM and corrupt the currently running output state.
+            ESP_LOGW(TAG, "AUDIO_ROUTE=BT_ONLY: 耳机已断开，停止当前曲目以防静音空跑");
+            audio_task_fail_stream(ESP_ERR_INVALID_STATE, "蓝牙耳机断开");
+            return;
+        }
+        if (!bt.streaming) {
+            // A2DP media START may lag CONNECTED. Wait for the media event;
+            // never decode-and-advance the timeline while the callback drops PCM.
+            const int64_t now_us = esp_timer_get_time();
+            if (g_bt_music_media_wait_started_us == 0LL) {
+                g_bt_music_media_wait_started_us = now_us;
+                ESP_LOGI(TAG, "AUDIO_ROUTE=BT_ONLY: 等待A2DP媒体START，I2S保持OFF");
+            } else if (now_us - g_bt_music_media_wait_started_us >
+                       (int64_t)kBtMusicMediaStartTimeoutMs * 1000LL) {
+                ESP_LOGE(TAG, "AUDIO_ROUTE=BT_ONLY: A2DP媒体8秒未启动，停止静音等待");
+                audio_task_fail_stream(ESP_ERR_TIMEOUT, "蓝牙媒体未启动");
+                return;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10) != 0U ? pdMS_TO_TICKS(10) : 1U);
+            return;
+        }
+        g_bt_music_media_wait_started_us = 0LL;
+        const uint32_t target_rate = bt.sample_rate_hz != 0U ? bt.sample_rate_hz : 44100U;
+        const uint32_t goal_frames = target_rate * kBtMusicQueueGoalMs / 1000U;
+        if (bt.queued_frames >= goal_frames) {
+            // Without I2S blocking, decoding would outrun SBC consumption and
+            // discard entire songs in the 120ms BT ring. Keep ~85ms queued.
+            vTaskDelay(pdMS_TO_TICKS(2) != 0U ? pdMS_TO_TICKS(2) : 1U);
+            return;
+        }
     }
 
     // One bounded silence step per service call: the outer task handles commands
@@ -3068,25 +3209,31 @@ static void audio_task_service_pcm_playback()
 
     audio_task_apply_pcm_fade_in(g_pcm_block, frames);
 
-    // 第一块真实 PCM 已经在 g_pcm_block 中准备好；先恢复稳定的零 PCM 时钟，
-    // 再解除 CS43131 手动静音，随后发送从 0 开始淡入的真实 PCM。
-    ret = audio_task_unmute_when_pcm_ready();
-    if (ret != ESP_OK) {
-        audio_task_fail_stream(ret, "首PCM解除静音");
-        return;
+    if (g_music_bt_only) {
+        // No DAC setup, no I2S channel, no DMA descriptors. A2DP handles its
+        // own 44.1/48k S16 conversion directly from decoded native-rate PCM32.
+        bt_audio_source_feed_pcm32(g_pcm_block, frames, g_task_sample_rate_hz,
+                                   g_task_user_muted ? 0U : g_task_volume_percent);
+    } else {
+        // Wired: first restore a stable I2S zero clock, unmute CS43131, then
+        // write real PCM. Bluetooth stays an optional mirror until route switch.
+        ret = audio_task_unmute_when_pcm_ready();
+        if (ret != ESP_OK) {
+            audio_task_fail_stream(ret, "首PCM解除静音");
+            return;
+        }
+        ret = i2s_output_stream_write_pcm32(g_pcm_block, frames, AUDIO_I2S_WRITE_TIMEOUT_MS);
+        if (ret != ESP_OK) {
+            audio_task_fail_stream(ret, "I2S发送");
+            return;
+        }
+        audio_task_note_music_pcm(g_pcm_block, frames);
+        bt_audio_source_feed_pcm32(g_pcm_block, frames, g_task_sample_rate_hz,
+                                   g_task_user_muted ? 0U : g_task_volume_percent);
     }
 
-    ret = i2s_output_stream_write_pcm32(g_pcm_block, frames, AUDIO_I2S_WRITE_TIMEOUT_MS);
-    if (ret != ESP_OK) {
-        audio_task_fail_stream(ret, "I2S发送");
-        return;
-    }
-    audio_task_note_music_pcm(g_pcm_block, frames);
-    bt_audio_source_feed_pcm32(g_pcm_block, frames, g_task_sample_rate_hz,
-                               g_task_user_muted ? 0U : g_task_volume_percent);
-
-    // i2s_output_stream_write_pcm32() 成功表示整块真实 PCM 已复制进 DMA。
-    // 启动 prime、暂停保持时钟和 EOF drain 都走 silence API，因此不会污染该计数。
+    // The clock counts PCM submitted to the selected output, not time heard:
+    // I2S DMA and A2DP PSRAM ring both have finite downstream latency.
     audio_playback_clock_commit_pcm(&g_playback_clock, frames);
     if (g_nas_seek_diag_first_pcm_pending && g_task_source == AudioPlaybackSource::NasHttp &&
         g_task_format == MediaFormat::MP3) {
@@ -3591,6 +3738,10 @@ static esp_err_t audio_task_stop_video_mp3_internal(bool restore_music_hardware,
 static void audio_task_handle_video_mp3_start(AudioRequest *request)
 {
     if (request == nullptr) return;
+    if (g_bt_sink_output_enabled) {
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
 #if APP_DIAG_AUDIO_RAM
     g_audio_stack_hwm_at_video_start = uxTaskGetStackHighWaterMark(nullptr);
 #endif
@@ -3616,7 +3767,8 @@ static void audio_task_handle_video_mp3_start(AudioRequest *request)
     }
 
     g_video_restore_paused_music_hardware =
-        g_task_state == AudioPlaybackState::Paused && pcm_decoder_is_open(&g_decoder);
+        !g_music_bt_only && g_task_state == AudioPlaybackState::Paused &&
+        pcm_decoder_is_open(&g_decoder);
 
     // 首次进入 Video 时沿用当前 Music 音量作为起始值；之后独立记住 Video 音量。
     portENTER_CRITICAL(&g_video_mp3_volume_mux);
@@ -5166,6 +5318,10 @@ static esp_err_t audio_task_stop_nsf_internal(bool restore_music_hardware, const
 static void audio_task_handle_nsf_start(AudioRequest *request)
 {
     if (request == nullptr) return;
+    if (g_bt_sink_output_enabled) {
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
 #if APP_DIAG_AUDIO_RAM
     g_audio_stack_hwm_at_nsf_start = uxTaskGetStackHighWaterMark(nullptr);
 #endif
@@ -5196,7 +5352,8 @@ static void audio_task_handle_nsf_start(AudioRequest *request)
     }
 
     g_nsf_restore_paused_music_hardware =
-        g_task_state == AudioPlaybackState::Paused && pcm_decoder_is_open(&g_decoder);
+        !g_music_bt_only && g_task_state == AudioPlaybackState::Paused &&
+        pcm_decoder_is_open(&g_decoder);
 
     if (g_pipeline_headphone_enabled || g_pipeline_clock_prepared ||
         g_pipeline_i2s_started || i2s_output_is_started()) {
@@ -5625,6 +5782,11 @@ static PcmDecoderType audio_decoder_type_for_format(MediaFormat format)
 
 static void audio_task_handle_play(AudioRequest *request)
 {
+    if (g_bt_sink_output_enabled) {
+        ESP_LOGW(TAG, "蓝牙音频接收模式运行中：本地Music播放被禁用，避免双音源抢占I2S");
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
     bt_audio_source_flush(); // 新曲目开始前清除上首歌的蓝牙延迟帧。
     // 新 Music Play 覆盖任何尚未恢复的临时音源深度挂起上下文。
     audio_task_release_music_deep_suspend_context();
@@ -6036,6 +6198,13 @@ static void audio_task_handle_seek(AudioRequest *request)
 
 static void audio_task_handle_stop(AudioRequest *request)
 {
+    if (g_bt_sink_output_enabled) {
+        // The Music STOP command must not interrupt phone -> wired A2DP
+        // playback. Role switching first disables this sink output explicitly,
+        // then issues its normal Music STOP to release local resources.
+        audio_request_complete(request, true, ESP_OK);
+        return;
+    }
     bt_audio_source_flush();
     g_task_last_request_id = request->request_id;
     audio_task_release_music_deep_suspend_context();
@@ -6081,7 +6250,6 @@ static bool audio_task_request_matches_playback_context(const AudioRequest *requ
 
 static void audio_task_handle_pause(AudioRequest *request)
 {
-    bt_audio_source_flush();
     g_task_last_request_id = request->request_id;
     // Pause 不是 transport intent，但必须绑定提交时的歌曲世代。否则切歌后的旧 Pause
     // 可能排在新 Play 后执行，把刚启动的新歌误暂停。
@@ -6101,7 +6269,8 @@ static void audio_task_handle_pause(AudioRequest *request)
         audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
         return;
     }
-    if (g_task_state != AudioPlaybackState::Playing || !g_pipeline_headphone_enabled) {
+    if (g_task_state != AudioPlaybackState::Playing ||
+        (!g_music_bt_only && !g_pipeline_headphone_enabled)) {
         ESP_LOGW(TAG, "暂停请求被拒绝：当前状态=%s",
             audio_playback_state_name_cn(g_task_state));
         audio_task_set_state(g_task_state, ESP_ERR_INVALID_STATE);
@@ -6109,6 +6278,22 @@ static void audio_task_handle_pause(AudioRequest *request)
         return;
     }
 
+    if (g_music_bt_only) {
+        const bool drained = audio_task_wait_for_bt_pcm_drain(kBtMusicDrainTimeoutMs);
+        bt_audio_source_flush();
+        g_bt_music_media_wait_started_us = 0LL;
+        audio_task_reset_music_last_pcm();
+        g_pcm_unmute_pending = false;
+        audio_task_reset_pcm_fade_in();
+        audio_task_set_state(AudioPlaybackState::Paused, ESP_OK);
+        ESP_LOGI(TAG,
+            "AUDIO_ROUTE=BT_ONLY: 暂停完成 frame=%llu bt_drain=%u I2S=OFF",
+            (unsigned long long)g_playback_clock.submitted_frames,
+            (unsigned)drained);
+        audio_request_complete(request, true, ESP_OK);
+        return;
+    }
+    bt_audio_source_flush();
     AUDIO_POP_TRACE_LOG("PAUSE_MUTE_BEGIN frame=%llu",
         static_cast<unsigned long long>(g_playback_clock.submitted_frames));
     esp_err_t ret = cs43131_set_pcm_mute(true);
@@ -6149,11 +6334,29 @@ static void audio_task_handle_resume(AudioRequest *request)
         audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
         return;
     }
-    if (g_task_state != AudioPlaybackState::Paused || !g_pipeline_headphone_enabled) {
+    if (g_task_state != AudioPlaybackState::Paused ||
+        (!g_music_bt_only && !g_pipeline_headphone_enabled)) {
         ESP_LOGW(TAG, "恢复请求被拒绝：当前状态=%s",
             audio_playback_state_name_cn(g_task_state));
         audio_task_set_state(g_task_state, ESP_ERR_INVALID_STATE);
         audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
+    if (g_music_bt_only) {
+        BtAudioSourceSnapshot bt = {};
+        if (!bt_audio_source_get_snapshot(&bt) || !bt.initialized || !bt.connected) {
+            ESP_LOGW(TAG, "AUDIO_ROUTE=BT_ONLY: 无已连接耳机，拒绝恢复播放");
+            audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+            return;
+        }
+        bt_audio_source_flush();
+        g_bt_music_media_wait_started_us = 0LL;
+        audio_task_begin_pcm_fade_in("bt_resume", g_task_sample_rate_hz);
+        g_pcm_unmute_pending = false;
+        audio_task_set_state(AudioPlaybackState::Playing, ESP_OK);
+        ESP_LOGI(TAG, "AUDIO_ROUTE=BT_ONLY: 恢复播放 frame=%llu I2S=OFF",
+            (unsigned long long)g_playback_clock.submitted_frames);
+        audio_request_complete(request, true, ESP_OK);
         return;
     }
 
@@ -6297,7 +6500,8 @@ static void audio_task_handle_set_mute(AudioRequest *request)
     if (g_pipeline_headphone_enabled) {
         if (g_task_user_muted) {
             ret = cs43131_set_pcm_mute(true);
-        } else if (g_task_state == AudioPlaybackState::Playing && !g_pcm_unmute_pending) {
+        } else if ((g_task_state == AudioPlaybackState::Playing || g_bt_sink_output_active) &&
+                   !g_pcm_unmute_pending) {
             ret = cs43131_set_pcm_mute(false);
         }
         // Paused/Preparing 状态解除“用户静音”时仍保持硬件 mute；真正恢复播放时由
@@ -6314,6 +6518,103 @@ static void audio_task_handle_set_mute(AudioRequest *request)
     audio_task_publish_snapshot();
     ESP_LOGI(TAG, "用户静音：%s", g_task_user_muted ? "开启" : "关闭");
     audio_request_complete(request, true, ESP_OK);
+}
+
+// Incoming phone audio is handled by the same AudioTask that owns all
+// I2S/DAC operations. Neither Bluedroid nor the Settings UI may touch DAC.
+static void audio_task_handle_bluetooth_sink_enable(AudioRequest *request)
+{
+    if (request == nullptr) return;
+    const bool enable = request->bt_sink_enable;
+    if (enable && (pcm_decoder_is_open(&g_decoder) || g_nsf_active ||
+                   g_video_mp3_active || g_task_state == AudioPlaybackState::Playing)) {
+        ESP_LOGW(TAG, "蓝牙接收输出启动被拒绝：请先停止Music/Video/NSF");
+        audio_request_complete(request, false, ESP_ERR_INVALID_STATE);
+        return;
+    }
+    if (!enable && g_bt_sink_output_active) {
+        const esp_err_t ret = audio_task_shutdown_output_hardware(
+            g_bt_sink_output_rate, "Bluetooth-Sink");
+        g_bt_sink_output_active = false;
+        g_bt_sink_output_rate = 0U;
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "蓝牙接收I2S停止返回：%s", esp_err_to_name(ret));
+        }
+    }
+    g_bt_sink_output_enabled = enable;
+    g_bt_sink_retry_due = 0;
+    bt_audio_sink_flush();
+    ESP_LOGI(TAG, "蓝牙音频接收DAC输出：%s", enable ? "开启(等待手机媒体流)" : "关闭");
+    audio_request_complete(request, true, ESP_OK);
+}
+
+static void audio_task_service_bluetooth_sink()
+{
+    if (!g_bt_sink_output_enabled) return;
+    BtAudioSinkSnapshot bt = {};
+    (void)bt_audio_sink_get_snapshot(&bt);
+    const bool valid_stream = bt.initialized && bt.connected && bt.streaming;
+    if (g_bt_sink_output_active &&
+        (!valid_stream || g_bt_sink_output_rate != bt.sample_rate_hz)) {
+        (void)audio_task_shutdown_output_hardware(
+            g_bt_sink_output_rate, "Bluetooth-Sink-Suspend");
+        g_bt_sink_output_active = false;
+        g_bt_sink_output_rate = 0U;
+        bt_audio_sink_flush();
+        ESP_LOGI(TAG, "BT_SINK_OUTPUT: 连接/采样率改变，释放I2S DMA");
+    }
+    if (!valid_stream) return;
+
+    if (!g_bt_sink_output_active) {
+        // Allow approximately 40ms of incoming PCM to build before enabling
+        // the wired DAC. This avoids immediate underruns during SBC startup.
+        const uint32_t min_frames = bt.sample_rate_hz * 40U / 1000U;
+        if (bt.queued_frames < min_frames) return;
+        const TickType_t now = xTaskGetTickCount();
+        if (g_bt_sink_retry_due != 0 &&
+            static_cast<int32_t>(now - g_bt_sink_retry_due) < 0) return;
+        // No Video/NSF/Music can own I2S while BT Sink output is enabled.
+        const esp_err_t ret = audio_task_start_output_hardware(
+            bt.sample_rate_hz, 16U, 2U, "Bluetooth-Sink",
+            nullptr, true, "bt_sink", false, false, true);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "BT_SINK_OUTPUT: DAC/I2S启动失败：%s", esp_err_to_name(ret));
+            g_bt_sink_retry_due = now + pdMS_TO_TICKS(2000);
+            return;
+        }
+        g_bt_sink_output_active = true;
+        g_bt_sink_output_rate = bt.sample_rate_hz;
+        ESP_LOGI(TAG,
+            "BT_SINK_OUTPUT: started rate=%lu PCM=S16->32 I2S->CS43131",
+            (unsigned long)g_bt_sink_output_rate);
+    }
+
+    size_t frames = bt_audio_sink_read_pcm32(g_pcm_block, AUDIO_STREAM_FRAMES);
+    if (frames == 0U) {
+        // Media packets can be jittery; keep the DAC clock running and
+        // leave mute policy in AudioTask. Silence does not advance music time.
+        const esp_err_t ret = i2s_output_stream_write_silence(
+            AUDIO_STREAM_FRAMES, AUDIO_I2S_WRITE_TIMEOUT_MS);
+        if (ret != ESP_OK) ESP_LOGW(TAG, "BT_SINK_OUTPUT: 补零失败：%s", esp_err_to_name(ret));
+        return;
+    }
+    if (frames < AUDIO_STREAM_FRAMES) {
+        memset(g_pcm_block + frames * 2U, 0,
+               (AUDIO_STREAM_FRAMES - frames) * 2U * sizeof(int32_t));
+        frames = AUDIO_STREAM_FRAMES;
+    }
+    audio_task_apply_pcm_fade_in(g_pcm_block, frames);
+    esp_err_t ret = audio_task_unmute_when_pcm_ready();
+    if (ret == ESP_OK) ret = i2s_output_stream_write_pcm32(
+        g_pcm_block, frames, AUDIO_I2S_WRITE_TIMEOUT_MS);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "BT_SINK_OUTPUT: I2S写入失败：%s，释放输出并等待恢复",
+                 esp_err_to_name(ret));
+        (void)audio_task_shutdown_output_hardware(g_bt_sink_output_rate, "Bluetooth-Sink-Error");
+        g_bt_sink_output_active = false;
+        g_bt_sink_output_rate = 0U;
+        g_bt_sink_retry_due = xTaskGetTickCount() + pdMS_TO_TICKS(2000);
+    }
 }
 
 static void audio_task_process_request(AudioRequest *request)
@@ -6342,6 +6643,9 @@ static void audio_task_process_request(AudioRequest *request)
             break;
         case AudioCommandType::SetMute:
             audio_task_handle_set_mute(request);
+            break;
+        case AudioCommandType::BluetoothSinkEnable:
+            audio_task_handle_bluetooth_sink_enable(request);
             break;
         case AudioCommandType::MusicDeepSuspend:
             audio_task_handle_music_deep_suspend(request);
@@ -6518,16 +6822,20 @@ static void audio_task_main(void *arg)
         const bool stream_needs_service =
             g_video_mp3_active ||
             g_nsf_active ||
+            g_bt_sink_output_active ||
             g_task_state == AudioPlaybackState::Playing ||
             (g_task_state == AudioPlaybackState::Paused && g_pipeline_i2s_started);
-        const TickType_t wait_ticks = stream_needs_service ? 0 : portMAX_DELAY;
+        const TickType_t wait_ticks = stream_needs_service ? 0 :
+            (g_bt_sink_output_enabled ? pdMS_TO_TICKS(10) : portMAX_DELAY);
 
         if (xQueueReceive(g_command_queue, &request, wait_ticks) == pdTRUE && request != nullptr) {
             audio_task_process_queue_request(request);
             audio_request_release(request); // 释放 queue 引用
         }
 
-        if (g_video_mp3_active) {
+        if (g_bt_sink_output_enabled) {
+            audio_task_service_bluetooth_sink();
+        } else if (g_video_mp3_active) {
             audio_task_service_video_mp3();
         } else if (g_nsf_active) {
             audio_task_service_nsf();
@@ -6923,6 +7231,14 @@ bool audio_service_play_nas_track(
         return false;
     }
     return audio_service_submit_transport_intent(request, wait);
+}
+
+bool audio_service_bluetooth_sink_set_enabled(bool enabled, bool wait)
+{
+    AudioRequest *request = audio_request_create(AudioCommandType::BluetoothSinkEnable, wait);
+    if (request == nullptr) return false;
+    request->bt_sink_enable = enabled;
+    return audio_service_submit(request, wait);
 }
 
 bool audio_service_stop(bool wait)

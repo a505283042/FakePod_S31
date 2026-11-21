@@ -533,6 +533,7 @@ bool bt_audio_source_get_snapshot(BtAudioSourceSnapshot *out)
     s.sample_rate_hz = s_target_rate;
     s.underrun_frames = s_underrun;
     s.dropped_frames = s_dropped;
+    s.queued_frames = static_cast<uint32_t>(s_queued);
     memcpy(s.peer_name, s_connected || s_connecting ? s_peer_name : s_candidate_name,
            sizeof(s.peer_name));
     portEXIT_CRITICAL(&s_lock);

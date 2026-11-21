@@ -124,6 +124,133 @@
 
 ## 蓝牙音频发射 + 手机遥控共存（实验分支）
 
+### 蓝牙菜单整合与手机音频接收（A2DP Sink 实验）
+
+菜单层级统一为：
+
+```text
+设置
+└── 连接
+    └── 蓝牙                  ← 唯一的蓝牙入口
+        ├── 蓝牙开关          ← BR/EDR + BLE 双模 Host
+        ├── 手机遥控          ← 现有加密 BLE GATT，状态显示
+        ├── 音频发射          ← FakePod 本地音乐 → 蓝牙耳机/音箱
+        ├── 音频接收          ← 手机 A2DP → FakePod → CS43131 有线输出
+        └── 音频方向          ← 当前发射/接收状态
+```
+
+- **音频发射**：保持已实机验证的 MH-M18 A2DP Source 扫描、
+  连接/断开、软件重采样及蓝牙专用无 I2S 音乐路径。
+- **音频接收**：在蓝牙页面点击“音频接收”，后台在不重启
+  Controller、Bluedroid Host 和 BLE GATT 的情况下，反初始化 A2DP
+  Source 并初始化互斥的 Sink Profile。设备进入可发现/可连接模式，
+  手机蓝牙设置搜索 **FakePod Audio** 并配对，即可向 FakePod 传音乐。
+- **接收音频路径**：ESP-IDF 6.1 内部 SBC 解码回调 →
+  8192 帧（32KiB）PSRAM S16 stereo 环形队列 → **唯一 AudioTask**
+  转 S16 为左对齐 PCM32 → I2S 32-bit slot → CS43131 → 有线耳机/线路输出。
+  蓝牙回调不得直接写 I2S、访问 GUI 或 TF 卡。CS43131 音量/静音沿用
+  AudioTask 的现有安全流程。接收端启动时预缓冲约 40ms，并使用
+  I2S 8→6→4 个 DMA 描述符低内存回退，不能调整原有的 Hi-Fi 模式。
+- **互斥**：发射与接收绝不同时开启。进入接收时先停止本地 Music
+  /Video/NSF 并释放输出链；接收期间新本地播放请求拒绝抢占 DAC。
+  回到发射时先由 AudioTask 停止接收 I2S，再关闭 Sink 并恢复 Source。
+- **持久化**：模式切换成功后写入 device_cfg/btaudiorole（0=发射，1=接收）；
+  上电蓝牙服务按上次成功角色启动。BLE 手机遥控保持同一 GATT 协议。
+  **接收模式不含 AVRCP 控制手机曲目**：手机音乐播放/暂停/切歌仍由手机控制。
+- **停止/断开**：接收模式可点击“音频接收”断开当前手机；
+  或从手机 Bluetooth 设置断开。断开/暂停媒体后 AudioTask 释放 I2S DMA。
+- **首轮限制**：仅内部 SBC，常见 44.1/48kHz 立体声优先；
+  32kHz 可工作；16kHz 目前没有 DAC rate profile，返回不支持；
+  手机高品质 AAC 音频并未在本轮开启。
+- **已有 LVGL 修复**：实际运行恢复了 16 行 × 双 DMA 绘图缓冲，
+  不可把历史实验段落中关于单缓冲的文字理解为当前配置。
+
+测试顺序：
+
+1. **发射回归**：连接 MH-M18，播放本地 44.1kHz、96kHz FLAC，
+   确认 `AUDIO_ROUTE=BT_ONLY` / `A2DP_TX`、BLE 遥控和 LVGL 无横条。
+2. 设置 → 连接 → 蓝牙 → **音频接收**。观察
+   `A2DP_ROLE_SWITCH complete: RECEIVE`，手机搜索
+   `FakePod Audio`，并配对与播放音乐。
+3. 观察 `A2DP Sink connection state=2`、
+   `A2DP Sink audio STARTED`、`A2DP_RX`、
+   `BT_SINK_I2S ready` 和 `BT_SINK_OUTPUT: started`。
+   检查 DAC 有线声音、约 10 分钟稳定性、静音/音量、暂停/恢复、反复连接。
+4. 对比接收期间音乐、封面显示、打开设置页时的
+   `DMA_free` / `DMA_largest`。观察 PSRAM queue `drop` 有无持续上涨。
+5. 点击 **音频发射** 切回，重新连接 MH-M18，
+   验证先前的 Source 发射不受影响；重启核验成功角色持久化。
+6. 关闭/重新打开蓝牙、切换 Wi-Fi 再回来，确认 BLE/GATT、经典蓝牙
+   和 AudioTask 没有重复初始化、Crash 或 SDMMC DMA 错误。
+
+**状态：已提交源码，未完成编译/实机验收。** 蓝牙 Sink 使用当前 ESP-IDF
+release/v6.1 的 legacy 内部 SBC PCM callback；后续实机日志用于收敛延迟、
+低内存档以及手机兼容性。
+
+---
+
+### 实验：蓝牙耳机专用 Music PCM 通路（绕过 I2S/CS43131）
+
+目标：保留 BLE 手机遥控 + Bluedroid Classic A2DP Source；只在蓝牙耳机播放 Music
+时停止使用 I2S DMA/CS43131 playback path。没有连接蓝牙耳机时保持原有的有线 Hi-Fi 路径。
+
+新的 AudioTask 选择规则：
+
+- A2DP Profile 已就绪且耳机已连接：新 Music Play/SEEK 创建 decoder 后，直接启用
+  `AUDIO_ROUTE=BT_ONLY`，**不调用** `cs43131_prepare_pcm_playback_32bit()` /
+  `i2s_new_channel()` / `i2s_channel_init_std_mode()`。Codec boot init 仍保留，
+  但 DAC playback/ASP/headphone 均不启动。
+- 没有已连接耳机：默认 `AUDIO_ROUTE=I2S_DAC`。保持普通 I2S/CS43131 播放，
+  包括原生高采样率 96kHz 的硬件播放配置。
+- 有线 Music 播放中耳机才连接且 A2DP 进入 `STARTED`：先按原有 anti-pop 流程
+  停止 I2S/DAC，再原位切到 BT-only，不重新打开文件或把 decoder 进度归零。
+- BT-only PCM：原生解码 `PCM32` -> 软件音量/重采样（A2DP 协商频率，
+  通常 44.1kHz / S16 stereo）-> A2DP PSRAM ring -> SBC -> 蓝牙耳机。
+  96kHz FLAC 不再为本地 DAC 申请 26×256 的 I2S DMA。
+- BT-only 不依赖 I2S block 的自然限速：从 BT 回调更新的 `queued_frames` 读取水位，
+  约 85ms 后让 AudioTask 睡眠 2ms，避免 CPU 抢跑导致持续丢帧；
+  ring 本身仍保留原 120ms 上限。
+- BT-only Pause：最多等待 250ms 让已入队 PCM 排空，然后清队列并暂停；
+  Resume：清队列、重新淡入，不调用 CS43131/I2S。
+  Seek：复用现有的有界重建逻辑并清空旧 A2DP 队列。
+  EOF：最多等待 250ms 排空已提交给 A2DP 的 PCM，再释放 decoder。
+- 若耳机在 BT-only 播放中断开，不伪造进度也不冒险直接重建 96kHz I2S；
+  当前曲目进入错误状态，重新连接耳机后按播放键重启，
+  或先断开耳机再重新播放以选择有线模式。
+- A2DP 已 CONNECTED 但尚未 STARTED 时等待最多 8 秒，期间不解码推进曲目；
+  超时进入错误状态，避免无声无限播放。
+- Video / NSF 临时独占 Music 硬件时，不再为已暂停的 BT-only Music
+  错误创建一条有线 Music I2S 恢复链。它们各自的有线 I2S 输出保持现状。
+
+重新同步及烧录：
+
+```powershell
+git switch feat/a2dp-source-ble-remote
+git pull --ff-only
+pio run -e fakepod_s31 -t clean
+pio run -e fakepod_s31 -t upload
+pio device monitor -e fakepod_s31
+```
+
+验证：
+
+1. 保持 BLE 开启，手机端连接并订阅通知；在设置页扫描/连接 MH-M18，
+   等日志 A2DP `connection state=2`、`audio STARTED`。
+2. 播放 44.1kHz FLAC；应看到 `AUDIO_ROUTE=BT_ONLY`，
+   **不应**出现本曲 `Music I2S DMA档` 或 `PCM硬件链路已开启`。
+3. 切换到 96kHz/24-bit FLAC（例 Craig David - 7 Days），
+   检查 `AUDIO_ROUTE=BT_ONLY: bypass I2S/CS43131 rate=96000`，
+   不应出现 `I2S_BT_DMA` 分配日志，也不应出现 `jpeg` 内存崩溃。
+4. 检查 A2DP_TX：`queued` 稳定、`drop` 不连续增加、
+   播放期间 `underrun` 不快速上涨；对比此前播放时的 DMA_free/DMA_largest。
+5. 测试手机 BLE 的暂停/恢复、上一曲/下一曲、音量、SEEK，
+   并连续播放三分钟；同时检查蓝牙耳机有无卡顿、爆音、延迟异常。
+6. 再断开蓝牙耳机后重播，验证有线 I2S 路径仍正常；
+   还需验证有线播放中连接 A2DP 时的运行中切换。
+
+说明：这是源码已提交的首轮实验实现，尚无本机编译/真实设备验证。
+
+---
 ### 修复96kHz播放时JPEG硬件驱动内存失败引发Core1崩溃
 
 2026-11-21 14:10 新日志：第一个96kHz/24bit FLAC在BTDM模式下成功以14×256

@@ -248,7 +248,7 @@ static uint32_t g_te_animation_bypass_count = 0U;
 // This trades potential render/transfer overlap for audio DMA headroom without
 // doubling the number of QSPI strips as an 8-line dual-buffer would.
 static constexpr uint32_t kLvglDmaBufferLines = 16U;
-static constexpr bool kLvglDoubleBuffer = false;
+static constexpr bool kLvglDoubleBuffer = true;
 
 static void ui_display_flush_sync_event_cb(lv_event_t *event)
 {

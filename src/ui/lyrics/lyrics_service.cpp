@@ -749,7 +749,8 @@ static esp_err_t lyrics_parse_utf8_lrc(
         heap_caps_free(text_pool);
         return ESP_ERR_NO_MEM;
     }
-    memset(rows, 0, timestamp_count * sizeof(LyricsLineRow));
+    // Initialize default-valued C++ records within the existing PSRAM buffer.
+    std::fill_n(rows, timestamp_count, LyricsLineRow{});
     text_pool[0] = '\0';
     uint32_t text_used = 1U;
     uint32_t row_used = 0U;

@@ -19,6 +19,7 @@
 #include "battery_service.h"
 #include "ble_remote_service.h"
 #include "bt_audio_source.h"
+#include "bt_audio_sink.h"
 #include "device_settings.h"
 #include "font/font_manager.h"
 #include "font/usb_service_font.h"
@@ -86,6 +87,7 @@ static constexpr int32_t kDetailScrollbarMinThumbHeight = 36;
 enum class SettingsPage : uint8_t {
     Main = 0,
     Connection,
+    Bluetooth,
     Applications,
     MusicPlayer,
     ElectronicFlow,
@@ -164,7 +166,7 @@ static bool g_controls_auto_hide_dirty = false;
 static uint8_t g_nsf_gain_saved_db = 3U;
 static uint8_t g_nsf_gain_pending_db = 3U;
 static bool g_nsf_gain_dirty = false;
-static int32_t g_detail_saved_scroll_y[7] = {};
+static int32_t g_detail_saved_scroll_y[8] = {};
 static int32_t g_detail_scroll_y = 0;
 static int32_t g_detail_scroll_max_y = 0;
 static int32_t g_detail_drag_start_scroll_y = 0;
@@ -217,6 +219,7 @@ static const char *page_title(SettingsPage page)
     switch (page) {
         case SettingsPage::Main: return "设置";
         case SettingsPage::Connection: return "连接";
+        case SettingsPage::Bluetooth: return "蓝牙";
         case SettingsPage::Applications: return "应用";
         case SettingsPage::MusicPlayer: return "音乐播放器";
         case SettingsPage::ElectronicFlow: return "电子音流";
@@ -243,6 +246,8 @@ static SettingsPage parent_page(SettingsPage page)
         case SettingsPage::MusicPlayer:
         case SettingsPage::ElectronicFlow:
             return SettingsPage::Applications;
+        case SettingsPage::Bluetooth:
+            return SettingsPage::Connection;
         case SettingsPage::Connection:
         case SettingsPage::Applications:
         case SettingsPage::System:
@@ -268,7 +273,7 @@ static void clear_detail_value_refs()
 static size_t settings_page_index(SettingsPage page)
 {
     const size_t index = static_cast<size_t>(page);
-    return index < 7U ? index : 0U;
+    return index < 8U ? index : 0U;
 }
 
 static lv_obj_t *detail_parent()
@@ -346,7 +351,8 @@ static void detail_apply_scroll_y(int32_t y)
 static uint16_t detail_row_count_for_page(SettingsPage page)
 {
     switch (page) {
-        case SettingsPage::Connection: return 7U;
+        case SettingsPage::Connection: return 6U;
+        case SettingsPage::Bluetooth: return 5U;
         case SettingsPage::Applications: return 5U;
         case SettingsPage::MusicPlayer: return 5U;
         case SettingsPage::ElectronicFlow: return 1U;
@@ -1651,7 +1657,7 @@ static void format_ble_mode_value(const BleRemoteSnapshot &ble, char *out, size_
 
 static void bluetooth_switch_click_cb(lv_event_t *event)
 {
-    if (!click_is_valid(event) || g_page != SettingsPage::Connection) return;
+    if (!click_is_valid(event) || g_page != SettingsPage::Bluetooth) return;
 
     DeviceSettingsSnapshot settings = {};
     if (!device_settings_get_snapshot(&settings)) return;
@@ -1729,7 +1735,7 @@ static void format_bt_audio_value(char *out, size_t cap)
     BtAudioSourceSnapshot s = {};
     (void)bt_audio_source_get_snapshot(&s);
     if (!s.available) snprintf(out, cap, "不支持");
-    else if (!s.initialized) snprintf(out, cap, "需先开启蓝牙");
+    else if (!s.initialized) snprintf(out, cap, "未启动");
     else if (s.streaming) snprintf(out, cap, "播放中·%s", s.peer_name);
     else if (s.connected) snprintf(out, cap, "已连接·%s", s.peer_name);
     else if (s.connecting) snprintf(out, cap, "正在连接");
@@ -1740,7 +1746,7 @@ static void format_bt_audio_value(char *out, size_t cap)
 
 static void bluetooth_audio_click_cb(lv_event_t *event)
 {
-    if (!click_is_valid(event) || g_page != SettingsPage::Connection) return;
+    if (!click_is_valid(event) || g_page != SettingsPage::Bluetooth) return;
     BtAudioSourceSnapshot s = {};
     (void)bt_audio_source_get_snapshot(&s);
     if (!s.available) {
@@ -1765,10 +1771,86 @@ static void bluetooth_audio_click_cb(lv_event_t *event)
         ESP_LOGW(TAG, "蓝牙音频操作失败：%s", esp_err_to_name(ret));
         ui_common_show_notice("蓝牙音频操作失败", "请检查耳机是否进入配对模式");
     }
-    if (g_detail_values[6] != nullptr) {
+    if (g_detail_values[2] != nullptr) {
         char value[72] = {};
         format_bt_audio_value(value, sizeof(value));
-        lv_label_set_text(g_detail_values[6], value);
+        lv_label_set_text(g_detail_values[2], value);
+    }
+}
+
+// The Connection menu contains a single Bluetooth entrance. Its child page
+// exposes independent A2DP direction choices and the BLE GATT remote status.
+static void bluetooth_settings_click_cb(lv_event_t *event)
+{
+    if (!click_is_valid(event) || g_page != SettingsPage::Connection) return;
+    g_pending_page = SettingsPage::Bluetooth;
+    lv_async_call(show_page_async, nullptr);
+}
+
+static void format_bt_sink_value(char *out, size_t cap)
+{
+    if (out == nullptr || cap == 0U) return;
+    BleRemoteSnapshot ble = {};
+    (void)ble_remote_service_get_snapshot(&ble);
+    if (ble.audio_role_switching) {
+        snprintf(out, cap, "切换中");
+        return;
+    }
+    if (ble.audio_role != DeviceBluetoothAudioRole::Receive) {
+        snprintf(out, cap, "点击切换");
+        return;
+    }
+    BtAudioSinkSnapshot sink = {};
+    (void)bt_audio_sink_get_snapshot(&sink);
+    if (!sink.initialized) snprintf(out, cap, "启动中");
+    else if (sink.streaming) snprintf(out, cap, "手机播放中");
+    else if (sink.connected) snprintf(out, cap, "手机已连接");
+    else snprintf(out, cap, "等待手机配对");
+}
+
+static void bluetooth_transmit_click_cb(lv_event_t *event)
+{
+    if (!click_is_valid(event) || g_page != SettingsPage::Bluetooth) return;
+    BleRemoteSnapshot ble = {};
+    if (!ble_remote_service_get_snapshot(&ble) ||
+        !ble.stack_initialized || ble.audio_role_switching) {
+        ui_common_show_notice("蓝牙未就绪", "请先开启蓝牙服务，等待启动完成");
+        return;
+    }
+    if (ble.audio_role != DeviceBluetoothAudioRole::Transmit) {
+        if (ble_remote_service_request_audio_role(DeviceBluetoothAudioRole::Transmit)) {
+            ui_common_show_notice("切换蓝牙音频发射", "正在切换：FakePod → 耳机／音箱");
+        }
+        return;
+    }
+    bluetooth_audio_click_cb(event);
+}
+
+static void bluetooth_receive_click_cb(lv_event_t *event)
+{
+    if (!click_is_valid(event) || g_page != SettingsPage::Bluetooth) return;
+    BleRemoteSnapshot ble = {};
+    if (!ble_remote_service_get_snapshot(&ble) ||
+        !ble.stack_initialized || ble.audio_role_switching) {
+        ui_common_show_notice("蓝牙未就绪", "请先开启蓝牙服务，等待启动完成");
+        return;
+    }
+    if (ble.audio_role != DeviceBluetoothAudioRole::Receive) {
+        if (ble_remote_service_request_audio_role(DeviceBluetoothAudioRole::Receive)) {
+            ui_common_show_notice("切换蓝牙音频接收", "手机 → FakePod → 有线耳机／音箱");
+        }
+        return;
+    }
+    BtAudioSinkSnapshot sink = {};
+    (void)bt_audio_sink_get_snapshot(&sink);
+    if (sink.connected) {
+        const esp_err_t ret = bt_audio_sink_disconnect_peer();
+        if (ret != ESP_OK) {
+            ui_common_show_notice("断开手机失败", "请尝试从手机蓝牙设置断开");
+        }
+    } else {
+        ui_common_show_notice("等待手机连接",
+            "在手机蓝牙设置中搜索“FakePod Audio”并配对");
     }
 }
 
@@ -1961,16 +2043,8 @@ static void create_connection_page(const DeviceSettingsSnapshot &settings)
         "进入",
         SettingsDetailIcon::TfFiles,
         usb_tf_storage_enter_click_cb);
-    BleRemoteSnapshot ble = {};
-    char ble_value[48] = {};
-    if (settings.bluetooth_mode == DeviceBluetoothMode::Off) {
-        snprintf(ble_value, sizeof(ble_value), "%s", "关闭");
-    } else if (ble_remote_service_get_snapshot(&ble)) {
-        format_ble_mode_value(ble, ble_value, sizeof(ble_value));
-    } else {
-        snprintf(ble_value, sizeof(ble_value), "%s", device_settings_bluetooth_mode_name(settings.bluetooth_mode));
-    }
-    add_clickable_detail_row(2, "蓝牙模式", ble_value, SettingsDetailIcon::Bluetooth, bluetooth_switch_click_cb);
+    add_clickable_detail_row(2, "蓝牙", settings.ble_enabled ? "已开启" : "已关闭",
+                             SettingsDetailIcon::Bluetooth, bluetooth_settings_click_cb);
 
     WifiServiceSnapshot wifi = {};
     char wifi_value[64] = "关闭";
@@ -1992,10 +2066,41 @@ static void create_connection_page(const DeviceSettingsSnapshot &settings)
     add_clickable_detail_row(4, "NAS曲库更新", nas_value, SettingsDetailIcon::NasSync, nas_catalog_sync_click_cb);
     add_clickable_detail_row(5, "NAS服务器配对", "手机配置", SettingsDetailIcon::NasPair, nas_pair_click_cb);
 
-    char a2dp_value[72] = {};
-    format_bt_audio_value(a2dp_value, sizeof(a2dp_value));
-    add_clickable_detail_row(6, "蓝牙音频发射", a2dp_value,
-                             SettingsDetailIcon::Bluetooth, bluetooth_audio_click_cb);
+}
+
+static void create_bluetooth_page(const DeviceSettingsSnapshot &settings)
+{
+    BleRemoteSnapshot ble = {};
+    (void)ble_remote_service_get_snapshot(&ble);
+    add_clickable_detail_row(0, "蓝牙开关",
+        settings.ble_enabled ? "已开启" : "已关闭",
+        SettingsDetailIcon::Bluetooth, bluetooth_switch_click_cb);
+    char ble_value[64] = {};
+    if (!settings.ble_enabled) {
+        snprintf(ble_value, sizeof(ble_value), "已关闭");
+    } else {
+        format_ble_mode_value(ble, ble_value, sizeof(ble_value));
+    }
+    add_detail_row(1, "手机遥控", ble_value, SettingsDetailIcon::Bluetooth);
+
+    char tx_value[72] = {};
+    if (ble.audio_role_switching) snprintf(tx_value, sizeof(tx_value), "切换中");
+    else if (ble.audio_role != DeviceBluetoothAudioRole::Transmit)
+        snprintf(tx_value, sizeof(tx_value), "点击切换");
+    else format_bt_audio_value(tx_value, sizeof(tx_value));
+    add_clickable_detail_row(2, "音频发射", tx_value,
+        SettingsDetailIcon::Bluetooth, bluetooth_transmit_click_cb);
+
+    char rx_value[72] = {};
+    format_bt_sink_value(rx_value, sizeof(rx_value));
+    add_clickable_detail_row(3, "音频接收", rx_value,
+        SettingsDetailIcon::Bluetooth, bluetooth_receive_click_cb);
+
+    add_detail_row(4, "音频方向",
+        ble.audio_role_switching ? "正在切换" :
+        (ble.audio_role == DeviceBluetoothAudioRole::Receive
+            ? "手机→有线" : "本机→耳机"),
+        SettingsDetailIcon::AudioOutput);
 }
 
 static PlayerFolderScope player_folder_scope_from_setting(DeviceMusicListScope scope)
@@ -2649,6 +2754,7 @@ static void show_page(SettingsPage page)
     switch (page) {
         case SettingsPage::Main: create_main_page(); break;
         case SettingsPage::Connection: create_connection_page(settings); break;
+        case SettingsPage::Bluetooth: create_bluetooth_page(settings); break;
         case SettingsPage::Applications: create_applications_page(settings); break;
         case SettingsPage::MusicPlayer: create_music_player_page(settings); break;
         case SettingsPage::ElectronicFlow: create_electronic_flow_page(settings); break;
@@ -2736,26 +2842,9 @@ static void refresh_timer_cb(lv_timer_t *timer)
     if (g_page == SettingsPage::Connection) {
         DeviceSettingsSnapshot settings = {};
         if (!device_settings_get_snapshot(&settings)) return;
-
         if (g_detail_values[2] != nullptr) {
-            if (settings.bluetooth_mode == DeviceBluetoothMode::Off) {
-                lv_label_set_text(g_detail_values[2], "关闭");
-            } else {
-                BleRemoteSnapshot ble = {};
-                if (ble_remote_service_get_snapshot(&ble)) {
-                    char ble_value[64] = {};
-                    format_ble_mode_value(ble, ble_value, sizeof(ble_value));
-                    lv_label_set_text(g_detail_values[2], ble_value);
-                } else {
-                    lv_label_set_text(g_detail_values[2],
-                        device_settings_bluetooth_mode_name(settings.bluetooth_mode));
-                }
-            }
-        }
-        if (g_detail_values[6] != nullptr) {
-            char bt_value[72] = {};
-            format_bt_audio_value(bt_value, sizeof(bt_value));
-            lv_label_set_text(g_detail_values[6], bt_value);
+            lv_label_set_text(g_detail_values[2],
+                settings.ble_enabled ? "已开启" : "已关闭");
         }
 
         if (g_detail_values[3] != nullptr) {
@@ -2779,6 +2868,40 @@ static void refresh_timer_cb(lv_timer_t *timer)
         if (g_detail_values[4] != nullptr) {
             format_nas_catalog_value(value, sizeof(value));
             lv_label_set_text(g_detail_values[4], value);
+        }
+    }
+    if (g_page == SettingsPage::Bluetooth) {
+        DeviceSettingsSnapshot settings = {};
+        if (!device_settings_get_snapshot(&settings)) return;
+        BleRemoteSnapshot ble = {};
+        (void)ble_remote_service_get_snapshot(&ble);
+        if (g_detail_values[0] != nullptr) {
+            lv_label_set_text(g_detail_values[0],
+                settings.ble_enabled ? "已开启" : "已关闭");
+        }
+        if (g_detail_values[1] != nullptr) {
+            char ble_value[64] = {};
+            if (!settings.ble_enabled) snprintf(ble_value, sizeof(ble_value), "已关闭");
+            else format_ble_mode_value(ble, ble_value, sizeof(ble_value));
+            lv_label_set_text(g_detail_values[1], ble_value);
+        }
+        if (g_detail_values[2] != nullptr) {
+            char tx_value[72] = {};
+            if (ble.audio_role_switching) snprintf(tx_value, sizeof(tx_value), "切换中");
+            else if (ble.audio_role != DeviceBluetoothAudioRole::Transmit)
+                snprintf(tx_value, sizeof(tx_value), "点击切换");
+            else format_bt_audio_value(tx_value, sizeof(tx_value));
+            lv_label_set_text(g_detail_values[2], tx_value);
+        }
+        if (g_detail_values[3] != nullptr) {
+            char rx_value[72] = {};
+            format_bt_sink_value(rx_value, sizeof(rx_value));
+            lv_label_set_text(g_detail_values[3], rx_value);
+        }
+        if (g_detail_values[4] != nullptr) {
+            lv_label_set_text(g_detail_values[4], ble.audio_role_switching
+                ? "正在切换" : (ble.audio_role == DeviceBluetoothAudioRole::Receive
+                    ? "手机→有线" : "本机→耳机"));
         }
     }
     if (g_page == SettingsPage::About) {

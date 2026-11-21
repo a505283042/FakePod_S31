@@ -18,6 +18,10 @@ esp_err_t i2s_output_stream_start_32bit(uint32_t sample_rate_hz);
 // standard 96kHz 26x256 profile when Bluetooth is off.
 esp_err_t i2s_output_stream_start_32bit_bt_coexist(uint32_t sample_rate_hz);
 
+// A2DP Sink PCM playback uses its own conservative 8/6/4 descriptor
+// fallback; do not change ordinary wired Music or Video I2S profiles.
+esp_err_t i2s_output_stream_start_32bit_bt_sink(uint32_t sample_rate_hz);
+
 // NSF 专用稳定档：固定 16×256，避免普通 Music 降低 DMA 后影响电子音流渲染余量。
 esp_err_t i2s_output_stream_start_32bit_nsf(uint32_t sample_rate_hz);
 

@@ -18,6 +18,12 @@ enum class DeviceBluetoothMode : uint8_t {
     Controller,
 };
 
+// Classic A2DP role, independent of the BLE GATT phone remote switch.
+enum class DeviceBluetoothAudioRole : uint8_t {
+    Transmit = 0, // FakePod music -> Bluetooth headphones/speaker
+    Receive,      // Phone music -> FakePod -> wired CS43131 DAC
+};
+
 enum class DeviceAudioOutputMode : uint8_t {
     NormalHeadphones = 0,
     LineOut,
@@ -73,6 +79,7 @@ struct DeviceSettingsSnapshot {
     DeviceUsbMode usb_mode = DeviceUsbMode::Serial;
     bool ble_enabled = true;
     DeviceBluetoothMode bluetooth_mode = DeviceBluetoothMode::PhoneRemote;
+    DeviceBluetoothAudioRole bluetooth_audio_role = DeviceBluetoothAudioRole::Transmit;
     bool wifi_enabled = false;
     DeviceAudioOutputMode audio_output_mode = DeviceAudioOutputMode::NormalHeadphones;
     uint8_t brightness_level = 60U;          // CO5300 正常显示亮度 5~100%；0 保留给熄屏。
@@ -106,6 +113,7 @@ DeviceMusicListScope device_settings_music_list_scope();
 esp_err_t device_settings_set_usb_mode(DeviceUsbMode mode);
 esp_err_t device_settings_set_ble_enabled(bool enabled);
 esp_err_t device_settings_set_bluetooth_mode(DeviceBluetoothMode mode);
+esp_err_t device_settings_set_bluetooth_audio_role(DeviceBluetoothAudioRole role);
 // 原子保存互斥无线意图：允许 BLE/Wi-Fi 都关闭，但不允许同时开启。
 esp_err_t device_settings_set_wireless_enabled(bool ble_enabled, bool wifi_enabled);
 esp_err_t device_settings_set_audio_output_mode(DeviceAudioOutputMode mode);

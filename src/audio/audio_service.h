@@ -12,6 +12,10 @@ enum class AudioOutputMode : uint8_t {
     LineOut,
 };
 
+// 蓝牙接收模式：手机 A2DP PCM -> PSRAM Ring -> AudioTask -> CS43131/I2S。
+ // 切换命令由非 LVGL 的蓝牙控制任务同步提交，和普通Music/Video/NSF互斥。
+bool audio_service_bluetooth_sink_set_enabled(bool enabled, bool wait = true);
+
 // 启动唯一的 AudioTask。运行期所有 DAC/I2S 控制都必须由该任务执行。
 esp_err_t audio_service_start();
 

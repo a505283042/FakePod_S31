@@ -11,6 +11,7 @@
 #include "freertos/task.h"
 #include "audio_service.h"
 #include "bt_audio_source.h"
+#include "bt_audio_sink.h"
 #include "app/app_manager.h"
 #include "battery_service.h"
 #include "media_catalog_v2.h"
@@ -71,6 +72,11 @@ static DeviceBluetoothMode g_active_mode = DeviceBluetoothMode::Off;
 static bool g_stack_initialized = false;
 static bool g_connected = false;
 static bool g_transition_running = false;
+// Classic A2DP role is mutually exclusive but BLE GATT stays active.
+static DeviceBluetoothAudioRole g_audio_role_target = DeviceBluetoothAudioRole::Transmit;
+static DeviceBluetoothAudioRole g_audio_role_active = DeviceBluetoothAudioRole::Transmit;
+static bool g_audio_role_switching = false;
+static esp_err_t g_audio_role_last_error = ESP_OK;
 static BleRemoteState g_state = BleRemoteState::Disabled;
 static esp_err_t g_last_error = ESP_OK;
 static TickType_t g_retry_due_tick = 0;
@@ -2026,7 +2032,9 @@ static esp_err_t stop_stack()
     }
 #endif
 
-    // A2DP Source 与 BLE 共用同一个 Host，必须先释放 A2DP Profile。
+    // Release AudioTask's wired DAC before either A2DP profile is destroyed.
+    (void)audio_service_bluetooth_sink_set_enabled(false, true);
+    bt_audio_sink_host_stop();
     bt_audio_source_host_stop();
 
     // Bluedroid 关闭顺序：注销 GATT 应用 → 关闭 Host → 关闭控制器。
@@ -2167,10 +2175,41 @@ static esp_err_t start_stack()
         return ESP_FAIL;
     }
 
-    set_startup_stage(5U, "a2dp_source_init");
-    const esp_err_t a2dp_ret = bt_audio_source_host_start();
+    DeviceBluetoothAudioRole wanted_role = DeviceBluetoothAudioRole::Transmit;
+    portENTER_CRITICAL(&g_lock);
+    wanted_role = g_audio_role_target;
+    portEXIT_CRITICAL(&g_lock);
+    set_startup_stage(5U, wanted_role == DeviceBluetoothAudioRole::Receive
+        ? "a2dp_sink_init" : "a2dp_source_init");
+    esp_err_t a2dp_ret = wanted_role == DeviceBluetoothAudioRole::Receive
+        ? bt_audio_sink_host_start() : bt_audio_source_host_start();
+    if (a2dp_ret == ESP_OK && wanted_role == DeviceBluetoothAudioRole::Receive &&
+        !audio_service_bluetooth_sink_set_enabled(true, true)) {
+        bt_audio_sink_host_stop();
+        a2dp_ret = ESP_ERR_INVALID_STATE;
+    }
+    if (a2dp_ret != ESP_OK && wanted_role == DeviceBluetoothAudioRole::Receive) {
+        // Keep the existing transmitter usable if the new receiver fails
+        // during early boot. Do not leave the UI claiming RX is active.
+        ESP_LOGW(TAG, "A2DP接收启动失败：%s，启动原发射模式兜底",
+            esp_err_to_name(a2dp_ret));
+        bt_audio_sink_host_stop();
+        if (bt_audio_source_host_start() == ESP_OK) {
+            wanted_role = DeviceBluetoothAudioRole::Transmit;
+            portENTER_CRITICAL(&g_lock);
+            g_audio_role_target = wanted_role;
+            g_audio_role_last_error = a2dp_ret;
+            portEXIT_CRITICAL(&g_lock);
+            a2dp_ret = ESP_OK;
+        }
+    }
     if (a2dp_ret != ESP_OK) {
-        ESP_LOGW(TAG, "A2DP Source未启动：%s；保留BLE手机遥控", esp_err_to_name(a2dp_ret));
+        ESP_LOGW(TAG, "Classic A2DP Profile未启动：%s；保留BLE手机遥控",
+            esp_err_to_name(a2dp_ret));
+    } else {
+        portENTER_CRITICAL(&g_lock);
+        g_audio_role_active = wanted_role;
+        portEXIT_CRITICAL(&g_lock);
     }
 
     portENTER_CRITICAL(&g_lock);
@@ -2237,8 +2276,12 @@ static esp_err_t start_stack()
     esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &key_dist, sizeof(key_dist));
 
 #if CONFIG_BT_CLASSIC_ENABLED
-    // Classic A2DP 主动发现耳机；本机仍不接受 Classic 被动发现/连接。
-    if (esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE) != ESP_OK) {
+    // Receiver must be discoverable to phones. Transmitter discovers headsets
+    // actively; the BLE GATT name/advertising remains independent.
+    const bool receiver_mode = wanted_role == DeviceBluetoothAudioRole::Receive;
+    if (esp_bt_gap_set_scan_mode(
+            receiver_mode ? ESP_BT_CONNECTABLE : ESP_BT_NON_CONNECTABLE,
+            receiver_mode ? ESP_BT_GENERAL_DISCOVERABLE : ESP_BT_NON_DISCOVERABLE) != ESP_OK) {
         ESP_LOGW(TAG, "Classic扫描模式设置失败（不影响BLE遥控）");
     }
 #endif
@@ -2326,6 +2369,106 @@ static void transition_task(void *)
     vTaskDelete(nullptr);
 }
 
+// Run A2DP role switches on Core1, never on the LVGL or BT callback thread.
+// Only the Classic A2DP profile changes: controller + Bluedroid + BLE GATT
+// remain alive, retaining the phone remote's connection if one is present.
+static void audio_role_transition_task(void *)
+{
+#if FAKEPOD_BLE_FOUNDATION_ENABLED
+    DeviceBluetoothAudioRole target, previous;
+    portENTER_CRITICAL(&g_lock);
+    target = g_audio_role_target;
+    previous = g_audio_role_active;
+    portEXIT_CRITICAL(&g_lock);
+    ESP_LOGI(TAG, "A2DP_ROLE_SWITCH begin %s -> %s",
+        previous == DeviceBluetoothAudioRole::Receive ? "RECEIVE" : "TRANSMIT",
+        target == DeviceBluetoothAudioRole::Receive ? "RECEIVE" : "TRANSMIT");
+
+    esp_err_t ret = ESP_OK;
+    if (!audio_service_bluetooth_sink_set_enabled(false, true)) {
+        ret = ESP_ERR_INVALID_STATE;
+    }
+    if (ret == ESP_OK && !audio_service_stop(true)) {
+        ret = ESP_ERR_TIMEOUT;
+    }
+    if (ret == ESP_OK) {
+        if (previous == DeviceBluetoothAudioRole::Receive) {
+            bt_audio_sink_host_stop();
+        } else {
+            bt_audio_source_host_stop();
+        }
+        ret = target == DeviceBluetoothAudioRole::Receive
+            ? bt_audio_sink_host_start() : bt_audio_source_host_start();
+        if (ret == ESP_OK && target == DeviceBluetoothAudioRole::Receive &&
+            !audio_service_bluetooth_sink_set_enabled(true, true)) {
+            bt_audio_sink_host_stop();
+            ret = ESP_ERR_INVALID_STATE;
+        }
+    }
+    if (ret != ESP_OK) {
+        // On any failed switch, prefer restoring the previously verified role.
+        ESP_LOGE(TAG, "A2DP_ROLE_SWITCH failed: %s; restoring previous role",
+            esp_err_to_name(ret));
+        bt_audio_sink_host_stop();
+        bt_audio_source_host_stop();
+        const esp_err_t restore = previous == DeviceBluetoothAudioRole::Receive
+            ? bt_audio_sink_host_start() : bt_audio_source_host_start();
+        if (restore == ESP_OK && previous == DeviceBluetoothAudioRole::Receive)
+            (void)audio_service_bluetooth_sink_set_enabled(true, true);
+        portENTER_CRITICAL(&g_lock);
+        g_audio_role_target = previous;
+        g_audio_role_last_error = ret;
+        portEXIT_CRITICAL(&g_lock);
+    } else {
+        const esp_err_t save = device_settings_set_bluetooth_audio_role(target);
+        if (save != ESP_OK) {
+            ESP_LOGW(TAG, "A2DP角色已切换但未持久化：%s", esp_err_to_name(save));
+        }
+        portENTER_CRITICAL(&g_lock);
+        g_audio_role_active = target;
+        g_audio_role_last_error = save;
+        portEXIT_CRITICAL(&g_lock);
+        ESP_LOGI(TAG, "A2DP_ROLE_SWITCH complete: %s (BLE GATT preserved)",
+            target == DeviceBluetoothAudioRole::Receive ? "RECEIVE" : "TRANSMIT");
+    }
+    portENTER_CRITICAL(&g_lock);
+    g_audio_role_switching = false;
+    portEXIT_CRITICAL(&g_lock);
+#endif
+    vTaskDelete(nullptr);
+}
+
+static bool start_audio_role_transition_task()
+{
+#if FAKEPOD_BLE_FOUNDATION_ENABLED
+    portENTER_CRITICAL(&g_lock);
+    if (!g_ready || !g_stack_initialized || !g_desired_enabled ||
+        g_transition_running || g_audio_role_switching) {
+        portEXIT_CRITICAL(&g_lock);
+        return false;
+    }
+    if (g_audio_role_target == g_audio_role_active) {
+        portEXIT_CRITICAL(&g_lock);
+        return true;
+    }
+    g_audio_role_switching = true;
+    g_audio_role_last_error = ESP_OK;
+    portEXIT_CRITICAL(&g_lock);
+    const BaseType_t created = xTaskCreatePinnedToCore(
+        audio_role_transition_task, "bt_a2dp_role", 5120U,
+        nullptr, kTransitionTaskPriority, nullptr, kTransitionTaskCore);
+    if (created == pdPASS) return true;
+    portENTER_CRITICAL(&g_lock);
+    g_audio_role_switching = false;
+    g_audio_role_last_error = ESP_ERR_NO_MEM;
+    g_audio_role_target = g_audio_role_active;
+    portEXIT_CRITICAL(&g_lock);
+    return false;
+#else
+    return false;
+#endif
+}
+
 static bool start_transition_task(BleRemoteState state)
 {
     portENTER_CRITICAL(&g_lock);
@@ -2374,6 +2517,13 @@ esp_err_t ble_remote_service_init()
     g_last_error = ESP_OK;
     g_retry_due_tick = 0;
     g_startup_stage = 0;
+    DeviceSettingsSnapshot saved = {};
+    if (device_settings_get_snapshot(&saved)) {
+        g_audio_role_target = saved.bluetooth_audio_role;
+    }
+    g_audio_role_active = DeviceBluetoothAudioRole::Transmit;
+    g_audio_role_switching = false;
+    g_audio_role_last_error = ESP_OK;
 #if FAKEPOD_BLE_FOUNDATION_ENABLED
     set_state_locked(BleRemoteState::Disabled);
 #else
@@ -2385,7 +2535,9 @@ esp_err_t ble_remote_service_init()
     portEXIT_CRITICAL(&g_lock);
 
 #if FAKEPOD_BLE_FOUNDATION_ENABLED
-    ESP_LOGI(TAG, "BLE Foundation就绪：Bluedroid双模，BLE GATT遥控 + Classic A2DP Source，默认关闭");
+    ESP_LOGI(TAG,
+        "BLE Foundation就绪：Bluedroid双模、手机BLE遥控、Classic A2DP可切换发射/接收；当前首选=%s",
+        g_audio_role_target == DeviceBluetoothAudioRole::Receive ? "接收" : "发射");
     return ESP_OK;
 #else
     ESP_LOGW(TAG, "BLE Foundation代码已就绪，但 sdkconfig 尚未完整启用 Bluedroid BLE/GATT Server");
@@ -2440,12 +2592,26 @@ void ble_remote_service_set_mode(DeviceBluetoothMode mode)
     ESP_LOGI(TAG, "BLE工作模式：%s", device_settings_bluetooth_mode_name(mode));
 }
 
+bool ble_remote_service_request_audio_role(DeviceBluetoothAudioRole role)
+{
+    if (role != DeviceBluetoothAudioRole::Transmit &&
+        role != DeviceBluetoothAudioRole::Receive) return false;
+    portENTER_CRITICAL(&g_lock);
+    const bool allowed = g_ready && g_stack_initialized && g_desired_enabled &&
+        !g_transition_running && !g_audio_role_switching;
+    if (allowed) g_audio_role_target = role;
+    portEXIT_CRITICAL(&g_lock);
+    if (!allowed) return false;
+    return start_audio_role_transition_task();
+}
+
 void ble_remote_service_update()
 {
-    // A2DP 媒体握手独立推进，BLE GATT 广播/连接不因音乐状态改变。
+    // A2DP media handshake stays independent of BLE GATT.
     bt_audio_source_update();
+    bt_audio_sink_update();
     portENTER_CRITICAL(&g_lock);
-    if (!g_ready || g_transition_running) {
+    if (!g_ready || g_transition_running || g_audio_role_switching) {
         portEXIT_CRITICAL(&g_lock);
         return;
     }
@@ -2575,6 +2741,10 @@ bool ble_remote_service_get_snapshot(BleRemoteSnapshot *out_snapshot)
     out_snapshot->state = g_state;
     out_snapshot->last_error = g_last_error;
     out_snapshot->startup_stage = g_startup_stage;
+    out_snapshot->audio_role = g_audio_role_active;
+    out_snapshot->audio_role_target = g_audio_role_target;
+    out_snapshot->audio_role_switching = g_audio_role_switching;
+    out_snapshot->audio_role_last_error = g_audio_role_last_error;
     portEXIT_CRITICAL(&g_lock);
     return out_snapshot->ready;
 }
