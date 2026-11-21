@@ -137,7 +137,7 @@ choice，可能默认保持 BLE Only，结果 Bluedroid 同时启动 Classic 与
 `CONFIG_BTDM_CTRL_MODE_BTDM=y`，增加 `CONFIG_BT_CTRL_BREDR_ENABLE` 与
 双模模式的编译期检查，并把本分支 sdkconfig 改为独立的
 `sdkconfig.fakepod_s31_bt_dualmode`，确保从新的默认配置生成，不复用旧
-`sdkconfig.fakepod_s31_bt_dualmode` 或主线配置。
+`sdkconfig.fakepod_s31_a2dp` 或主线配置。
 
 更新后的实机测试命令：
 
