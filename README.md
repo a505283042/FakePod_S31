@@ -124,6 +124,38 @@
 
 ## 蓝牙音频发射 + 手机遥控共存（实验分支）
 
+### 修复“启动·使能Host”卡住：底层控制器未启用双模
+
+实机日志确定卡在 `BLE_START step=4 bluedroid_enable`，控制器初始化已成功。
+此前配置仅打开 `CONFIG_BT_CLASSIC_ENABLED`（Host）与
+`CONFIG_BT_A2DP_ENABLE`（Profile），但未设置独立的 **底层控制器工作模式**
+`CONFIG_BTDM_CTRL_MODE_BTDM=y`。ESP-IDF 6.1 的控制器模式是独立的 Kconfig
+choice，可能默认保持 BLE Only，结果 Bluedroid 同时启动 Classic 与 BLE 时卡在
+`esp_bluedroid_enable()` 的同步等待。这是目前最强的根因假设，仍待实机验证。
+
+已修复：在 `sdkconfig.bluetooth.defaults` 明确配置
+`CONFIG_BTDM_CTRL_MODE_BTDM=y`，增加 `CONFIG_BT_CTRL_BREDR_ENABLE` 与
+双模模式的编译期检查，并把本分支 sdkconfig 改为独立的
+`sdkconfig.fakepod_s31_bt_dualmode`，确保从新的默认配置生成，不复用旧
+`sdkconfig.fakepod_s31_bt_dualmode` 或主线配置。
+
+更新后的实机测试命令：
+
+```powershell
+git switch feat/a2dp-source-ble-remote
+git pull --ff-only
+pio run -e fakepod_s31 -t clean
+pio run -e fakepod_s31
+Select-String -Path .\sdkconfig.fakepod_s31_bt_dualmode -Pattern '^(CONFIG_BTDM_CTRL_MODE_BTDM=y|CONFIG_BT_CTRL_BREDR_ENABLE=y|CONFIG_BT_CLASSIC_ENABLED=y|CONFIG_BT_A2DP_ENABLE=y)'
+pio run -e fakepod_s31 -t upload
+pio device monitor -e fakepod_s31
+```
+
+正确生成配置必须同时包含 **四个 =y**。新日志应打印
+`BT_MODE: controller=3 expect_dual=3, host_classic=1, controller_bredr=1`。
+若仍卡在 `step=4`，需进一步检查 Bluedroid Host 的 BTU/BTC 任务、
+内部 RAM 余量与 HCI 初始化响应；仅增加启动超时无法解决同步阻塞。
+
 ### 修复蓝牙模式反复显示“启动中”（诊断增强）
 
 BLE 广播是异步流程。设备需依次完成 Controller 初始化、Bluedroid 初始化、
@@ -154,7 +186,7 @@ pio device monitor -e fakepod_s31
 这样 Android BLE 仍能正常“广播中”，但 A2DP Source 宏被编译为关闭，
 UI 就会显示“不支持”。
 
-本分支已将 `platformio.ini` 的 sdkconfig 文件切换为 **`sdkconfig.fakepod_s31_a2dp`**。
+本分支已将 `platformio.ini` 的 sdkconfig 文件切换为 **`sdkconfig.fakepod_s31_bt_dualmode`**。
 第一次重新构建会从 `sdkconfig.defaults;sdkconfig.bluetooth.defaults` 生成新的配置，
 不触碰主线原有的 `sdkconfig.fakepod_s31`，因此切回 `main` 也不影响原设置。
 同时增加编译期强制检查，若 Classic / A2DP / 内置 SBC 没有生效，编译会报错，
@@ -172,7 +204,7 @@ pio run -e fakepod_s31
 确认实际 SDK 配置：
 
 ```powershell
-Select-String -Path .\sdkconfig.fakepod_s31_a2dp -Pattern '^(CONFIG_BT_(BLUEDROID_ENABLED|CLASSIC_ENABLED|A2DP_ENABLE|BLE_ENABLED|GATTS_ENABLE)=y|# CONFIG_BT_A2DP_USE_EXTERNAL_CODEC is not set)'
+Select-String -Path .\sdkconfig.fakepod_s31_bt_dualmode -Pattern '^(CONFIG_BT_(BLUEDROID_ENABLED|CLASSIC_ENABLED|A2DP_ENABLE|BLE_ENABLED|GATTS_ENABLE)=y|# CONFIG_BT_A2DP_USE_EXTERNAL_CODEC is not set)'
 ```
 
 **正确结果应同时包含** `CONFIG_BT_CLASSIC_ENABLED=y`、`CONFIG_BT_A2DP_ENABLE=y`，
