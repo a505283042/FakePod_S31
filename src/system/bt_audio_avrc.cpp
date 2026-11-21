@@ -177,6 +177,7 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
                 s_snapshot.metadata_valid = false;
                 s_snapshot.duration_ms = 0U;
                 s_snapshot.position_ms = 0U;
+                s_position_tick = 0;
                 s_metadata_needed = true;
                 s_status_needed = true;
                 s_notifications_needed |= 0x02U;
