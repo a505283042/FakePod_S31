@@ -1810,16 +1810,7 @@ static void format_bt_sink_value(char *out, size_t cap)
     else snprintf(out, cap, "等待手机配对");
 }
 
-static const char *bluetooth_volume_sync_value()
-{
-    if (!bt_audio_avrc_is_sink_mode()) return "仅发射模式";
-    BtAudioAvrcSnapshot avrc = {};
-    (void)bt_audio_avrc_get_snapshot(&avrc);
-    if (!avrc.connected) return "未连接";
-    return avrc.absolute_volume_supported ? "已同步" : "未同步";
-}
-
-static void bluetooth_sink_codec_click_cb(lv_event_t *event)
+static void bluetooth_codec_click_cb(lv_event_t *event)
 {
     if (!click_is_valid(event) || g_page != SettingsPage::Bluetooth) return;
 #if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
@@ -1837,7 +1828,7 @@ static void bluetooth_sink_codec_click_cb(lv_event_t *event)
             : DeviceBluetoothSinkCodec::AutoAac;
     const esp_err_t ret = device_settings_set_bluetooth_sink_codec(next);
     if (ret != ESP_OK) {
-        ui_common_show_notice("保存接收编码失败", "请检查NVS状态");
+        ui_common_show_notice("保存音频编码失败", "请检查NVS状态");
         return;
     }
     if (g_detail_values[5] != nullptr) {
@@ -1845,20 +1836,19 @@ static void bluetooth_sink_codec_click_cb(lv_event_t *event)
             device_settings_bluetooth_sink_codec_name(next));
     }
 
-    // SEPs are fixed for the duration of an A2DP profile. When receiving,
-    // restart the Sink asynchronously using the existing A2DP role worker;
-    // when transmitting/offline, the setting applies next time Sink starts.
-    if (ble.audio_role == DeviceBluetoothAudioRole::Receive &&
+    // This preference is shared by transmitter and receiver. Re-register
+    // the active profile's SEPs; leave BLE GATT and phone remote untouched.
+    if (ble.audio_role != DeviceBluetoothAudioRole::Off &&
         ble.stack_initialized && !ble.audio_role_switching) {
-        if (ble_remote_service_restart_audio_sink()) {
-            ui_common_show_notice("接收编码已更改",
-                "蓝牙接收将重新启动，请在手机上重新连接");
+        if (ble_remote_service_restart_audio_profile()) {
+            ui_common_show_notice("音频编码已更改",
+                "蓝牙音频将重新启动，需要重新连接音频设备");
         } else {
-            ui_common_show_notice("接收编码已保存",
-                "蓝牙服务忙碌，下次进入接收模式时生效");
+            ui_common_show_notice("音频编码已保存",
+                "蓝牙服务忙碌，下次启动音频时生效");
         }
     } else {
-        ui_common_show_notice("接收编码已保存", "下次进入接收模式时生效");
+        ui_common_show_notice("音频编码已保存", "下次启动音频时生效");
     }
 #else
     ui_common_show_notice("固定SBC", "当前固件未启用AAC接收环境");
@@ -1868,10 +1858,6 @@ static void bluetooth_sink_codec_click_cb(lv_event_t *event)
 static void bluetooth_transmit_click_cb(lv_event_t *event)
 {
     if (!click_is_valid(event) || g_page != SettingsPage::Bluetooth) return;
-#if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
-    ui_common_show_notice("发射模式暂不支持", "AAC实验版仅支持手机音频接收；原SBC固件支持发射");
-    return;
-#endif
     BleRemoteSnapshot ble = {};
     if (!ble_remote_service_get_snapshot(&ble) ||
         !ble.stack_initialized || ble.audio_role_switching) {
@@ -1913,6 +1899,23 @@ static void bluetooth_receive_click_cb(lv_event_t *event)
         ui_common_show_notice("等待手机连接",
             "在手机蓝牙设置中搜索“FakePod Audio”并配对");
     }
+}
+
+static void bluetooth_remote_only_click_cb(lv_event_t *event)
+{
+    if (!click_is_valid(event) || g_page != SettingsPage::Bluetooth) return;
+    BleRemoteSnapshot ble = {};
+    if (!ble_remote_service_get_snapshot(&ble) ||
+        !ble.stack_initialized || ble.audio_role_switching) {
+        ui_common_show_notice("蓝牙未就绪", "请先开启蓝牙服务，等待启动完成");
+        return;
+    }
+    if (ble.audio_role == DeviceBluetoothAudioRole::Off) {
+        ui_common_show_notice("仅手机遥控", "音频收发均已关闭，BLE APP 遥控保持可用");
+        return;
+    }
+    if (ble_remote_service_request_audio_role(DeviceBluetoothAudioRole::Off))
+        ui_common_show_notice("切换仅手机遥控", "正在关闭音频收发，保留 BLE APP 遥控");
 }
 
 static void wifi_switch_click_cb(lv_event_t *event)
@@ -2145,16 +2148,10 @@ static void create_bluetooth_page(const DeviceSettingsSnapshot &settings)
     add_detail_row(1, "手机遥控", ble_value, SettingsDetailIcon::Bluetooth);
 
     char tx_value[72] = {};
-#if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
-    // External-codec Sink experiment has no matching external A2DP Source
-    // encoder yet; keep the TX row visible but accurately mark unavailable.
-    snprintf(tx_value, sizeof(tx_value), "暂不支持");
-#else
     if (ble.audio_role_switching) snprintf(tx_value, sizeof(tx_value), "切换中");
     else if (ble.audio_role != DeviceBluetoothAudioRole::Transmit)
         snprintf(tx_value, sizeof(tx_value), "点击切换");
     else format_bt_audio_value(tx_value, sizeof(tx_value));
-#endif
     add_clickable_detail_row(2, "音频发射", tx_value,
         SettingsDetailIcon::Bluetooth, bluetooth_transmit_click_cb);
 
@@ -2163,14 +2160,16 @@ static void create_bluetooth_page(const DeviceSettingsSnapshot &settings)
     add_clickable_detail_row(3, "音频接收", rx_value,
         SettingsDetailIcon::Bluetooth, bluetooth_receive_click_cb);
 
-    add_detail_row(4, "音量同步", bluetooth_volume_sync_value(),
-        SettingsDetailIcon::AudioOutput);
+    add_clickable_detail_row(4, "仅手机遥控",
+        ble.audio_role_switching ? "切换中" :
+        ble.audio_role == DeviceBluetoothAudioRole::Off ? "已启用" : "点击关闭音频",
+        SettingsDetailIcon::Bluetooth, bluetooth_remote_only_click_cb);
 #if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
-    add_clickable_detail_row(5, "接收编码",
+    add_clickable_detail_row(5, "音频编码",
         device_settings_bluetooth_sink_codec_name(settings.bluetooth_sink_codec),
-        SettingsDetailIcon::Bluetooth, bluetooth_sink_codec_click_cb);
+        SettingsDetailIcon::Bluetooth, bluetooth_codec_click_cb);
 #else
-    add_detail_row(5, "接收编码", "固定SBC", SettingsDetailIcon::Bluetooth, false);
+    add_detail_row(5, "音频编码", "固定SBC", SettingsDetailIcon::Bluetooth, false);
 #endif
 }
 
@@ -2958,14 +2957,10 @@ static void refresh_timer_cb(lv_timer_t *timer)
         }
         if (g_detail_values[2] != nullptr) {
             char tx_value[72] = {};
-#if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
-            snprintf(tx_value, sizeof(tx_value), "暂不支持");
-#else
             if (ble.audio_role_switching) snprintf(tx_value, sizeof(tx_value), "切换中");
             else if (ble.audio_role != DeviceBluetoothAudioRole::Transmit)
                 snprintf(tx_value, sizeof(tx_value), "点击切换");
             else format_bt_audio_value(tx_value, sizeof(tx_value));
-#endif
             lv_label_set_text(g_detail_values[2], tx_value);
         }
         if (g_detail_values[3] != nullptr) {
@@ -2975,8 +2970,8 @@ static void refresh_timer_cb(lv_timer_t *timer)
         }
         if (g_detail_values[4] != nullptr) {
             lv_label_set_text(g_detail_values[4],
-                ble.audio_role_switching ? "正在切换" :
-                bluetooth_volume_sync_value());
+                ble.audio_role_switching ? "切换中" :
+                ble.audio_role == DeviceBluetoothAudioRole::Off ? "已启用" : "点击关闭音频");
         }
         if (g_detail_values[5] != nullptr) {
 #if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC

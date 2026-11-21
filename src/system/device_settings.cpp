@@ -273,7 +273,7 @@ esp_err_t device_settings_init()
         g_settings.bluetooth_mode = static_cast<DeviceBluetoothMode>(u8);
         g_settings.ble_enabled = g_settings.bluetooth_mode != DeviceBluetoothMode::Off;
     }
-    if (nvs_get_u8(handle, "btaudiorole", &u8) == ESP_OK && u8 <= 1U) {
+    if (nvs_get_u8(handle, "btaudiorole", &u8) == ESP_OK && u8 <= 2U) {
         g_settings.bluetooth_audio_role = static_cast<DeviceBluetoothAudioRole>(u8);
     }
     if (nvs_get_u8(handle, "btaacpref", &u8) == ESP_OK && u8 <= 1U) {
@@ -505,7 +505,7 @@ esp_err_t device_settings_set_bluetooth_mode(DeviceBluetoothMode mode)
 
 esp_err_t device_settings_set_bluetooth_audio_role(DeviceBluetoothAudioRole role)
 {
-    if (static_cast<uint8_t>(role) > 1U || !g_settings.ready)
+    if (static_cast<uint8_t>(role) > 2U || !g_settings.ready)
         return ESP_ERR_INVALID_ARG;
     const esp_err_t ret = commit_u8("btaudiorole", static_cast<uint8_t>(role));
     if (ret == ESP_OK) g_settings.bluetooth_audio_role = role;

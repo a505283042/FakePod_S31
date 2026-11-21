@@ -18,7 +18,7 @@ enum class DeviceBluetoothMode : uint8_t {
     Controller,
 };
 
-// A2DP Sink codec advertisement preference (not a guarantee of peer choice).
+// Shared A2DP Source/Sink codec preference (actual codec is negotiated with the peer).
 // A2DP keeps SBC mandatory; an AAC-only mode cannot be advertised.
 enum class DeviceBluetoothSinkCodec : uint8_t {
     AutoAac = 0, // AAC-LC preferred, mandatory SBC fallback.
@@ -29,6 +29,7 @@ enum class DeviceBluetoothSinkCodec : uint8_t {
 enum class DeviceBluetoothAudioRole : uint8_t {
     Transmit = 0, // FakePod music -> Bluetooth headphones/speaker
     Receive,      // Phone music -> FakePod -> wired CS43131 DAC
+    Off,          // Keep BLE phone remote connected, but no A2DP profile.
 };
 
 enum class DeviceAudioOutputMode : uint8_t {
