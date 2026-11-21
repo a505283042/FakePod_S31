@@ -3728,6 +3728,7 @@ static void audio_task_handle_video_mp3_release_start(AudioRequest *request)
 
 static void audio_task_handle_video_mp3_pause(AudioRequest *request)
 {
+    bt_audio_source_flush();
     if (request == nullptr) return;
     g_task_last_request_id = request->request_id;
     if (!g_video_mp3_active || !mp3_decoder_is_open(&g_video_mp3_decoder)) {
@@ -3770,6 +3771,7 @@ static void audio_task_handle_video_mp3_resume(AudioRequest *request)
 
 static void audio_task_handle_video_mp3_seek(AudioRequest *request)
 {
+    bt_audio_source_flush();
     if (request == nullptr) return;
     g_task_last_request_id = request->request_id;
     if (!g_video_mp3_active || !mp3_decoder_is_open(&g_video_mp3_decoder) ||
@@ -3839,6 +3841,7 @@ static void audio_task_handle_video_mp3_seek(AudioRequest *request)
 
 static void audio_task_handle_video_mp3_stop(AudioRequest *request)
 {
+    bt_audio_source_flush();
     if (request == nullptr) return;
     g_task_last_request_id = request->request_id;
     const esp_err_t ret = audio_task_stop_video_mp3_internal(true, "video_stop_command");
@@ -5280,6 +5283,7 @@ static void audio_task_handle_nsf_start(AudioRequest *request)
 
 static void audio_task_handle_nsf_pause(AudioRequest *request)
 {
+    bt_audio_source_flush();
     if (request == nullptr) return;
     g_task_last_request_id = request->request_id;
     if (!g_nsf_active || g_nsf_paused || g_nsf_eof || g_nsf_failed) {
@@ -5317,6 +5321,7 @@ static void audio_task_handle_nsf_resume(AudioRequest *request)
 
 static void audio_task_handle_nsf_set_track(AudioRequest *request)
 {
+    bt_audio_source_flush();
     if (request == nullptr) return;
     g_task_last_request_id = request->request_id;
     if (!g_nsf_active || !nsf_apu_renderer_is_open(&g_nsf_renderer) ||
@@ -5391,6 +5396,7 @@ static void audio_task_handle_nsf_set_track(AudioRequest *request)
 
 static void audio_task_handle_nsf_stop(AudioRequest *request)
 {
+    bt_audio_source_flush();
     if (request == nullptr) return;
     g_task_last_request_id = request->request_id;
     const esp_err_t ret = audio_task_stop_nsf_internal(
@@ -5606,6 +5612,7 @@ static PcmDecoderType audio_decoder_type_for_format(MediaFormat format)
 
 static void audio_task_handle_play(AudioRequest *request)
 {
+    bt_audio_source_flush(); // 新曲目开始前清除上首歌的蓝牙延迟帧。
     // 新 Music Play 覆盖任何尚未恢复的临时音源深度挂起上下文。
     audio_task_release_music_deep_suspend_context();
     if (g_video_mp3_active || mp3_decoder_is_open(&g_video_mp3_decoder)) {
@@ -5814,6 +5821,7 @@ static esp_err_t audio_task_fast_seek_flac(
 
 static void audio_task_handle_seek(AudioRequest *request)
 {
+    bt_audio_source_flush();
     if (request == nullptr) {
         return;
     }
@@ -6015,6 +6023,7 @@ static void audio_task_handle_seek(AudioRequest *request)
 
 static void audio_task_handle_stop(AudioRequest *request)
 {
+    bt_audio_source_flush();
     g_task_last_request_id = request->request_id;
     audio_task_release_music_deep_suspend_context();
     if (g_video_mp3_active || mp3_decoder_is_open(&g_video_mp3_decoder)) {
@@ -6059,6 +6068,7 @@ static bool audio_task_request_matches_playback_context(const AudioRequest *requ
 
 static void audio_task_handle_pause(AudioRequest *request)
 {
+    bt_audio_source_flush();
     g_task_last_request_id = request->request_id;
     // Pause 不是 transport intent，但必须绑定提交时的歌曲世代。否则切歌后的旧 Pause
     // 可能排在新 Play 后执行，把刚启动的新歌误暂停。
