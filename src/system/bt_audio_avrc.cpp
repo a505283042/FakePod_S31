@@ -6,6 +6,7 @@
 
 #include "audio_service.h"
 #include "bt_phone_cover.h"
+#include "bt_avrc_cover_descriptor.h"
 #include "ui/artwork/cover_surface_cache.h"
 #include "sdkconfig.h"
 #include "esp_avrc_api.h"
@@ -70,6 +71,10 @@ static CoverStep s_cover_active_step = CoverStep::Properties;
 static bool s_cover_discard_active = false; // Track changed during previous BIP request.
 static bool s_cover_bad_data = false;
 static size_t s_cover_rx_bytes = 0U;
+// GetImageProperties is XML, not the JPEG. Keep it separately, bounded, and
+// convert its advertised JPEG representation into the required Image Descriptor.
+static char s_cover_properties[768] = {};
+static size_t s_cover_properties_len = 0U;
 static uint8_t s_cover_thumbnail_retries = 0U;
 static uint8_t s_cover_connect_attempts = 0U;
 static TickType_t s_cover_due = 0U;
@@ -210,6 +215,8 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
         s_cover_discard_active = false;
         s_cover_bad_data = false;
         s_cover_rx_bytes = 0U;
+        s_cover_properties_len = 0U;
+        s_cover_properties[0] = '\0';
         s_cover_thumbnail_retries = 0U;
         s_cover_connect_attempts = 0U;
         s_cover_due = s_cover_started = s_cover_last_data = 0U;
@@ -279,6 +286,8 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
                     s_cover_handle_requested = false;
                     s_cover_epoch = cover_epoch;
                     s_cover_step = CoverStep::Properties;
+                    s_cover_properties_len = 0U;
+                    s_cover_properties[0] = '\0';
                     s_cover_thumbnail_retries = 0U;
                     s_cover_due = 0U;
                     // Do not overlap a new BIP operation with a previous song.
@@ -353,6 +362,8 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
                 if (s_cover_fetching) s_cover_discard_active = true;
                 s_cover_handle_requested = false;
                 s_cover_step = CoverStep::Properties;
+                s_cover_properties_len = 0U;
+                s_cover_properties[0] = '\0';
                 s_cover_thumbnail_retries = 0U;
                 s_cover_epoch = cover_epoch;
 #endif
@@ -429,6 +440,18 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
         if (expected) {
             s_cover_last_data = now;
             s_cover_rx_bytes += data.data_len;
+            if (!discard && step == CoverStep::Properties && !s_cover_bad_data &&
+                data.status == ESP_BT_STATUS_SUCCESS) {
+                if (data.data_len != 0U && data.p_data != nullptr &&
+                    s_cover_properties_len + data.data_len < sizeof(s_cover_properties)) {
+                    memcpy(s_cover_properties + s_cover_properties_len,
+                        data.p_data, data.data_len);
+                    s_cover_properties_len += data.data_len;
+                    s_cover_properties[s_cover_properties_len] = '\0';
+                } else if (data.data_len != 0U) {
+                    s_cover_bad_data = true;
+                }
+            }
         }
         portEXIT_CRITICAL(&s_lock);
         if (!expected) break;
@@ -461,6 +484,16 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
                 cover_step_name(step), final_good ? 1U : 0U,
                 static_cast<unsigned>(total_bytes), discard ? 1U : 0U,
                 static_cast<unsigned>(data.status));
+            if (step == CoverStep::Properties && !discard && final_good) {
+                // Visible in diagnostic logs; enables validating what the
+                // HyperOS BIP server actually advertises per track.
+                char xml[sizeof(s_cover_properties)] = {};
+                portENTER_CRITICAL(&s_lock);
+                const size_t n = s_cover_properties_len;
+                if (n != 0U && n < sizeof(xml)) memcpy(xml, s_cover_properties, n);
+                portEXIT_CRITICAL(&s_lock);
+                if (n != 0U) ESP_LOGI(TAG, "AVRCP_COVER properties XML: %s", xml);
+            }
         } else if (!good && !discard && !prior_error) {
             ESP_LOGW(TAG, "AVRCP_COVER %s rejected chunk bytes=%u total=%u (limit=%u)",
                 cover_step_name(step), static_cast<unsigned>(data.data_len),
@@ -563,6 +596,8 @@ static void reset_state()
     s_cover_discard_active = false;
     s_cover_bad_data = false;
     s_cover_rx_bytes = 0U;
+    s_cover_properties_len = 0U;
+    s_cover_properties[0] = '\0';
     s_cover_thumbnail_retries = 0U;
     s_cover_connect_attempts = 0U;
     s_cover_due = s_cover_started = s_cover_last_data = 0U;
@@ -846,11 +881,41 @@ void bt_audio_avrc_update()
             case CoverStep::Properties:
                 err = esp_avrc_ct_cover_art_get_image_properties(cover_handle);
                 break;
-            case CoverStep::NativeImage:
-                // Null descriptor requests the native image; do not hard-code a
-                // pixel size that a phone's BIP image representations may reject.
-                err = esp_avrc_ct_cover_art_get_image(cover_handle, nullptr, 0U);
+            case CoverStep::NativeImage: {
+                // IDF 6.1 rejects a null/empty Image Descriptor with
+                // ESP_ERR_INVALID_ARG. Select an advertised JPEG representation
+                // from the preceding GetImageProperties response.
+                char properties[sizeof(s_cover_properties)] = {};
+                portENTER_CRITICAL(&s_lock);
+                const size_t n = s_cover_properties_len;
+                if (n != 0U && n < sizeof(properties))
+                    memcpy(properties, s_cover_properties, n);
+                portEXIT_CRITICAL(&s_lock);
+                bt_avrc_cover_descriptor::Selection selected = {};
+                char descriptor[160] = {};
+                const bool found = bt_avrc_cover_descriptor::select(
+                    properties, n, BT_PHONE_COVER_MAX_BYTES, &selected);
+                const size_t descriptor_len = found
+                    ? bt_avrc_cover_descriptor::make_xml(
+                        selected, descriptor, sizeof(descriptor))
+                    : 0U;
+                if (descriptor_len != 0U) {
+                    ESP_LOGI(TAG,
+                        "AVRCP_COVER image descriptor jpeg=%ux%u variant=%u len=%u",
+                        static_cast<unsigned>(selected.width),
+                        static_cast<unsigned>(selected.height),
+                        selected.variant ? 1U : 0U,
+                        static_cast<unsigned>(descriptor_len));
+                    err = esp_avrc_ct_cover_art_get_image(cover_handle,
+                        reinterpret_cast<uint8_t *>(descriptor),
+                        static_cast<uint16_t>(descriptor_len));
+                } else {
+                    ESP_LOGW(TAG,
+                        "AVRCP_COVER no suitable JPEG representation, using thumbnail");
+                    err = ESP_ERR_NOT_SUPPORTED;
+                }
                 break;
+            }
             case CoverStep::Thumbnail:
                 err = esp_avrc_ct_cover_art_get_linked_thumbnail(cover_handle);
                 break;

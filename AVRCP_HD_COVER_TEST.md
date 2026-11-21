@@ -45,3 +45,29 @@ AVRCP_COVER surface requested
 “原生图”不等于严格的 460×460。使用空 Image Descriptor 是规范允许的原生图请求；手机可能返回不同编码、尺寸和字节数。对明确要求 460×460 的图片描述符，应先通过 `GetImageProperties` 解析出手机支持的表示格式后再协商，不应猜测尺寸。此版本优先确保兼容性和可靠回退。
 
 代码尚未在使用者的 ESP-IDF 6.1 环境完整构建，也尚未经红米 K50 真机验证；日志和分支提交不是实机成功的证明。
+
+## V1.1 修复 ESP_ERR_INVALID_ARG（2026-11-21）
+
+用户真机日志已验证此前版本 `GetImageProperties` 成功，但 `GetImage(handle, nullptr, 0)` **每首歌都返回 `ESP_ERR_INVALID_ARG`**，因此仍只显示 200×200 Thumbnail。原因不是手机不支持高清，而是 ESP-IDF 6.1 的 `esp_avrc_ct_cover_art_get_image()` 强制要求非空、非零长度 Image Descriptor。
+
+现在增加 `src/system/bt_avrc_cover_descriptor.h`，读取 Properties 返回的 BIP XML：如果手机声明可变尺寸 JPEG，优先请求 460×460；否则请求 JPEG 原生分辨率且 Properties 声明文件大小不超过 512 KiB；没有安全的候选或图片下载失败时自动降级 Thumbnail。有效的 Descriptor 形如：
+
+```xml
+<image-descriptor version="1.0"><image encoding="JPEG" pixel="460*460"/></image-descriptor>
+```
+
+下载前可看到如下诊断（尺寸取决于手机实际提供的属性）：
+
+```text
+AVRCP_COVER properties XML: ...
+AVRCP_COVER image descriptor jpeg=460x460 variant=1 len=...
+AVRCP_COVER request=native err=ESP_OK max_bytes=524288
+AVRCP_COVER native completed ok=1 bytes=...
+JPEG_HW ... 460x460 ...
+```
+
+真实输出若有 `request=native err=ESP_OK` 但 `native completed ok=0`，说明请求已经发送到手机但被拒绝或传输失败；应继续观察缩略图后备。
+
+独立 C++ 测试：`g++ -std=c++17 -Wall -Wextra -Werror -Isrc tests/avrcp_cover_descriptor_smoke.cpp -o cover_smoke && ./cover_smoke`。
+
+**额外性能观察**：真机日志在 A2DP 开始播放的早期出现 `A2DP_RX drop=3200`，下一次为 3328、后续稳定 3328。这不是该版本高清图的测试结果，因为高清请求尚未实际发出。测试新版时应比较 `drop` 增量与 `native completed` 时间的对应关系，避免以累计 drop 误判持续音频中断。
