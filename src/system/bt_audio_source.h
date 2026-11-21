@@ -29,7 +29,7 @@ struct BtAudioSourceSnapshot {
     bool connected = false;
     bool streaming = false;
     uint32_t sample_rate_hz = 44100U;
-    uint8_t negotiated_codec = 0xFFU; // 0=SBC, 2=AAC; FF=not negotiated.
+    uint8_t negotiated_codec = 0xFFU; // 0=SBC, FF=not negotiated.
     uint32_t underrun_frames = 0U;
     uint32_t dropped_frames = 0U;
     // Output PCM frames currently buffered in the A2DP PSRAM ring (target-rate).

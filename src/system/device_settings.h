@@ -18,11 +18,9 @@ enum class DeviceBluetoothMode : uint8_t {
     Controller,
 };
 
-// Shared A2DP Source/Sink codec preference (actual codec is negotiated with the peer).
-// A2DP keeps SBC mandatory; an AAC-only mode cannot be advertised.
+// Only SBC is supported. Keep numerical value 1 for previous NVS compatibility.
 enum class DeviceBluetoothSinkCodec : uint8_t {
-    AutoAac = 0, // AAC-LC preferred, mandatory SBC fallback.
-    SbcOnly = 1, // Disable AAC SEP; SBC-only compatibility.
+    SbcOnly = 1,
 };
 
 // Classic A2DP role, independent of the BLE GATT phone remote switch.
@@ -88,7 +86,7 @@ struct DeviceSettingsSnapshot {
     bool ble_enabled = true;
     DeviceBluetoothMode bluetooth_mode = DeviceBluetoothMode::PhoneRemote;
     DeviceBluetoothAudioRole bluetooth_audio_role = DeviceBluetoothAudioRole::Transmit;
-    DeviceBluetoothSinkCodec bluetooth_sink_codec = DeviceBluetoothSinkCodec::AutoAac;
+    DeviceBluetoothSinkCodec bluetooth_sink_codec = DeviceBluetoothSinkCodec::SbcOnly;
     bool wifi_enabled = false;
     DeviceAudioOutputMode audio_output_mode = DeviceAudioOutputMode::NormalHeadphones;
     uint8_t brightness_level = 60U;          // CO5300 正常显示亮度 5~100%；0 保留给熄屏。

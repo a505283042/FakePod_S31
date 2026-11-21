@@ -14,9 +14,9 @@ struct BtAudioSinkSnapshot {
     bool connected = false;
     bool streaming = false;
     uint32_t sample_rate_hz = 44100U;
-    // 0xFF = not yet negotiated, 0=SBC, 2=MPEG-2/4 AAC.
+    // 0xFF = not yet negotiated; 0=SBC (only supported codec).
     uint8_t negotiated_codec = 0xFFU;
-    DeviceBluetoothSinkCodec preferred_codec = DeviceBluetoothSinkCodec::AutoAac;
+    DeviceBluetoothSinkCodec preferred_codec = DeviceBluetoothSinkCodec::SbcOnly;
     uint32_t queued_frames = 0U;
     uint32_t dropped_frames = 0U;       // Actual ring overflow (unwanted)
     uint32_t underrun_frames = 0U;      // Missing PCM while output was active

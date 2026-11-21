@@ -23,12 +23,7 @@
 #error "FakePod A2DP Sink requires Classic BT and A2DP"
 #endif
 #if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
-#if !defined(CONFIG_BT_A2DP_CODEC_AAC_ENABLED) || !CONFIG_BT_A2DP_CODEC_AAC_ENABLED
-#error "AAC experiment must enable CONFIG_BT_A2DP_CODEC_AAC_ENABLED"
-#endif
-#if !defined(CONFIG_BT_A2DP_SEP_NUM_MAX) || CONFIG_BT_A2DP_SEP_NUM_MAX < 2
-#error "AAC + SBC Sink requires at least two A2DP SEPs"
-#endif
+#error "SBC-only build: external A2DP codecs disabled; build fakepod_s31."
 #endif
 
 namespace {
@@ -57,7 +52,7 @@ static TickType_t s_stats_due = 0;
 static esp_bd_addr_t s_peer = {};
 static char s_peer_name[48] = {};
 static uint8_t s_negotiated_codec = 0xFFU;
-static DeviceBluetoothSinkCodec s_codec_preference = DeviceBluetoothSinkCodec::AutoAac;
+static DeviceBluetoothSinkCodec s_codec_preference = DeviceBluetoothSinkCodec::SbcOnly;
 #if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
 static bool s_sep_ok[2] = {};
 static bool s_sep_reported[2] = {};
@@ -322,7 +317,7 @@ esp_err_t bt_audio_sink_host_start()
     s_peak_queued = 0U;
     s_negotiated_codec = 0xFFU;
     s_codec_preference = have_settings
-        ? settings_snapshot.bluetooth_sink_codec : DeviceBluetoothSinkCodec::AutoAac;
+        ? settings_snapshot.bluetooth_sink_codec : DeviceBluetoothSinkCodec::SbcOnly;
 #if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
     memset(s_sep_ok, 0, sizeof(s_sep_ok));
     memset(s_sep_reported, 0, sizeof(s_sep_reported));
@@ -332,6 +327,7 @@ esp_err_t bt_audio_sink_host_start()
     flush_locked();
     portEXIT_CRITICAL(&s_mux);
 
+    ESP_LOGI(TAG, "A2DP_RX_BACKEND=IDF_INTERNAL_SBC (SBC-only firmware)");
     // ESP-IDF contract: AVRCP CT/TG must initialize before A2DP Sink.
     esp_err_t err = bt_audio_avrc_host_start();
     if (err != ESP_OK) {
@@ -440,7 +436,6 @@ void bt_audio_sink_host_stop()
 
 const char *bt_audio_sink_codec_name(uint8_t negotiated_codec)
 {
-    if (negotiated_codec == ESP_A2D_MCT_M24) return "AAC";
     if (negotiated_codec == ESP_A2D_MCT_SBC) return "SBC";
     return "未知";
 }

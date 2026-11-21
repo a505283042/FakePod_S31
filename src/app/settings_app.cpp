@@ -1739,7 +1739,7 @@ static void format_bt_audio_value(char *out, size_t cap)
     else if (!s.initialized) snprintf(out, cap, "未启动");
     else if (s.streaming && s.negotiated_codec != 0xFFU)
         snprintf(out, cap, "播放中·%s·%lu.%luk",
-            s.negotiated_codec == 2U ? "AAC" : "SBC",
+            s.negotiated_codec == 0U ? "SBC" : "待协商",
             static_cast<unsigned long>(s.sample_rate_hz / 1000U),
             static_cast<unsigned long>((s.sample_rate_hz % 1000U) / 100U));
     else if (s.streaming) snprintf(out, cap, "播放中·%s", s.peer_name);
@@ -1873,51 +1873,6 @@ static void format_bt_sink_value(char *out, size_t cap)
     else if (sink.streaming) snprintf(out, cap, "手机播放中");
     else if (sink.connected) snprintf(out, cap, "手机已连接");
     else snprintf(out, cap, "等待手机配对");
-}
-
-static void bluetooth_codec_click_cb(lv_event_t *event)
-{
-    if (!click_is_valid(event) || g_page != SettingsPage::Bluetooth) return;
-#if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
-    DeviceSettingsSnapshot settings = {};
-    if (!device_settings_get_snapshot(&settings)) return;
-    BleRemoteSnapshot ble = {};
-    (void)ble_remote_service_get_snapshot(&ble);
-    if (ble.audio_role_switching) {
-        ui_common_show_notice("蓝牙忙碌", "请等待发射/接收切换结束");
-        return;
-    }
-    const DeviceBluetoothSinkCodec next =
-        settings.bluetooth_sink_codec == DeviceBluetoothSinkCodec::AutoAac
-            ? DeviceBluetoothSinkCodec::SbcOnly
-            : DeviceBluetoothSinkCodec::AutoAac;
-    const esp_err_t ret = device_settings_set_bluetooth_sink_codec(next);
-    if (ret != ESP_OK) {
-        ui_common_show_notice("保存音频编码失败", "请检查NVS状态");
-        return;
-    }
-    if (g_detail_values[4] != nullptr) {
-        lv_label_set_text(g_detail_values[4],
-            device_settings_bluetooth_sink_codec_name(next));
-    }
-
-    // This preference is shared by transmitter and receiver. Re-register
-    // the active profile's SEPs; leave BLE GATT and phone remote untouched.
-    if (ble.audio_role != DeviceBluetoothAudioRole::Off &&
-        ble.stack_initialized && !ble.audio_role_switching) {
-        if (ble_remote_service_restart_audio_profile()) {
-            ui_common_show_notice("音频编码已更改",
-                "蓝牙音频将重新启动，需要重新连接音频设备");
-        } else {
-            ui_common_show_notice("音频编码已保存",
-                "蓝牙服务忙碌，下次启动音频时生效");
-        }
-    } else {
-        ui_common_show_notice("音频编码已保存", "下次启动音频时生效");
-    }
-#else
-    ui_common_show_notice("固定SBC", "当前固件未启用AAC接收环境");
-#endif
 }
 
 static void bluetooth_transmit_click_cb(lv_event_t *event)
@@ -2235,13 +2190,7 @@ static void create_bluetooth_page(const DeviceSettingsSnapshot &settings)
     add_clickable_detail_row(3, "音频接收", rx_value,
         SettingsDetailIcon::Bluetooth, bluetooth_receive_click_cb);
 
-#if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
-    add_clickable_detail_row(4, "音频编码",
-        device_settings_bluetooth_sink_codec_name(settings.bluetooth_sink_codec),
-        SettingsDetailIcon::Bluetooth, bluetooth_codec_click_cb);
-#else
     add_detail_row(4, "音频编码", "固定SBC", SettingsDetailIcon::Bluetooth, false);
-#endif
 }
 
 static void create_bluetooth_devices_page()
@@ -3093,12 +3042,7 @@ static void refresh_timer_cb(lv_timer_t *timer)
             lv_label_set_text(g_detail_values[3], rx_value);
         }
         if (g_detail_values[4] != nullptr) {
-#if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
-            lv_label_set_text(g_detail_values[4],
-                device_settings_bluetooth_sink_codec_name(settings.bluetooth_sink_codec));
-#else
             lv_label_set_text(g_detail_values[4], "固定SBC");
-#endif
         }
     }
     if (g_page == SettingsPage::BluetoothDevices) {

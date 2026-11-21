@@ -25,6 +25,9 @@
 #if !FAKEPOD_A2DP_SUPPORTED
 #error "FakePod S31 A2DP Source requires Classic BT/A2DP. Check generated sdkconfig."
 #endif
+#if FAKEPOD_A2DP_EXTERNAL_CODEC
+#error "SBC-only build: disable CONFIG_BT_A2DP_USE_EXTERNAL_CODEC and build fakepod_s31."
+#endif
 
 // ESP-IDF S31 has two independent options: Host Classic Bluetooth and controller
 // BR/EDR + BLE dual mode. A2DP Host on a BLE-only controller can hang at
@@ -54,15 +57,9 @@
 static const char *TAG = "BT_AUDIO";
 namespace {
 
-// Keep the proven built-in SBC buffer unchanged. External codec workers
-// need extra headroom against occasional LVGL full-screen PSRAM stalls.
-#if FAKEPOD_A2DP_EXTERNAL_CODEC
-static constexpr size_t kRingFrames = 16384U; // 64 KiB PSRAM, ~341ms @48kHz
-static constexpr uint32_t kMaxQueueMs = 260U;
-#else
-static constexpr size_t kRingFrames = 8192U;  // 32 KiB, legacy SBC
+// Proven ee312620 internal SBC configuration.
+static constexpr size_t kRingFrames = 8192U; // 32 KiB
 static constexpr uint32_t kMaxQueueMs = 120U;
-#endif
 static constexpr TickType_t kMediaRetryTicks = pdMS_TO_TICKS(600);
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 
@@ -369,11 +366,9 @@ static int32_t a2dp_pcm_callback(uint8_t *data, int32_t len)
     if (data == nullptr || len <= 0) return 0;
     memset(data, 0, static_cast<size_t>(len));
     const size_t requested = static_cast<size_t>(len) / 4U;
-    size_t consumed_frames = 0U;
     portENTER_CRITICAL(&s_lock);
     if (s_init_requested && s_streaming && s_pcm_ring != nullptr) {
         const size_t read_frames = requested < s_queued ? requested : s_queued;
-        consumed_frames = read_frames;
         const size_t first = read_frames < (kRingFrames - s_read)
             ? read_frames : kRingFrames - s_read;
         memcpy(data, s_pcm_ring + s_read * 4U, first * 4U);
@@ -385,14 +380,8 @@ static int32_t a2dp_pcm_callback(uint8_t *data, int32_t len)
         s_underrun += static_cast<uint32_t>(requested - read_frames);
     }
     portEXIT_CRITICAL(&s_lock);
-#if FAKEPOD_A2DP_EXTERNAL_CODEC
-    // Worker knows whether its PCM was real or silence padding. The output
-    // remains zero-filled so the encoder always receives a complete frame.
-    return static_cast<int32_t>(consumed_frames * 4U);
-#else
-    // ESP-IDF's legacy built-in SBC callback requires the full byte count.
+    // The internal SBC source requires the full byte count including padding.
     return len;
-#endif
 }
 
 static void classic_gap_event(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
@@ -500,11 +489,7 @@ esp_err_t bt_audio_source_host_start()
                 static_cast<unsigned>(kRingFrames * 4U));
         return ESP_ERR_NO_MEM;
     }
-#if FAKEPOD_A2DP_EXTERNAL_CODEC
-    ESP_LOGI(TAG, "A2DP_TX_BACKEND=EXTERNAL_SBC_AAC (built at compile time)");
-#else
-    ESP_LOGI(TAG, "A2DP_TX_BACKEND=IDF_INTERNAL_SBC (built at compile time)");
-#endif
+    ESP_LOGI(TAG, "A2DP_TX_BACKEND=IDF_INTERNAL_SBC (SBC-only firmware)");
     ESP_LOGI(TAG, "A2DP启动：internal_free=%u psram_free=%u",
              static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
              static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
