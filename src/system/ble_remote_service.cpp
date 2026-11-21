@@ -10,6 +10,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "audio_service.h"
+#include "bt_audio_source.h"
 #include "app/app_manager.h"
 #include "battery_service.h"
 #include "media_catalog_v2.h"
@@ -2009,6 +2010,9 @@ static esp_err_t stop_stack()
     }
 #endif
 
+    // A2DP Source 与 BLE 共用同一个 Host，必须先释放 A2DP Profile。
+    bt_audio_source_host_stop();
+
     // Bluedroid 关闭顺序：注销 GATT 应用 → 关闭 Host → 关闭控制器。
     portENTER_CRITICAL(&g_lock);
     const esp_gatt_if_t gatts_if = g_gatts_if;
@@ -2138,6 +2142,11 @@ static esp_err_t start_stack()
         return ESP_FAIL;
     }
 
+    const esp_err_t a2dp_ret = bt_audio_source_host_start();
+    if (a2dp_ret != ESP_OK) {
+        ESP_LOGW(TAG, "A2DP Source未启动：%s；保留BLE手机遥控", esp_err_to_name(a2dp_ret));
+    }
+
     portENTER_CRITICAL(&g_lock);
     g_active_mode = mode;
     g_stack_initialized = true;
@@ -2201,7 +2210,7 @@ static esp_err_t start_stack()
     esp_ble_gap_set_security_param(ESP_BLE_SM_SET_RSP_KEY, &key_dist, sizeof(key_dist));
 
 #if CONFIG_BT_CLASSIC_ENABLED
-    // Classic 侧保持不可发现/不可连接，避免被传统蓝牙设备扫到。
+    // Classic A2DP 主动发现耳机；本机仍不接受 Classic 被动发现/连接。
     if (esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE) != ESP_OK) {
         ESP_LOGW(TAG, "Classic扫描模式设置失败（不影响BLE遥控）");
     }
@@ -2346,7 +2355,7 @@ esp_err_t ble_remote_service_init()
     portEXIT_CRITICAL(&g_lock);
 
 #if FAKEPOD_BLE_FOUNDATION_ENABLED
-    ESP_LOGI(TAG, "BLE Foundation就绪：Bluedroid 双模（BLE GATT Server + Classic 预留），默认关闭");
+    ESP_LOGI(TAG, "BLE Foundation就绪：Bluedroid双模，BLE GATT遥控 + Classic A2DP Source，默认关闭");
     return ESP_OK;
 #else
     ESP_LOGW(TAG, "BLE Foundation代码已就绪，但 sdkconfig 尚未完整启用 Bluedroid BLE/GATT Server");
@@ -2403,6 +2412,8 @@ void ble_remote_service_set_mode(DeviceBluetoothMode mode)
 
 void ble_remote_service_update()
 {
+    // A2DP 媒体握手独立推进，BLE GATT 广播/连接不因音乐状态改变。
+    bt_audio_source_update();
     portENTER_CRITICAL(&g_lock);
     if (!g_ready || g_transition_running) {
         portEXIT_CRITICAL(&g_lock);
