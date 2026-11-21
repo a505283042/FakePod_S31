@@ -669,6 +669,9 @@ static bool cassette_view_audio_matches_current(const AudioStateSnapshot &audio)
 static void cassette_view_update_track_text()
 {
     if (bt_audio_avrc_is_sink_mode()) {
+        // The next TF/NAS activation must not reuse its cached local text key.
+        g_text_track = UINT32_MAX;
+        g_text_generation = 0U;
         BtAudioAvrcSnapshot phone = {};
         (void)bt_audio_avrc_get_snapshot(&phone);
         cassette_view_set_text_if_changed(g_title_label,
