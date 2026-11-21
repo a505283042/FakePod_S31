@@ -14,6 +14,8 @@
 #include "fallback_cover_images.h"
 #include "board_pins.h"
 #include "cover_surface_cache.h"
+#include "system/bt_audio_avrc.h"
+#include "system/bt_phone_cover.h"
 #include "display.h"
 #include "display_bounded_spi.h"
 #include "font/font_manager.h"
@@ -72,6 +74,8 @@ static ArtworkCacheLease g_compressed_lease = {};
 static lv_image_dsc_t g_compressed_dsc = {};
 static bool g_has_compressed_source = false;
 
+static constexpr uint32_t kPhoneCoverGeneration = 0xFFFFFFFEU;
+static bool g_context_phone = false;
 static uint32_t g_context_generation = 0U;
 static uint32_t g_context_track = UINT32_MAX;
 static bool g_context_has_artwork = false;
@@ -344,7 +348,9 @@ static bool artwork_ui_apply_transition_hold()
 static bool artwork_ui_apply_surface(uint32_t track_index)
 {
     CoverSurfaceLease lease = {};
-    if (!cover_surface_cache_acquire(track_index, &lease)) return false;
+    if (!(g_context_phone
+            ? cover_surface_cache_acquire_phone(track_index, true, &lease)
+            : cover_surface_cache_acquire(track_index, &lease))) return false;
     if (lease.normal_rgb565 == nullptr ||
         lease.width == 0U || lease.height == 0U || lease.data_size == 0U) {
         cover_surface_cache_release(&lease);
@@ -356,9 +362,12 @@ static bool artwork_ui_apply_surface(uint32_t track_index)
     // 继续使用 normal，并由播放器现有 Alpha Backdrop 承担临时压暗，不能因此丢封面。
     if (g_dimmed_requested && lease.dimmed_rgb565 == nullptr) {
         cover_surface_cache_release(&lease);
-        (void)cover_surface_cache_restore_dimmed(track_index);
-        if (!cover_surface_cache_acquire(track_index, &lease) ||
-            lease.normal_rgb565 == nullptr ||
+        if (g_context_phone) (void)cover_surface_cache_restore_phone_dimmed(track_index);
+        else (void)cover_surface_cache_restore_dimmed(track_index);
+        const bool acquired = g_context_phone
+            ? cover_surface_cache_acquire_phone(track_index, true, &lease)
+            : cover_surface_cache_acquire(track_index, &lease);
+        if (!acquired || lease.normal_rgb565 == nullptr ||
             lease.width == 0U || lease.height == 0U || lease.data_size == 0U) {
             cover_surface_cache_release(&lease);
             return false;
@@ -366,7 +375,9 @@ static bool artwork_ui_apply_surface(uint32_t track_index)
     }
 
     const uint32_t previous_track = artwork_ui_displayed_track();
-    const bool replacing_track = previous_track != UINT32_MAX && previous_track != track_index;
+    const bool replacing_track = previous_track != UINT32_MAX &&
+        (previous_track != track_index ||
+         g_surface_lease.catalog_generation != g_context_generation);
     const bool dimmed_available = lease.dimmed_rgb565 != nullptr;
     const uint8_t *present_surface = g_dimmed_requested && dimmed_available
         ? lease.dimmed_rgb565
@@ -413,8 +424,11 @@ static bool artwork_ui_apply_surface(uint32_t track_index)
     g_surface_lease = lease;
     // 新 Surface 已 pin、旧 lease 已释放。此时清理交换槽中的旧曲，
     // 并释放所有未被 fallback 固定的压缩原图；normal 保留，dimmed 按当前视觉模式决定。
-    cover_surface_cache_retain_track(track_index);
-    artwork_loader_discard_unpinned();
+    if (g_context_phone) cover_surface_cache_retain_phone(track_index);
+    else {
+        cover_surface_cache_retain_track(track_index);
+        artwork_loader_discard_unpinned();
+    }
     artwork_ui_init_rgb565_dsc(
         &g_surface_normal_dsc,
         g_surface_lease.normal_rgb565,
@@ -601,7 +615,34 @@ static bool artwork_ui_apply_compressed_fallback(uint32_t track_index)
 
 static void artwork_ui_sync_context(bool force)
 {
-    if (g_container == nullptr || !player_state_is_ready()) return;
+    if (g_container == nullptr) return;
+    if (bt_audio_avrc_is_sink_mode()) {
+        BtPhoneCoverSnapshot phone = {};
+        (void)bt_phone_cover_get_snapshot(&phone);
+        const uint32_t revision = phone.ready ? phone.image_revision : 0U;
+        if (!force && g_context_phone &&
+            g_context_generation == kPhoneCoverGeneration &&
+            g_context_track == revision) return;
+        g_context_phone = true;
+        g_context_generation = kPhoneCoverGeneration;
+        g_context_track = revision;
+        g_context_has_artwork = phone.ready;
+        g_last_loader_state_revision = UINT32_MAX;
+        g_last_surface_state_revision = UINT32_MAX;
+        if (!phone.ready) {
+            artwork_ui_release_transition_hold();
+            artwork_ui_release_all_sources();
+            artwork_ui_show_no_artwork_fallback();
+        } else if (!artwork_ui_apply_surface(revision)) {
+            // Keep visual hold only while the current phone image is preparing;
+            // old TF/NAS image must never masquerade as new phone artwork.
+            artwork_ui_release_all_sources();
+            artwork_ui_show_no_artwork_fallback();
+        }
+        return;
+    }
+    if (!player_state_is_ready()) return;
+    g_context_phone = false;
     const uint32_t track_index = static_cast<uint32_t>(player_state_get_index());
     const bool is_nas = artwork_source_is_nas();
     if (is_nas && !nas_library_source_ready()) {
@@ -788,6 +829,13 @@ void now_playing_artwork_update()
     // 不再消费 CoverSurface/ArtworkLoader 状态，避免旧状态把它误切成“封面不可显示”。
     if (!g_context_has_artwork) return;
 
+    if (g_context_phone) {
+        if (!artwork_ui_source_matches_context()) {
+            (void)artwork_ui_apply_surface(g_context_track);
+        }
+        return; // no TF/NAS ArtworkLoader lookup in phone mode
+    }
+
     if (system_artwork_current_uses_default_fallback(g_context_track)) {
         artwork_ui_release_transition_hold();
         artwork_ui_release_all_sources();
@@ -893,6 +941,7 @@ void now_playing_artwork_update()
 bool now_playing_artwork_prepare_track_transition_hold()
 {
     artwork_ui_release_transition_hold();
+    if (bt_audio_avrc_is_sink_mode()) return false;
     if (!player_state_is_ready() || player_state_get_source() == PlayerMediaSource::Nas ||
         media_library_get_count() == 0U || !cover_surface_cache_is_ready()) {
         return false;

@@ -18,6 +18,7 @@
 
 #include "app_diag_config.h"
 #include "artwork_loader.h"
+#include "system/bt_phone_cover.h"
 #include "artwork_source_context.h"
 #include "board_pins.h"
 #include "drivers/jpeg/jpeg_hw_decoder.h"
@@ -35,6 +36,7 @@ static constexpr uint32_t COVER_TASK_STACK_BYTES = 4096U;
 static constexpr UBaseType_t COVER_TASK_PRIORITY = 1U;
 static constexpr BaseType_t COVER_TASK_CORE = 1;
 static constexpr size_t COVER_CACHE_SLOT_COUNT = 2U;
+static constexpr uint32_t COVER_PHONE_GENERATION = 0xFFFFFFFEU;
 static constexpr size_t COVER_SOURCE_DECODE_BUDGET_BYTES = 4U * 1024U * 1024U;
 static constexpr size_t COVER_PSRAM_SAFETY_RESERVE_BYTES = 512U * 1024U;
 static constexpr uint32_t COVER_COOPERATIVE_ROW_INTERVAL = 32U;
@@ -192,8 +194,12 @@ static bool cover_dimmed_retained()
 
 static bool cover_request_is_latest(const CoverRequest &request)
 {
-    return request.request_id == cover_latest_request_id() &&
-        request.catalog_generation == artwork_source_active_generation();
+    if (request.request_id != cover_latest_request_id()) return false;
+    if (request.catalog_generation != COVER_PHONE_GENERATION)
+        return request.catalog_generation == artwork_source_active_generation();
+    BtPhoneCoverSnapshot phone = {};
+    return bt_phone_cover_get_snapshot(&phone) && phone.ready &&
+        phone.image_revision == request.track_index;
 }
 
 static void cover_publish(
@@ -905,7 +911,19 @@ static void cover_task_main(void *)
         const int64_t started_us = esp_timer_get_time();
 
         ArtworkCacheLease compressed = {};
-        if (!artwork_loader_acquire_cached(request.track_index, &compressed)) {
+        uint8_t *phone_copy = nullptr;
+        if (request.catalog_generation == COVER_PHONE_GENERATION) {
+            size_t copy_size = 0U;
+            bool is_png = false;
+            if (!bt_phone_cover_copy_image(request.track_index,
+                    &phone_copy, &copy_size, &is_png)) {
+                cover_publish(CoverSurfaceState::Failed, &request, ESP_ERR_NOT_FOUND, false);
+                continue;
+            }
+            compressed.data = phone_copy;
+            compressed.size = copy_size;
+            compressed.format = is_png ? MediaArtworkFormatV2::Png : MediaArtworkFormatV2::Jpeg;
+        } else if (!artwork_loader_acquire_cached(request.track_index, &compressed)) {
             cover_publish(CoverSurfaceState::Failed, &request, ESP_ERR_NOT_FOUND, false);
             continue;
         }
@@ -923,7 +941,8 @@ static void cover_task_main(void *)
         const esp_err_t render_result = cover_render_surface(
             compressed, need_dimmed, &normal, &dimmed,
             &source_width, &source_height, &tint, &render_stats);
-        artwork_loader_release_cached(&compressed);
+        if (phone_copy != nullptr) heap_caps_free(phone_copy);
+        else artwork_loader_release_cached(&compressed);
 
         const uint32_t prepare_ms = static_cast<uint32_t>((esp_timer_get_time() - started_us) / 1000LL);
         if (render_result != ESP_OK) {
@@ -966,7 +985,8 @@ static void cover_task_main(void *)
         }
 
         // Surface 已经独立拥有最终像素，压缩 JPEG/PNG 不再需要长期留在 PSRAM。
-        artwork_loader_discard_unpinned();
+        if (request.catalog_generation != COVER_PHONE_GENERATION)
+            artwork_loader_discard_unpinned();
         cover_publish(CoverSurfaceState::Ready, &request, ESP_OK, false, source_width, source_height, prepare_ms);
 #if APP_DIAG_ARTWORK_UI
         const UBaseType_t stack_hwm = uxTaskGetStackHighWaterMark(nullptr);
@@ -1048,6 +1068,27 @@ bool cover_surface_cache_request_track(uint32_t track_index, uint32_t *out_reque
     return true;
 }
 
+bool cover_surface_cache_request_phone(uint32_t image_revision, uint32_t *out_request_id)
+{
+    if (!g_ready || g_queue == nullptr || g_submit_mutex == nullptr || image_revision == 0U)
+        return false;
+    BtPhoneCoverSnapshot phone = {};
+    if (!bt_phone_cover_get_snapshot(&phone) || !phone.ready ||
+        phone.image_revision != image_revision) return false;
+    if (xSemaphoreTake(g_submit_mutex, pdMS_TO_TICKS(20)) != pdTRUE) return false;
+    CoverRequest request = {};
+    request.request_id = cover_next_request_id();
+    request.catalog_generation = COVER_PHONE_GENERATION;
+    request.track_index = image_revision;
+    cover_set_latest_request_id(request.request_id);
+    const BaseType_t sent = xQueueOverwrite(g_queue, &request);
+    if (sent == pdTRUE && g_task != nullptr) xTaskNotifyGive(g_task);
+    xSemaphoreGive(g_submit_mutex);
+    if (sent != pdTRUE) return false;
+    if (out_request_id != nullptr) *out_request_id = request.request_id;
+    return true;
+}
+
 bool cover_surface_cache_get_snapshot(CoverSurfaceSnapshot *out_snapshot)
 {
     if (out_snapshot == nullptr) return false;
@@ -1058,6 +1099,7 @@ bool cover_surface_cache_get_snapshot(CoverSurfaceSnapshot *out_snapshot)
 }
 
 static bool cover_surface_cache_acquire_internal(
+    uint32_t generation,
     uint32_t track_index,
     bool pin_dimmed,
     CoverSurfaceLease *out_lease)
@@ -1066,7 +1108,6 @@ static bool cover_surface_cache_acquire_internal(
     *out_lease = {};
     if (xSemaphoreTake(g_cache_mutex, pdMS_TO_TICKS(20)) != pdTRUE) return false;
 
-    const uint32_t generation = artwork_source_active_generation();
     const int index = cover_find_locked(generation, track_index);
     if (index < 0) {
         xSemaphoreGive(g_cache_mutex);
@@ -1097,12 +1138,19 @@ static bool cover_surface_cache_acquire_internal(
 
 bool cover_surface_cache_acquire(uint32_t track_index, CoverSurfaceLease *out_lease)
 {
-    return cover_surface_cache_acquire_internal(track_index, true, out_lease);
+    return cover_surface_cache_acquire_internal(artwork_source_active_generation(), track_index, true, out_lease);
 }
 
 bool cover_surface_cache_acquire_normal(uint32_t track_index, CoverSurfaceLease *out_lease)
 {
-    return cover_surface_cache_acquire_internal(track_index, false, out_lease);
+    return cover_surface_cache_acquire_internal(artwork_source_active_generation(), track_index, false, out_lease);
+}
+
+bool cover_surface_cache_acquire_phone(uint32_t image_revision, bool dimmed,
+    CoverSurfaceLease *out_lease)
+{
+    return cover_surface_cache_acquire_internal(COVER_PHONE_GENERATION, image_revision,
+        dimmed, out_lease);
 }
 
 void cover_surface_cache_release(CoverSurfaceLease *lease)
@@ -1218,12 +1266,12 @@ void cover_surface_cache_set_dimmed_retained(bool retained)
     }
 }
 
-bool cover_surface_cache_restore_dimmed(uint32_t track_index)
+static bool cover_surface_cache_restore_dimmed_for(uint32_t generation, uint32_t track_index)
 {
     if (track_index == UINT32_MAX) return false;
 
     CoverSurfaceLease normal_lease = {};
-    if (!cover_surface_cache_acquire_normal(track_index, &normal_lease) ||
+    if (!cover_surface_cache_acquire_internal(generation, track_index, false, &normal_lease) ||
         normal_lease.normal_rgb565 == nullptr || normal_lease.data_size < COVER_SURFACE_BYTES) {
         cover_surface_cache_release(&normal_lease);
         return false;
@@ -1294,6 +1342,22 @@ bool cover_surface_cache_restore_dimmed(uint32_t track_index)
             static_cast<unsigned>(COVER_SURFACE_BYTES));
     }
     return installed;
+}
+
+bool cover_surface_cache_restore_dimmed(uint32_t track_index)
+{
+    return cover_surface_cache_restore_dimmed_for(artwork_source_active_generation(), track_index);
+}
+
+bool cover_surface_cache_restore_phone_dimmed(uint32_t image_revision)
+{
+    return image_revision != 0U &&
+        cover_surface_cache_restore_dimmed_for(COVER_PHONE_GENERATION, image_revision);
+}
+
+void cover_surface_cache_retain_phone(uint32_t image_revision)
+{
+    cover_cache_release_unpinned_except(COVER_PHONE_GENERATION, image_revision);
 }
 
 void cover_surface_cache_retain_track(uint32_t track_index)

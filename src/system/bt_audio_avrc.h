@@ -5,8 +5,8 @@
 
 // AVRCP Phase 1: A2DP Sink-side Controller (phone playback/metadata)
 // and Target (phone->FakePod absolute volume and local volume notifications).
-// All Bluetooth callbacks only update tiny snapshots; actual DAC writes stay
-// on AudioTask. No image or lyrics transfer in this phase.
+// Bluetooth callbacks only stage bounded cover bytes; JPEG/PNG conversion is
+// deferred to CoverSurfaceTask. No lyrics transfer is added in this phase.
 struct BtAudioAvrcSnapshot {
     bool active = false;
     bool connected = false;

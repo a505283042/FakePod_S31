@@ -68,6 +68,11 @@ bool cover_surface_cache_is_ready();
 // 只投递内存预处理任务，不访问 SD。调用前压缩封面应已由 ArtworkLoader 缓存。
 bool cover_surface_cache_request_track(uint32_t track_index, uint32_t *out_request_id = nullptr);
 
+// Phone artwork has its own generation namespace and may not refer to local track IDs.
+bool cover_surface_cache_request_phone(uint32_t image_revision, uint32_t *out_request_id = nullptr);
+bool cover_surface_cache_acquire_phone(uint32_t image_revision, bool dimmed, CoverSurfaceLease *out_lease);
+bool cover_surface_cache_restore_phone_dimmed(uint32_t image_revision);
+void cover_surface_cache_retain_phone(uint32_t image_revision);
 bool cover_surface_cache_get_snapshot(CoverSurfaceSnapshot *out_snapshot);
 bool cover_surface_cache_acquire(uint32_t track_index, CoverSurfaceLease *out_lease);
 // 磁带视图只依赖 normal；该 lease 不固定 dimmed，允许磁带稳态回收压暗 Surface。

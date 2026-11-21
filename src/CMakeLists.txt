@@ -32,6 +32,7 @@ idf_component_register(
         "system/bt_audio_source.cpp"
         "system/bt_audio_sink.cpp"
         "system/bt_audio_avrc.cpp"
+        "system/bt_phone_cover.cpp"
         "system/gamepad_input_service.cpp"
         "system/wifi_service.cpp"
         "system/wifi_remote_service.cpp"

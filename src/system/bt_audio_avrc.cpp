@@ -5,6 +5,9 @@
 #include <string.h>
 
 #include "audio_service.h"
+#include "bt_phone_cover.h"
+#include "ui/artwork/cover_surface_cache.h"
+#include "sdkconfig.h"
 #include "esp_avrc_api.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -46,6 +49,17 @@ static TickType_t s_caps_retry_due = 0;
 static TickType_t s_metadata_poll_due = 0;
 static TickType_t s_position_tick = 0;
 static bool s_tg_capabilities_configured = false;
+static uint32_t s_last_cover_submitted = 0U;
+#if defined(CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED) && CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED
+static uint8_t s_cover_handle[ESP_AVRC_CA_IMAGE_HANDLE_LEN] = {};
+static bool s_cover_handle_ready = false;
+static bool s_cover_link = false;
+static bool s_cover_connect_pending = false;
+static bool s_cover_fetch_pending = false;
+static bool s_cover_tried_connect = false;
+static bool s_cover_fetching = false;
+static uint32_t s_cover_epoch = 0U;
+#endif
 
 static uint8_t next_label()
 {
@@ -88,6 +102,7 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
     }
     case ESP_AVRC_CT_CONNECTION_STATE_EVT: {
         const bool connected = param->conn_stat.connected;
+        bt_phone_cover_track_changed();
         portENTER_CRITICAL(&s_lock);
         s_connected = connected && s_active;
         s_snapshot.connected = s_connected;
@@ -117,6 +132,16 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
         s_notifications_needed = 0U;
         s_release_pending = false;
         s_cmd_count = 0U;
+#if defined(CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED) && CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED
+        s_cover_handle_ready = false;
+        s_cover_link = false;
+        s_cover_connect_pending = false;
+        s_cover_fetch_pending = false;
+        s_cover_tried_connect = false;
+        s_cover_fetching = false;
+        s_cover_epoch = bt_phone_cover_track_epoch();
+#endif
+        s_last_cover_submitted = 0U;
         portEXIT_CRITICAL(&s_lock);
         ESP_LOGI(TAG, "AVRCP_CT %s", connected ? "connected" : "disconnected");
         break;
@@ -139,6 +164,16 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
             // AVRCP metadata callback attr_id uses ordinal 1..7, not mask.
             if (m.attr_id == 1U) copy_string(s_snapshot.title,
                 sizeof(s_snapshot.title), m.attr_text, m.attr_length);
+#if defined(CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED) && CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED
+            else if (m.attr_id == 8U && m.attr_text != nullptr &&
+                     m.attr_length == ESP_AVRC_CA_IMAGE_HANDLE_LEN) {
+                memcpy(s_cover_handle, m.attr_text, ESP_AVRC_CA_IMAGE_HANDLE_LEN);
+                s_cover_handle_ready = true;
+                s_cover_epoch = bt_phone_cover_track_epoch();
+                if (s_cover_link) s_cover_fetch_pending = true;
+                else if (!s_cover_tried_connect) s_cover_connect_pending = true;
+            }
+#endif
             else if (m.attr_id == 2U) copy_string(s_snapshot.artist,
                 sizeof(s_snapshot.artist), m.attr_text, m.attr_length);
             else if (m.attr_id == 3U) copy_string(s_snapshot.album,
@@ -175,10 +210,19 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
         break;
     }
     case ESP_AVRC_CT_CHANGE_NOTIFY_EVT: {
+        if (param->change_ntf.event_id == ESP_AVRC_RN_TRACK_CHANGE)
+            bt_phone_cover_track_changed();
         portENTER_CRITICAL(&s_lock);
         if (s_active && s_connected) {
             const uint8_t evt = param->change_ntf.event_id;
             if (evt == ESP_AVRC_RN_TRACK_CHANGE) {
+#if defined(CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED) && CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED
+                s_cover_handle_ready = false;
+                s_cover_fetch_pending = false;
+                s_cover_fetching = false;
+                s_cover_epoch = bt_phone_cover_track_epoch();
+#endif
+                s_last_cover_submitted = 0U;
                 s_snapshot.title[0] = '\0';
                 s_snapshot.artist[0] = '\0';
                 s_snapshot.album[0] = '\0';
@@ -207,6 +251,36 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
         portEXIT_CRITICAL(&s_lock);
         break;
     }
+#if defined(CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED) && CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED
+    case ESP_AVRC_CT_COVER_ART_STATE_EVT: {
+        const bool linked = param->cover_art_state.state == ESP_AVRC_COVER_ART_CONNECTED;
+        portENTER_CRITICAL(&s_lock);
+        s_cover_link = linked;
+        s_cover_fetch_pending = linked && s_cover_handle_ready;
+        s_cover_fetching = false;
+        portEXIT_CRITICAL(&s_lock);
+        ESP_LOGI(TAG, "AVRCP_COVER OBEX=%s reason=%u",
+            linked ? "CONNECTED" : "DISCONNECTED",
+            static_cast<unsigned>(param->cover_art_state.reason));
+        break;
+    }
+    case ESP_AVRC_CT_COVER_ART_DATA_EVT: {
+        const auto &data = param->cover_art_data;
+        const bool success = data.status == ESP_BT_STATUS_SUCCESS;
+        const bool ok = success &&
+            bt_phone_cover_append(BtPhoneCoverSource::Avrcp,
+                data.p_data, data.data_len, data.final);
+        if (!ok || data.final) {
+            portENTER_CRITICAL(&s_lock);
+            s_cover_fetching = false;
+            portEXIT_CRITICAL(&s_lock);
+        }
+        if (!ok) ESP_LOGW(TAG, "AVRCP_COVER chunk error status=%u final=%u bytes=%u",
+            static_cast<unsigned>(data.status), data.final,
+            static_cast<unsigned>(data.data_len));
+        break;
+    }
+#endif
     default: break;
     }
 }
@@ -285,6 +359,16 @@ static void reset_state()
     s_metadata_poll_due = 0;
     s_position_tick = 0;
     s_tg_capabilities_configured = false;
+    s_last_cover_submitted = 0U;
+#if defined(CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED) && CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED
+    s_cover_handle_ready = false;
+    s_cover_link = false;
+    s_cover_connect_pending = false;
+    s_cover_fetch_pending = false;
+    s_cover_tried_connect = false;
+    s_cover_fetching = false;
+    s_cover_epoch = 0U;
+#endif
     s_snapshot = {};
     s_snapshot.active = s_active;
 }
@@ -292,6 +376,8 @@ static void reset_state()
 
 esp_err_t bt_audio_avrc_host_start()
 {
+    (void)bt_phone_cover_init();
+    bt_phone_cover_track_changed();
     portENTER_CRITICAL(&s_lock);
     if (s_active) { portEXIT_CRITICAL(&s_lock); return ESP_OK; }
     s_active = true;
@@ -329,6 +415,7 @@ void bt_audio_avrc_host_stop()
     s_release_pending = false;
     s_cmd_count = 0U;
     portEXIT_CRITICAL(&s_lock);
+    bt_phone_cover_track_changed();
     if (!was_active) return;
     // AVRCP deinit must precede A2DP Sink deinit. Both are asynchronous:
     // wait for profile callbacks before allowing a new Source registration.
@@ -415,6 +502,11 @@ void bt_audio_avrc_update()
     uint16_t supported_events;
     bool cmd_send=false, cmd_release=false;
     uint8_t cmd=0U;
+#if defined(CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED) && CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED
+    bool connect_cover = false, fetch_cover = false;
+    uint8_t cover_handle[ESP_AVRC_CA_IMAGE_HANDLE_LEN] = {};
+    uint32_t cover_epoch = 0U;
+#endif
     const TickType_t now = xTaskGetTickCount();
 
     portENTER_CRITICAL(&s_lock);
@@ -477,6 +569,21 @@ void bt_audio_avrc_update()
         s_release_pending = true;
         s_release_due = now + kPressHold;
     }
+#if defined(CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED) && CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED
+    if (connected && ct_ready && s_cover_connect_pending && !s_cover_tried_connect) {
+        s_cover_connect_pending = false;
+        s_cover_tried_connect = true;
+        connect_cover = true;
+    }
+    if (connected && ct_ready && s_cover_link && s_cover_fetch_pending &&
+        s_cover_handle_ready && !s_cover_fetching) {
+        s_cover_fetch_pending = false;
+        s_cover_fetching = true;
+        fetch_cover = true;
+        memcpy(cover_handle, s_cover_handle, sizeof(cover_handle));
+        cover_epoch = s_cover_epoch;
+    }
+#endif
     if (connected && ct_ready && (s_poll_due == 0U ||
         static_cast<int32_t>(now - s_poll_due) >= 0)) {
         s_poll_due = now + kStatusPoll;
@@ -484,6 +591,37 @@ void bt_audio_avrc_update()
     }
     portEXIT_CRITICAL(&s_lock);
     if (!active) return;
+
+#if defined(CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED) && CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED
+    if (connect_cover) {
+        const esp_err_t err = esp_avrc_ct_cover_art_connect(512U);
+        ESP_LOGI(TAG, "AVRCP_COVER OBEX connect request: %s", esp_err_to_name(err));
+    }
+    if (fetch_cover) {
+        const bool ready = bt_phone_cover_begin(BtPhoneCoverSource::Avrcp, cover_epoch, 0U);
+        const esp_err_t err = ready
+            ? esp_avrc_ct_cover_art_get_linked_thumbnail(cover_handle)
+            : ESP_ERR_INVALID_STATE;
+        if (err != ESP_OK) {
+            portENTER_CRITICAL(&s_lock);
+            s_cover_fetching = false;
+            portEXIT_CRITICAL(&s_lock);
+            ESP_LOGW(TAG, "AVRCP_COVER thumbnail request: %s", esp_err_to_name(err));
+        }
+    }
+#endif
+    // Schedule phone JPEG/PNG conversion only from the normal service pump, never
+    // inside Bluedroid callbacks. Old Surface remains pinned during decoding.
+    BtPhoneCoverSnapshot cover = {};
+    if (connected && cover_surface_cache_is_ready() &&
+        bt_phone_cover_get_snapshot(&cover) && cover.ready &&
+        cover.image_revision != s_last_cover_submitted &&
+        cover_surface_cache_request_phone(cover.image_revision)) {
+        s_last_cover_submitted = cover.image_revision;
+        ESP_LOGI(TAG, "AVRCP_COVER surface requested revision=%lu source=%u",
+            static_cast<unsigned long>(cover.image_revision),
+            static_cast<unsigned>(cover.source));
+    }
 
     if (volume_pending) {
         // AudioTask is the only writer of CS43131: NO PCM attenuation stage.
@@ -525,7 +663,11 @@ void bt_audio_avrc_update()
         if (need_caps) (void)esp_avrc_ct_send_get_rn_capabilities_cmd(next_label());
         if (need_meta) (void)esp_avrc_ct_send_metadata_cmd(next_label(),
             ESP_AVRC_MD_ATTR_TITLE | ESP_AVRC_MD_ATTR_ARTIST |
-            ESP_AVRC_MD_ATTR_ALBUM | ESP_AVRC_MD_ATTR_PLAYING_TIME);
+            ESP_AVRC_MD_ATTR_ALBUM | ESP_AVRC_MD_ATTR_PLAYING_TIME
+#if defined(CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED) && CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED
+            | ESP_AVRC_MD_ATTR_COVER_ART
+#endif
+            );
         if (need_status) (void)esp_avrc_ct_send_get_play_status_cmd(next_label());
         const uint8_t ids[3] = {ESP_AVRC_RN_PLAY_STATUS_CHANGE,
                                  ESP_AVRC_RN_TRACK_CHANGE, ESP_AVRC_RN_PLAY_POS_CHANGED};
