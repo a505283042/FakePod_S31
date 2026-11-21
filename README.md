@@ -124,6 +124,40 @@
 
 ## 蓝牙音频发射 + 手机遥控共存（实验分支）
 
+### 修复“蓝牙音频发射：不支持”（2026-11-21）
+
+原因是先前在 `main` 上生成的 `sdkconfig.fakepod_s31` 中只启用了 BLE，
+切换到实验分支之后，PlatformIO 仍然复用了这个持久化配置：
+即使新增了 `sdkconfig.bluetooth.defaults`，配置也不会自动被覆盖。
+这样 Android BLE 仍能正常“广播中”，但 A2DP Source 宏被编译为关闭，
+UI 就会显示“不支持”。
+
+本分支已将 `platformio.ini` 的 sdkconfig 文件切换为 **`sdkconfig.fakepod_s31_a2dp`**。
+第一次重新构建会从 `sdkconfig.defaults;sdkconfig.bluetooth.defaults` 生成新的配置，
+不触碰主线原有的 `sdkconfig.fakepod_s31`，因此切回 `main` 也不影响原设置。
+同时增加编译期强制检查，若 Classic / A2DP / 内置 SBC 没有生效，编译会报错，
+不会再默默烧录一个显示“不支持”的固件。
+
+更新与编译命令（Windows PowerShell）：
+
+```powershell
+git switch feat/a2dp-source-ble-remote
+git pull --ff-only
+pio run -e fakepod_s31 -t clean
+pio run -e fakepod_s31
+```
+
+确认实际 SDK 配置：
+
+```powershell
+Select-String -Path .\sdkconfig.fakepod_s31_a2dp -Pattern '^(CONFIG_BT_(BLUEDROID_ENABLED|CLASSIC_ENABLED|A2DP_ENABLE|BLE_ENABLED|GATTS_ENABLE)=y|# CONFIG_BT_A2DP_USE_EXTERNAL_CODEC is not set)'
+```
+
+**正确结果应同时包含** `CONFIG_BT_CLASSIC_ENABLED=y`、`CONFIG_BT_A2DP_ENABLE=y`，
+且 external codec 没有开启。编译并烧录更新后的固件后，连接设置中的
+“蓝牙模式：遥控广播中”表示手机 GATT 等待连接，“蓝牙音频发射”应变为
+“点击搜索耳机”；如果卡在 “需先开启蓝牙”，再检查 `BT_AUDIO` 启动日志。
+
 在 `feat/a2dp-source-ble-remote` 分支上，蓝牙 Host 由 `ble_remote_service` **唯一初始化/停止**；
 A2DP Source 与原手机 GATT 遥控共用 Bluedroid。音源解码后从 AudioTask 的 PCM
 旁路复制到独立 PSRAM 环形缓存；蓝牙回调取 S16 立体声数据交给 ESP-IDF 的
