@@ -280,18 +280,39 @@ esp_err_t bt_audio_source_host_start()
         s_pcm_ring = static_cast<uint8_t *>(heap_caps_malloc(
             kRingFrames * 4U, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     }
-    if (s_pcm_ring == nullptr) return ESP_ERR_NO_MEM;
+    if (s_pcm_ring == nullptr) {
+        ESP_LOGE(TAG, "A2DP启动失败：无法分配32KB PSRAM PCM队列");
+        return ESP_ERR_NO_MEM;
+    }
+    ESP_LOGI(TAG, "A2DP启动：internal_free=%u psram_free=%u",
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT)),
+             static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_SPIRAM)));
     esp_err_t err = esp_bt_gap_register_callback(classic_gap_event);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "A2DP GAP回调注册失败：%s", esp_err_to_name(err));
+        return err;
+    }
     err = esp_bt_gap_set_device_name("FakePod Audio");
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "A2DP设备名设置失败：%s", esp_err_to_name(err));
+        return err;
+    }
     // 仍保留 BLE 广播：Classic 本机不作为可发现的音频接收端。
     err = esp_bt_gap_set_scan_mode(ESP_BT_NON_CONNECTABLE, ESP_BT_NON_DISCOVERABLE);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "A2DP Classic扫描模式设置失败：%s", esp_err_to_name(err));
+        return err;
+    }
     err = esp_a2d_register_callback(a2dp_event);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "A2DP Profile回调注册失败：%s", esp_err_to_name(err));
+        return err;
+    }
     err = esp_a2d_source_register_data_callback(a2dp_pcm_callback);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "A2DP PCM回调注册失败：%s", esp_err_to_name(err));
+        return err;
+    }
     portENTER_CRITICAL(&s_lock);
     s_init_requested = true;
     s_profile_ready = false;
@@ -314,7 +335,7 @@ esp_err_t bt_audio_source_host_start()
         portENTER_CRITICAL(&s_lock);
         s_init_requested = false;
         portEXIT_CRITICAL(&s_lock);
-        ESP_LOGW(TAG, "A2DP Source init: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "A2DP Source初始化失败：%s", esp_err_to_name(err));
     }
     return err;
 #else
