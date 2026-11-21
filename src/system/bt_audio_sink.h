@@ -14,8 +14,13 @@ struct BtAudioSinkSnapshot {
     bool streaming = false;
     uint32_t sample_rate_hz = 44100U;
     uint32_t queued_frames = 0U;
-    uint32_t dropped_frames = 0U;
-    uint32_t underrun_frames = 0U;
+    uint32_t dropped_frames = 0U;       // Actual ring overflow (unwanted)
+    uint32_t underrun_frames = 0U;      // Missing PCM while output was active
+    uint64_t received_frames = 0U;
+    uint64_t consumed_frames = 0U;
+    uint32_t startup_trim_frames = 0U;  // Intentional startup latency reduction
+    uint32_t smooth_adjust_frames = 0U; // Extra source frames consumed by interpolation
+    uint32_t queued_peak_frames = 0U;
     char peer_name[48] = {};
 };
 
@@ -27,4 +32,10 @@ void bt_audio_sink_host_stop();
 void bt_audio_sink_update();
 bool bt_audio_sink_get_snapshot(BtAudioSinkSnapshot *out);
 size_t bt_audio_sink_read_pcm32(int32_t *pcm, size_t max_frames);
+// AudioTask-only: 256-frame smooth drift correction (~0.4%/step) when queue is
+// too deep. This never blocks the Bluetooth callback or changes I2S sample rate.
+size_t bt_audio_sink_read_pcm32_adjusted(int32_t *pcm, size_t max_frames);
+// AudioTask-only: after DAC initialization, retain at most max_frames of the
+// newest PCM, avoiding permanent 200ms+ startup latency.
+size_t bt_audio_sink_trim_latency(size_t max_frames);
 void bt_audio_sink_flush();

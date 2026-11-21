@@ -6597,6 +6597,17 @@ static void audio_task_service_bluetooth_sink()
         }
         g_bt_sink_output_active = true;
         g_bt_sink_output_rate = bt.sample_rate_hz;
+        // DAC/I2S startup can take longer than a 32-KiB receive ring. After
+        // hardware is ready, start from recent phone PCM (110ms) instead of
+        // keeping stale audio or running permanently near ring overflow.
+        // Large startup reserve is PSRAM-only; normal playback stays low-latency.
+        const size_t startup_limit =
+            static_cast<size_t>(bt.sample_rate_hz) * 110U / 1000U;
+        const size_t startup_trim = bt_audio_sink_trim_latency(startup_limit);
+        ESP_LOGI(TAG, "BT_SINK_OUTPUT startup trim=%u frames (~%ums) target=110ms",
+            static_cast<unsigned>(startup_trim),
+            static_cast<unsigned>(
+                static_cast<uint64_t>(startup_trim) * 1000ULL / bt.sample_rate_hz));
         g_bt_sink_fft_frames = 0ULL;
         audio_spectrum_snapshot_reset(
             g_task_playback_revision, UINT32_MAX, bt.sample_rate_hz);
@@ -6605,7 +6616,11 @@ static void audio_task_service_bluetooth_sink()
             (unsigned long)g_bt_sink_output_rate);
     }
 
-    size_t frames = bt_audio_sink_read_pcm32(g_pcm_block, AUDIO_STREAM_FRAMES);
+    // Consume the independent phone/source clock with <0.8% interpolated
+    // drift compensation when the queue rises above 110/160ms. This avoids
+    // endless overflow caused by a slightly faster phone SBC delivery clock.
+    size_t frames = bt_audio_sink_read_pcm32_adjusted(
+        g_pcm_block, AUDIO_STREAM_FRAMES);
     if (frames == 0U) {
         // Media packets can be jittery; keep the DAC clock running and
         // leave mute policy in AudioTask. Silence does not advance music time.

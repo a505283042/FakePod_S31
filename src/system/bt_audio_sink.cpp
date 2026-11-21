@@ -1,5 +1,6 @@
 #include "bt_audio_sink.h"
 #include "bt_audio_avrc.h"
+#include "bt_pcm_drift.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -21,7 +22,9 @@
 
 namespace {
 static const char *TAG = "BT_SINK";
-static constexpr size_t kRingFrames = 8192U; // S16 stereo: 32 KiB in PSRAM.
+// The extra startup-only headroom absorbs DAC/I2S initialisation (typically
+// >100ms). Playback is trimmed to 110ms after start, not left with 370ms latency.
+static constexpr size_t kRingFrames = 16384U; // S16 stereo: 64 KiB PSRAM.
 static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 static uint8_t *s_ring = nullptr;
 static size_t s_read = 0U;
@@ -29,6 +32,11 @@ static size_t s_queued = 0U;
 static uint32_t s_rate_hz = 44100U;
 static uint32_t s_dropped_frames = 0U;
 static uint32_t s_underrun_frames = 0U;
+static uint64_t s_received_frames = 0U;
+static uint64_t s_consumed_frames = 0U;
+static uint32_t s_startup_trim_frames = 0U;
+static uint32_t s_smooth_adjust_frames = 0U;
+static uint32_t s_peak_queued = 0U;
 static bool s_requested = false;
 static bool s_profile_ready = false;
 static bool s_connected = false;
@@ -55,6 +63,7 @@ static void audio_data_cb(const uint8_t *data, uint32_t length)
         portEXIT_CRITICAL(&s_mux);
         return;
     }
+    s_received_frames += count;
     size_t start = 0U;
     size_t frames = count;
     if (frames > kRingFrames) {
@@ -75,6 +84,7 @@ static void audio_data_cb(const uint8_t *data, uint32_t length)
     if (frames > first) memcpy(s_ring, data + (start + first) * 4U,
                                (frames - first) * 4U);
     s_queued += frames;
+    if (s_queued > s_peak_queued) s_peak_queued = static_cast<uint32_t>(s_queued);
     portEXIT_CRITICAL(&s_mux);
 }
 
@@ -164,6 +174,11 @@ esp_err_t bt_audio_sink_host_start()
     s_stats_due = 0;
     s_dropped_frames = 0U;
     s_underrun_frames = 0U;
+    s_received_frames = 0U;
+    s_consumed_frames = 0U;
+    s_startup_trim_frames = 0U;
+    s_smooth_adjust_frames = 0U;
+    s_peak_queued = 0U;
     flush_locked();
     portEXIT_CRITICAL(&s_mux);
 
@@ -265,6 +280,11 @@ bool bt_audio_sink_get_snapshot(BtAudioSinkSnapshot *out)
     s.queued_frames = static_cast<uint32_t>(s_queued);
     s.dropped_frames = s_dropped_frames;
     s.underrun_frames = s_underrun_frames;
+    s.received_frames = s_received_frames;
+    s.consumed_frames = s_consumed_frames;
+    s.startup_trim_frames = s_startup_trim_frames;
+    s.smooth_adjust_frames = s_smooth_adjust_frames;
+    s.queued_peak_frames = s_peak_queued;
     memcpy(s.peer_name, s_peer_name, sizeof(s.peer_name));
     portEXIT_CRITICAL(&s_mux);
     *out = s;
@@ -290,8 +310,68 @@ size_t bt_audio_sink_read_pcm32(int32_t *pcm, size_t max_frames)
     }
     s_read = (s_read + frames) % kRingFrames;
     s_queued -= frames;
+    s_consumed_frames += frames;
     portEXIT_CRITICAL(&s_mux);
     return frames;
+}
+
+size_t bt_audio_sink_trim_latency(size_t max_frames)
+{
+    if (max_frames == 0U) return 0U;
+    portENTER_CRITICAL(&s_mux);
+    // Drop the oldest delayed startup samples once, after I2S setup. This is
+    // intentional low-latency resynchronisation, not ring overflow.
+    const size_t stale = s_queued > max_frames ? s_queued - max_frames : 0U;
+    if (stale != 0U) {
+        s_read = (s_read + stale) % kRingFrames;
+        s_queued -= stale;
+        s_startup_trim_frames += static_cast<uint32_t>(stale);
+    }
+    portEXIT_CRITICAL(&s_mux);
+    return stale;
+}
+
+size_t bt_audio_sink_read_pcm32_adjusted(int32_t *pcm, size_t max_frames)
+{
+    if (pcm == nullptr || max_frames == 0U) return 0U;
+    if (max_frames != bt_pcm_drift::kOutputBlockFrames)
+        return bt_audio_sink_read_pcm32(pcm, max_frames);
+
+    int16_t source[(bt_pcm_drift::kOutputBlockFrames +
+                    bt_pcm_drift::kMaxExtraSourceFrames) * 2U] = {};
+    size_t output_frames = 0U, extra = 0U, taken = 0U;
+    portENTER_CRITICAL(&s_mux);
+    if (s_requested && s_connected && s_streaming && s_ring != nullptr) {
+        output_frames = s_queued < max_frames ? s_queued : max_frames;
+        if (output_frames == max_frames) {
+            const size_t q_high = static_cast<size_t>(s_rate_hz) * 110U / 1000U;
+            const size_t q_critical = static_cast<size_t>(s_rate_hz) * 160U / 1000U;
+            if (s_queued > q_critical && s_queued >= max_frames + 2U)
+                extra = 2U; // 0.78% temporary catch-up
+            else if (s_queued > q_high && s_queued >= max_frames + 1U)
+                extra = 1U; // 0.39% drift correction
+        }
+        taken = output_frames + extra;
+        // Copy input under lock, but do all interpolation outside the BT lock.
+        const size_t first = taken < kRingFrames - s_read
+            ? taken : kRingFrames - s_read;
+        if (first != 0U)
+            memcpy(source, s_ring + s_read * 4U, first * 4U);
+        if (taken > first)
+            memcpy(source + first * 2U, s_ring,
+                   (taken - first) * 4U);
+        s_read = (s_read + taken) % kRingFrames;
+        s_queued -= taken;
+        s_consumed_frames += taken;
+        s_smooth_adjust_frames += static_cast<uint32_t>(extra);
+        if (output_frames == 0U)
+            s_underrun_frames += static_cast<uint32_t>(max_frames);
+    }
+    portEXIT_CRITICAL(&s_mux);
+    if (output_frames != 0U)
+        bt_pcm_drift::convert_s16_stereo(
+            source, taken, pcm, output_frames);
+    return output_frames;
 }
 
 void bt_audio_sink_flush()
@@ -307,7 +387,8 @@ void bt_audio_sink_update()
     // incoming phone absolute-volume changes to the sole AudioTask.
     bt_audio_avrc_update();
     const TickType_t now = xTaskGetTickCount();
-    uint32_t q=0U, rate=0U, drop=0U;
+    uint32_t q=0U, rate=0U, drop=0U, under=0U, trim=0U, smooth=0U, peak=0U;
+    uint64_t received=0U, consumed=0U;
     bool should_log = false;
     portENTER_CRITICAL(&s_mux);
     if (s_requested && s_streaming &&
@@ -316,13 +397,25 @@ void bt_audio_sink_update()
         q = static_cast<uint32_t>(s_queued);
         rate = s_rate_hz;
         drop = s_dropped_frames;
+        under = s_underrun_frames;
+        received = s_received_frames;
+        consumed = s_consumed_frames;
+        trim = s_startup_trim_frames;
+        smooth = s_smooth_adjust_frames;
+        peak = s_peak_queued;
         should_log = true;
     }
     portEXIT_CRITICAL(&s_mux);
     if (should_log) {
-        ESP_LOGI(TAG, "A2DP_RX rate=%luHz queued=%lu/%u drop=%lu DMA_free=%u largest=%u",
+        ESP_LOGI(TAG,
+            "A2DP_RX rate=%luHz queued=%lu/%u peak=%lu rx=%llu played_src=%llu "
+            "drop=%lu underrun=%lu start_trim=%lu smooth_extra=%lu "
+            "DMA_free=%u largest=%u",
             (unsigned long)rate, (unsigned long)q, (unsigned)kRingFrames,
-            (unsigned long)drop,
+            (unsigned long)peak,
+            (unsigned long long)received, (unsigned long long)consumed,
+            (unsigned long)drop, (unsigned long)under,
+            (unsigned long)trim, (unsigned long)smooth,
             (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
     }

@@ -83,10 +83,9 @@ bool bt_phone_cover_begin(BtPhoneCoverSource source, uint32_t epoch, size_t expe
 {
     if (source == BtPhoneCoverSource::None || epoch == 0U || s_buffer == nullptr ||
         expected_bytes > BT_PHONE_COVER_MAX_BYTES || !lock()) return false;
-    const bool allow = epoch == s_epoch &&
-        (source == BtPhoneCoverSource::Avrcp ||
-         ((!s_receiving || s_incoming != BtPhoneCoverSource::Avrcp) &&
-          (!s_ready.ready || s_ready.source != BtPhoneCoverSource::Avrcp)));
+    // Native AVRCP is the only artwork producer. Never let an old Android
+    // Remote build overwrite an image even if it still sends BLE commands.
+    const bool allow = epoch == s_epoch && source == BtPhoneCoverSource::Avrcp;
     if (allow) {
         s_receiving = true;
         s_received = 0U;
@@ -107,7 +106,7 @@ bool bt_phone_cover_append(BtPhoneCoverSource source, const uint8_t *data, size_
         size <= BT_PHONE_COVER_MAX_BYTES - s_received &&
         (s_expected == 0U || s_received + size <= s_expected);
     if (!valid) {
-        // An old AVRCP callback must not cancel a newer Android transaction.
+        // Invalid or stale AVRCP data must not publish a partial image.
         if (s_receiving && source == s_incoming) s_receiving = false;
         unlock();
         return false;

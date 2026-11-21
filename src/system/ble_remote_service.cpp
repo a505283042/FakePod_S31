@@ -13,7 +13,6 @@
 #include "bt_audio_source.h"
 #include "bt_audio_sink.h"
 #include "bt_audio_avrc.h"
-#include "bt_phone_cover.h"
 #include "app/app_manager.h"
 #include "battery_service.h"
 #include "media_catalog_v2.h"
@@ -220,17 +219,10 @@ static uint8_t g_metadata_chunk_count = 0U;
 static uint8_t g_metadata_send_pass = 0U; // 0=首发，1=可靠性补发
 static TickType_t g_metadata_replay_due_tick = 0;
 
-// Android companion cover upload uses the existing encrypted command characteristic.
-// Fixed 20-byte packets preserve compatibility with MTU=23 and avoid new GATT handles.
-static constexpr size_t kCoverGattMaxPacketBytes = 244U; // negotiated ATT MTU 247
-static constexpr uint8_t kCoverBeginCommand = 0x40U;
-static constexpr uint8_t kCoverDataCommand = 0x41U;
-static constexpr uint8_t kCoverFinishCommand = 0x42U;
-static bool g_cover_upload_active = false;
-static uint8_t g_cover_upload_transaction = 0U;
-static uint32_t g_cover_upload_epoch = 0U;
-static uint32_t g_cover_upload_size = 0U;
-static uint32_t g_cover_upload_offset = 0U;
+// Companion BLE cover chunks (0x40..0x42) are intentionally unsupported.
+// Only native AVRCP 1.6 Cover Art transfers album artwork. Preserve 20-byte
+// remote-control GATT commands and Wi-Fi provisioning behavior.
+static constexpr size_t kRemoteCommandMaxPacketBytes = 20U;
 
 static bool g_wifi_provision_active = false;
 static uint8_t g_wifi_provision_transaction = 0U;
@@ -941,68 +933,6 @@ static int handle_wifi_provision_fragment(const uint8_t *payload, size_t payload
     return 0;
 }
 
-static int handle_phone_cover_fragment(const uint8_t *payload, size_t len)
-{
-    if (payload == nullptr || len < 2U || !bt_audio_avrc_is_sink_mode())
-        return BLE_ATT_ERR_UNLIKELY;
-
-    const uint8_t op = payload[0];
-    const uint8_t transaction = payload[1];
-    if (op == kCoverBeginCommand) {
-        if (len != 6U) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
-        const uint32_t total = static_cast<uint32_t>(payload[2]) |
-            (static_cast<uint32_t>(payload[3]) << 8U) |
-            (static_cast<uint32_t>(payload[4]) << 16U) |
-            (static_cast<uint32_t>(payload[5]) << 24U);
-        g_cover_upload_active = false;
-        if (total < 32U || total > BT_PHONE_COVER_MAX_BYTES) return BLE_ATT_ERR_UNLIKELY;
-        const uint32_t epoch = bt_phone_cover_track_epoch();
-        if (epoch == 0U || !bt_phone_cover_begin(BtPhoneCoverSource::Android, epoch, total))
-            return BLE_ATT_ERR_UNLIKELY;
-        g_cover_upload_transaction = transaction;
-        g_cover_upload_epoch = epoch;
-        g_cover_upload_size = total;
-        g_cover_upload_offset = 0U;
-        g_cover_upload_active = true;
-        return 0;
-    }
-    if (!g_cover_upload_active || g_cover_upload_transaction != transaction ||
-        g_cover_upload_epoch != bt_phone_cover_track_epoch()) {
-        g_cover_upload_active = false;
-        return BLE_ATT_ERR_UNLIKELY;
-    }
-    if (op == kCoverDataCommand) {
-        if (len < 7U || len > kCoverGattMaxPacketBytes)
-            return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
-        const uint32_t offset = static_cast<uint32_t>(payload[2]) |
-            (static_cast<uint32_t>(payload[3]) << 8U) |
-            (static_cast<uint32_t>(payload[4]) << 16U) |
-            (static_cast<uint32_t>(payload[5]) << 24U);
-        const size_t n = len - 6U;
-        if (offset != g_cover_upload_offset ||
-            n > g_cover_upload_size - g_cover_upload_offset ||
-            !bt_phone_cover_append(BtPhoneCoverSource::Android, payload + 6U, n, false)) {
-            g_cover_upload_active = false;
-            return BLE_ATT_ERR_UNLIKELY;
-        }
-        g_cover_upload_offset += static_cast<uint32_t>(n);
-        return 0;
-    }
-    if (op == kCoverFinishCommand) {
-        if (len != 2U) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
-        g_cover_upload_active = false;
-        if (g_cover_upload_offset != g_cover_upload_size ||
-            !bt_phone_cover_append(BtPhoneCoverSource::Android, nullptr, 0U, true)) {
-            return BLE_ATT_ERR_UNLIKELY;
-        }
-        ESP_LOGI(TAG, "Android album cover complete bytes=%lu epoch=%lu",
-            static_cast<unsigned long>(g_cover_upload_size),
-            static_cast<unsigned long>(g_cover_upload_epoch));
-        return 0;
-    }
-    return BLE_ATT_ERR_UNLIKELY;
-}
-
 static int execute_control_write(
     uint16_t conn_handle,
     const uint8_t *payload,
@@ -1013,13 +943,12 @@ static int execute_control_write(
     }
 
     const uint8_t command = payload[0];
-    if (command == kCoverBeginCommand || command == kCoverDataCommand ||
-        command == kCoverFinishCommand)
-        return payload_len <= kCoverGattMaxPacketBytes
-            ? handle_phone_cover_fragment(payload, payload_len)
-            : BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
-    // All existing commands retain their original 20-byte contract.
-    if (payload_len > 20U) return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    // Reject old app cover transfers immediately, without allocating PSRAM,
+    // writing an album-image buffer, or competing with the native OBEX path.
+    if (command >= 0x40U && command <= 0x42U)
+        return BLE_ATT_ERR_UNLIKELY;
+    if (payload_len > kRemoteCommandMaxPacketBytes)
+        return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
     if (command == 0x31U) return handle_library_fragment(payload, payload_len);
     if (command == kWifiProvisionCommand) {
         return handle_wifi_provision_fragment(payload, payload_len);
@@ -1115,7 +1044,7 @@ static void init_control_gatt_defs()
     g_control_attr_db[kIdxCommandValue].att_desc.uuid_p =
         const_cast<uint8_t *>(kControlCommandUuid);
     g_control_attr_db[kIdxCommandValue].att_desc.perm = ESP_GATT_PERM_WRITE_ENCRYPTED;
-    g_control_attr_db[kIdxCommandValue].att_desc.max_length = kCoverGattMaxPacketBytes;
+    g_control_attr_db[kIdxCommandValue].att_desc.max_length = kRemoteCommandMaxPacketBytes;
     g_control_attr_db[kIdxCommandValue].att_desc.length = 0U;
     g_control_attr_db[kIdxCommandValue].att_desc.value = nullptr;
 
@@ -1985,7 +1914,6 @@ static void ble_gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t ga
         }
 
         case ESP_GATTS_DISCONNECT_EVT: {
-            g_cover_upload_active = false;
             portENTER_CRITICAL(&g_lock);
             g_connected = false;
             g_encrypted = false;

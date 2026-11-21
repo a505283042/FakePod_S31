@@ -5,7 +5,7 @@
 
 // A2DP phone cover transfer staging, independent of TF/NAS catalog identity.
 // JPEG/PNG bytes are bounded in PSRAM and never decoded in Bluetooth callbacks.
-enum class BtPhoneCoverSource : uint8_t { None = 0, Android = 1, Avrcp = 2 };
+enum class BtPhoneCoverSource : uint8_t { None = 0, Avrcp = 2 };
 struct BtPhoneCoverSnapshot {
     bool ready = false;
     uint32_t track_epoch = 0;
@@ -14,10 +14,9 @@ struct BtPhoneCoverSnapshot {
     BtPhoneCoverSource source = BtPhoneCoverSource::None;
 };
 
-// Native BIP JPEGs can exceed the 192 KiB BLE fallback cap. Bound the
-// compressed staging buffer to 512 KiB in external PSRAM; overflow must
-// trigger the linked-thumbnail fallback instead of writing past the buffer.
-static constexpr size_t BT_PHONE_COVER_MAX_BYTES = 512U * 1024U;
+// Native AVRCP linked thumbnails use only this bounded PSRAM staging buffer.
+// Android Remote BLE album-art upload and GetImage HD path are disabled.
+static constexpr size_t BT_PHONE_COVER_MAX_BYTES = 192U * 1024U;
 
 // Call from ordinary startup, not from a Bluetooth stack callback.
 bool bt_phone_cover_init();
