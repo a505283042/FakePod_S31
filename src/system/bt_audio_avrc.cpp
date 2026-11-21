@@ -422,7 +422,10 @@ void bt_audio_avrc_update()
     s_volume_pending = false;
     volume_interim = s_volume_interim_pending;
     s_volume_interim_pending = false;
-    volume_changed = s_local_volume_changed && s_volume_registered;
+    // AVRCP requires INTERIM first; a volume change in the same update must
+    // remain registered until a later CHANGED response is delivered.
+    volume_changed = !volume_interim &&
+        s_local_volume_changed && s_volume_registered;
     if (volume_changed) {
         s_local_volume_changed = false;
         s_volume_registered = false;
