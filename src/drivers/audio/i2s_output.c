@@ -5,6 +5,7 @@
 #include "driver/i2s_std.h"
 #include "esp_clk_tree.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 
 #include "board_pins.h"
 #include "app_diag_config.h"
@@ -248,6 +249,60 @@ esp_err_t i2s_output_stream_start_32bit(uint32_t sample_rate_hz)
         (unsigned)rate_profile.i2s_dma_desc_num,
         (unsigned)I2S_DMA_FRAME_NUM);
     return i2s_output_create_channel(sample_rate_hz, 0U);
+}
+
+// High-rate / Bluetooth coexistence deliberately changes only the I2S DMA
+// queue depth; DAC clock, original sample rate and 32-bit PCM remain unchanged.
+// 96kHz normal=26x256 ~69ms / ~52KB DMA. With A2DP+BLE enabled the measured
+// available DMA pool before high-rate start is ~40KB. Use ~43ms/32KB, with
+// bounded fallback if other driver allocations have fragmented this pool.
+// Never fallback on a non-memory driver error; a clock/configuration failure
+// must remain visible rather than being masked by repeatedly retrying.
+esp_err_t i2s_output_stream_start_32bit_bt_coexist(uint32_t sample_rate_hz)
+{
+    if (sample_rate_hz != 96000U && sample_rate_hz != 176400U) {
+        return i2s_output_stream_start_32bit(sample_rate_hz);
+    }
+    static const uint8_t kCoexistDmaDesc[] = {16U, 14U, 12U};
+    // Each 256 frame/stereo/32-bit slot buffer is 2048 bytes.
+    // Leave space for BT/SPI/SD driver operation; the SDMMC 4KB bounce buffer
+    // was already allocated during boot before Bluetooth was enabled.
+    static const size_t kDmaHeadroomBytes = 4096U;
+    esp_err_t ret = ESP_ERR_NO_MEM;
+    for (unsigned i = 0U; i < sizeof(kCoexistDmaDesc); ++i) {
+        const uint8_t desc = kCoexistDmaDesc[i];
+        const size_t dma_free = heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        const size_t minimum = (size_t)desc * I2S_DMA_FRAME_NUM *
+                               2U * sizeof(uint32_t) + kDmaHeadroomBytes;
+        if (dma_free < minimum) {
+            ESP_LOGW(TAG,
+                "I2S_BT_DMA: skip rate=%lu desc=%u need>=%u DMA_free=%u largest=%u",
+                (unsigned long)sample_rate_hz, (unsigned)desc,
+                (unsigned)minimum, (unsigned)dma_free,
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+            continue;
+        }
+        ESP_LOGI(TAG,
+            "I2S_BT_DMA: try rate=%lu desc=%u frames=%u DMA_free=%u largest=%u",
+            (unsigned long)sample_rate_hz, (unsigned)desc,
+            (unsigned)I2S_DMA_FRAME_NUM, (unsigned)dma_free,
+            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+        ret = i2s_output_create_channel(sample_rate_hz, desc);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG,
+                "I2S_BT_DMA: ready rate=%lu desc=%u runway=%lums DMA_remaining=%u",
+                (unsigned long)sample_rate_hz, (unsigned)desc,
+                (unsigned long)((uint64_t)desc * I2S_DMA_FRAME_NUM * 1000U / sample_rate_hz),
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+            return ret;
+        }
+        ESP_LOGW(TAG, "I2S_BT_DMA: init failed rate=%lu desc=%u err=%s",
+                 (unsigned long)sample_rate_hz, (unsigned)desc, esp_err_to_name(ret));
+        if (ret != ESP_ERR_NO_MEM) return ret;
+    }
+    ESP_LOGE(TAG, "I2S_BT_DMA: insufficient DMA memory for high-rate I2S + Bluetooth, rate=%lu",
+             (unsigned long)sample_rate_hz);
+    return ret;
 }
 
 esp_err_t i2s_output_stream_start_32bit_nsf(uint32_t sample_rate_hz)
