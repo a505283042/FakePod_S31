@@ -226,6 +226,18 @@
     BLE 手机遥控连接、I2S DMA 和 LVGL 16 行双缓冲保持正常。
 
 
+**AVRCP 6.1 官方案例对齐补丁（后续提交，尚未在实机重新验证）**：
+在 `src/system/bt_audio_avrc.cpp` 中把 metadata 属性判断改为官方
+`ESP_AVRC_MD_ATTR_TITLE/ARTIST/ALBUM/PLAYING_TIME/COVER_ART`
+（值分别为 `0x01/0x02/0x04/0x40/0x80`）；原先把封面误当成 8、
+把专辑误当成 3、时长误当成 7 的判断已修正。
+Cover Art 会先检查 SDP `tg_feat_flag & ESP_AVRC_FEAT_FLAG_TG_COVER_ART`
+（`0x0100`），支持才申请 OBEX/BIP 连接，成功后请求 `0x80` 图片句柄；
+通过句柄去重，不重复拉取同图。
+已确认当前测试手机的 `tg_flag=0x00d1` **不包含 `0x0100`**，
+故它仍需要 Android App BLE 回退。参考：
+`esp-idf/release/v6.1/examples/bluetooth/bluedroid/classic_bt/avrcp_ct_cover_art`。
+
 第二阶段 Cover Art 验收计划（实验分支 feat/phone-avrcp-cover-art）：
 
 12. 检查重新生成的 sdkconfig 中实际含有

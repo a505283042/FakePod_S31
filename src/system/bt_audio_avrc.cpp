@@ -58,6 +58,8 @@ static bool s_cover_connect_pending = false;
 static bool s_cover_fetch_pending = false;
 static bool s_cover_tried_connect = false;
 static bool s_cover_fetching = false;
+static bool s_cover_peer_supported = false;
+static bool s_cover_handle_requested = false; // Same image handle must not be fetched every 15s.
 static uint32_t s_cover_epoch = 0U;
 #endif
 
@@ -143,6 +145,8 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
         s_cover_fetch_pending = false;
         s_cover_tried_connect = false;
         s_cover_fetching = false;
+        s_cover_peer_supported = false;
+        s_cover_handle_requested = false;
         s_cover_epoch = cover_epoch;
 #endif
         s_last_cover_submitted = 0U;
@@ -151,10 +155,27 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
         break;
     }
     case ESP_AVRC_CT_REMOTE_FEATURES_EVT: {
+        const uint16_t tg_flags = param->rmt_feats.tg_feat_flag;
         ESP_LOGI(TAG,
             "AVRCP_PEER features=0x%08lx tg_flag=0x%04x (RN flags alone do not imply Cover Art)",
             static_cast<unsigned long>(param->rmt_feats.feat_mask),
-            static_cast<unsigned>(param->rmt_feats.tg_feat_flag));
+            static_cast<unsigned>(tg_flags));
+#if defined(CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED) && CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED
+        const bool supports_cover = (tg_flags & ESP_AVRC_FEAT_FLAG_TG_COVER_ART) != 0U;
+        portENTER_CRITICAL(&s_lock);
+        if (s_active && s_connected) {
+            s_cover_peer_supported = supports_cover;
+            // Follow ESP-IDF release/v6.1 example: SDP feature -> OBEX connect.
+            // Never wait for a 0x80 image handle before opening OBEX.
+            if (supports_cover && !s_cover_link && !s_cover_tried_connect)
+                s_cover_connect_pending = true;
+        }
+        portEXIT_CRITICAL(&s_lock);
+        ESP_LOGI(TAG, "AVRCP_COVER peer_support=%u (SDP TG 0x0100)",
+            supports_cover ? 1U : 0U);
+        if (!supports_cover)
+            ESP_LOGI(TAG, "AVRCP_COVER native unavailable; Android BLE artwork fallback required");
+#endif
         break;
     }
     case ESP_AVRC_CT_GET_RN_CAPABILITIES_RSP_EVT: {
@@ -171,29 +192,38 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
     case ESP_AVRC_CT_METADATA_RSP_EVT: {
         const auto &m = param->meta_rsp;
 #if defined(CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED) && CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED
-        const uint32_t cover_epoch = m.attr_id == 8U
+        const uint32_t cover_epoch = m.attr_id == ESP_AVRC_MD_ATTR_COVER_ART
             ? bt_phone_cover_track_epoch() : 0U;
 #endif
         portENTER_CRITICAL(&s_lock);
         if (s_active && s_connected) {
-            // AVRCP metadata callback attr_id uses ordinal 1..7, not mask.
-            if (m.attr_id == 1U) copy_string(s_snapshot.title,
+            // ESP-IDF 6.1 meta_rsp.attr_id is esp_avrc_md_attr_mask_t
+            // (0x01 title, 0x02 artist, 0x04 album, 0x40 time, 0x80 cover).
+            if (m.attr_id == ESP_AVRC_MD_ATTR_TITLE) copy_string(s_snapshot.title,
                 sizeof(s_snapshot.title), m.attr_text, m.attr_length);
 #if defined(CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED) && CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED
-            else if (m.attr_id == 8U && m.attr_text != nullptr &&
+            else if (m.attr_id == ESP_AVRC_MD_ATTR_COVER_ART &&
+                     m.attr_text != nullptr &&
                      m.attr_length == ESP_AVRC_CA_IMAGE_HANDLE_LEN) {
-                memcpy(s_cover_handle, m.attr_text, ESP_AVRC_CA_IMAGE_HANDLE_LEN);
-                s_cover_handle_ready = true;
-                s_cover_epoch = cover_epoch;
-                if (s_cover_link) s_cover_fetch_pending = true;
-                else if (!s_cover_tried_connect) s_cover_connect_pending = true;
+                const bool changed_handle = !s_cover_handle_ready ||
+                    memcmp(s_cover_handle, m.attr_text, ESP_AVRC_CA_IMAGE_HANDLE_LEN) != 0 ||
+                    s_cover_epoch != cover_epoch;
+                if (changed_handle) {
+                    memcpy(s_cover_handle, m.attr_text, ESP_AVRC_CA_IMAGE_HANDLE_LEN);
+                    s_cover_handle_ready = true;
+                    s_cover_handle_requested = false;
+                    s_cover_epoch = cover_epoch;
+                    // Download only after SDP announced Cover Art and OBEX is linked.
+                    s_cover_fetch_pending = s_cover_peer_supported && s_cover_link;
+                }
             }
 #endif
-            else if (m.attr_id == 2U) copy_string(s_snapshot.artist,
+            else if (m.attr_id == ESP_AVRC_MD_ATTR_ARTIST) copy_string(s_snapshot.artist,
                 sizeof(s_snapshot.artist), m.attr_text, m.attr_length);
-            else if (m.attr_id == 3U) copy_string(s_snapshot.album,
+            else if (m.attr_id == ESP_AVRC_MD_ATTR_ALBUM) copy_string(s_snapshot.album,
                 sizeof(s_snapshot.album), m.attr_text, m.attr_length);
-            else if (m.attr_id == 7U && m.attr_text != nullptr && m.attr_length > 0) {
+            else if (m.attr_id == ESP_AVRC_MD_ATTR_PLAYING_TIME &&
+                     m.attr_text != nullptr && m.attr_length > 0) {
                 char duration[16] = {};
                 copy_string(duration, sizeof(duration), m.attr_text, m.attr_length);
                 s_snapshot.duration_ms = static_cast<uint32_t>(strtoul(duration, nullptr, 10));
@@ -203,11 +233,11 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
             ++s_snapshot.metadata_revision;
         }
         portEXIT_CRITICAL(&s_lock);
-        if (m.attr_id == 1U) ESP_LOGI(TAG,
+        if (m.attr_id == ESP_AVRC_MD_ATTR_TITLE) ESP_LOGI(TAG,
             "AVRCP_META title received bytes=%d", m.attr_length);
         // A received cover handle is NOT the image itself; it is required for
         // establishing the OBEX/BIP cover-art data connection.
-        if (m.attr_id == 8U) ESP_LOGI(TAG,
+        if (m.attr_id == ESP_AVRC_MD_ATTR_COVER_ART) ESP_LOGI(TAG,
             "AVRCP_COVER image handle metadata bytes=%d expected=%u accepted=%u",
             m.attr_length,
 #if defined(CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED) && CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED
@@ -249,6 +279,7 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
                 s_cover_handle_ready = false;
                 s_cover_fetch_pending = false;
                 s_cover_fetching = false;
+                s_cover_handle_requested = false;
                 s_cover_epoch = cover_epoch;
 #endif
                 s_last_cover_submitted = 0U;
@@ -284,9 +315,15 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
     case ESP_AVRC_CT_COVER_ART_STATE_EVT: {
         const bool linked = param->cover_art_state.state == ESP_AVRC_COVER_ART_CONNECTED;
         portENTER_CRITICAL(&s_lock);
-        s_cover_link = linked;
-        s_cover_fetch_pending = linked && s_cover_handle_ready;
+        s_cover_link = linked && s_active && s_connected;
+        s_cover_fetch_pending = s_cover_link && s_cover_handle_ready &&
+            !s_cover_handle_requested;
         s_cover_fetching = false;
+        if (s_cover_link) {
+            // Official example requests image handle after OBEX connects.
+            s_metadata_needed = true;
+            s_metadata_poll_due = 0;
+        }
         portEXIT_CRITICAL(&s_lock);
         ESP_LOGI(TAG, "AVRCP_COVER OBEX=%s reason=%u",
             linked ? "CONNECTED" : "DISCONNECTED",
@@ -295,6 +332,10 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
     }
     case ESP_AVRC_CT_COVER_ART_DATA_EVT: {
         const auto &data = param->cover_art_data;
+        portENTER_CRITICAL(&s_lock);
+        const bool expected = s_active && s_connected && s_cover_link && s_cover_fetching;
+        portEXIT_CRITICAL(&s_lock);
+        if (!expected) break; // Stale data after stop/disconnect/track change.
         const bool success = data.status == ESP_BT_STATUS_SUCCESS;
         const bool ok = success &&
             bt_phone_cover_append(BtPhoneCoverSource::Avrcp,
@@ -304,6 +345,7 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
             s_cover_fetching = false;
             portEXIT_CRITICAL(&s_lock);
         }
+        if (ok && data.final) ESP_LOGI(TAG, "AVRCP_COVER image complete (decode queued by service pump)");
         if (!ok) ESP_LOGW(TAG, "AVRCP_COVER chunk error status=%u final=%u bytes=%u",
             static_cast<unsigned>(data.status), data.final,
             static_cast<unsigned>(data.data_len));
@@ -396,6 +438,8 @@ static void reset_state()
     s_cover_fetch_pending = false;
     s_cover_tried_connect = false;
     s_cover_fetching = false;
+    s_cover_peer_supported = false;
+    s_cover_handle_requested = false;
     s_cover_epoch = 0U;
 #endif
     s_snapshot = {};
@@ -538,7 +582,7 @@ void bt_audio_avrc_update()
     bool cmd_send=false, cmd_release=false;
     uint8_t cmd=0U;
 #if defined(CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED) && CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED
-    bool connect_cover = false, fetch_cover = false;
+    bool connect_cover = false, fetch_cover = false, request_cover_metadata = false;
     uint8_t cover_handle[ESP_AVRC_CA_IMAGE_HANDLE_LEN] = {};
     uint32_t cover_epoch = 0U;
 #endif
@@ -610,14 +654,17 @@ void bt_audio_avrc_update()
         s_cover_tried_connect = true;
         connect_cover = true;
     }
-    if (connected && ct_ready && s_cover_link && s_cover_fetch_pending &&
-        s_cover_handle_ready && !s_cover_fetching) {
+    if (connected && ct_ready && s_cover_peer_supported && s_cover_link &&
+        s_cover_fetch_pending && s_cover_handle_ready && !s_cover_fetching &&
+        !s_cover_handle_requested) {
         s_cover_fetch_pending = false;
         s_cover_fetching = true;
+        s_cover_handle_requested = true;
         fetch_cover = true;
         memcpy(cover_handle, s_cover_handle, sizeof(cover_handle));
         cover_epoch = s_cover_epoch;
     }
+    request_cover_metadata = s_cover_peer_supported && s_cover_link;
 #endif
     if (connected && ct_ready && (s_poll_due == 0U ||
         static_cast<int32_t>(now - s_poll_due) >= 0)) {
@@ -629,7 +676,7 @@ void bt_audio_avrc_update()
 
 #if defined(CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED) && CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED
     if (connect_cover) {
-        const esp_err_t err = esp_avrc_ct_cover_art_connect(512U);
+        const esp_err_t err = esp_avrc_ct_cover_art_connect(ESP_AVRC_CA_MTU_MAX);
         ESP_LOGI(TAG, "AVRCP_COVER OBEX connect request: %s", esp_err_to_name(err));
     }
     if (fetch_cover) {
@@ -701,13 +748,17 @@ void bt_audio_avrc_update()
 
     if (connected && ct_ready) {
         if (need_caps) (void)esp_avrc_ct_send_get_rn_capabilities_cmd(next_label());
-        if (need_meta) (void)esp_avrc_ct_send_metadata_cmd(next_label(),
-            ESP_AVRC_MD_ATTR_TITLE | ESP_AVRC_MD_ATTR_ARTIST |
-            ESP_AVRC_MD_ATTR_ALBUM | ESP_AVRC_MD_ATTR_PLAYING_TIME
+        if (need_meta) {
+            uint8_t attr_mask = ESP_AVRC_MD_ATTR_TITLE | ESP_AVRC_MD_ATTR_ARTIST |
+                                ESP_AVRC_MD_ATTR_ALBUM | ESP_AVRC_MD_ATTR_PLAYING_TIME;
 #if defined(CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED) && CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED
-            | ESP_AVRC_MD_ATTR_COVER_ART
+            if (request_cover_metadata) attr_mask |= ESP_AVRC_MD_ATTR_COVER_ART;
 #endif
-            );
+            const esp_err_t ret = esp_avrc_ct_send_metadata_cmd(next_label(), attr_mask);
+            if (ret != ESP_OK) ESP_LOGW(TAG,
+                "AVRCP_META request failed mask=0x%02x %s",
+                attr_mask, esp_err_to_name(ret));
+        }
         if (need_status) (void)esp_avrc_ct_send_get_play_status_cmd(next_label());
         const uint8_t ids[3] = {ESP_AVRC_RN_PLAY_STATUS_CHANGE,
                                  ESP_AVRC_RN_TRACK_CHANGE, ESP_AVRC_RN_PLAY_POS_CHANGED};
