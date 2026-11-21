@@ -1815,7 +1815,20 @@ static esp_err_t audio_task_start_output_hardware(
     } else if (nsf_i2s_profile) {
         ret = i2s_output_stream_start_32bit_nsf(sample_rate_hz);
     } else {
-        ret = i2s_output_stream_start_32bit(sample_rate_hz);
+        BtAudioSourceSnapshot bt = {};
+        const bool bt_coexist = bt_audio_source_get_snapshot(&bt) &&
+                                bt.available && bt.initialized;
+        if (bt_coexist && (sample_rate_hz == 96000U || sample_rate_hz == 176400U)) {
+            // Bluetooth Host keeps considerable internal DMA RAM in use.
+            // High-res DAC PCM is preserved: only the I2S descriptor count is
+            // reduced at native sample rate (SBC rate conversion remains in BT).
+            ESP_LOGI(TAG,
+                "双模蓝牙高采样率内存兼容档：PCM=%luHz，保留原始DAC采样率和32bit输出",
+                static_cast<unsigned long>(sample_rate_hz));
+            ret = i2s_output_stream_start_32bit_bt_coexist(sample_rate_hz);
+        } else {
+            ret = i2s_output_stream_start_32bit(sample_rate_hz);
+        }
     }
     if (ret != ESP_OK) {
         audio_task_shutdown_output_hardware(sample_rate_hz, label);
