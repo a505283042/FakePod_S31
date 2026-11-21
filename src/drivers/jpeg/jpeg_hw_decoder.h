@@ -16,7 +16,8 @@ typedef enum {
     JPEG_HW_ORDER_BE = 1, // RGB565 大端字节序（视频直写 CO5300 使用）
 } jpeg_hw_order_t;
 
-// 硬件 JPEG 引擎是否可用（懒初始化，失败后固定返回 false）。
+// 硬件 JPEG 引擎是否可用。启动 UI 阶段会提前预热；若因 DMA 余量不足而跳过，
+// 允许之后重试（不将暂时内存不足视为永久不可用）。
 bool jpeg_hw_available(void);
 
 // 仅解析 JPEG 头，不占用硬件；padded_width/padded_height 可为 nullptr。
