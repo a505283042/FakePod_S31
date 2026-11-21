@@ -61,6 +61,64 @@ static bool s_cover_fetching = false;
 static bool s_cover_peer_supported = false;
 static bool s_cover_handle_requested = false; // Same image handle must not be fetched every 15s.
 static uint32_t s_cover_epoch = 0U;
+
+// Android/AVRCP BIP download stages: query properties, request native image,
+// then fall back to the standard linked thumbnail if native is unavailable.
+enum class CoverStep : uint8_t { Properties, NativeImage, Thumbnail };
+static CoverStep s_cover_step = CoverStep::Properties;
+static CoverStep s_cover_active_step = CoverStep::Properties;
+static bool s_cover_discard_active = false; // Track changed during previous BIP request.
+static bool s_cover_bad_data = false;
+static size_t s_cover_rx_bytes = 0U;
+static uint8_t s_cover_thumbnail_retries = 0U;
+static uint8_t s_cover_connect_attempts = 0U;
+static TickType_t s_cover_due = 0U;
+static TickType_t s_cover_started = 0U;
+static TickType_t s_cover_last_data = 0U;
+static constexpr TickType_t kCoverNoProgressTimeout = pdMS_TO_TICKS(10000);
+static constexpr TickType_t kCoverTotalTimeout = pdMS_TO_TICKS(45000);
+static constexpr TickType_t kCoverRetryDelay = pdMS_TO_TICKS(1200);
+
+static const char *cover_step_name(CoverStep step)
+{
+    switch (step) {
+    case CoverStep::Properties: return "properties";
+    case CoverStep::NativeImage: return "native";
+    case CoverStep::Thumbnail: return "thumbnail";
+    }
+    return "unknown";
+}
+
+// Called ONLY under s_lock. Never call Bluetooth APIs or FreeRTOS mutexes here.
+static void cover_complete_step_locked(CoverStep step, bool success, TickType_t now)
+{
+    s_cover_fetching = false;
+    s_cover_bad_data = false;
+    s_cover_rx_bytes = 0U;
+    s_cover_discard_active = false;
+    if (!s_cover_handle_ready) {
+        s_cover_fetch_pending = false;
+        return;
+    }
+    if (step == CoverStep::Properties) {
+        // Properties are advisory. Some Targets reject the query but allow GetImage.
+        s_cover_step = CoverStep::NativeImage;
+        s_cover_fetch_pending = true;
+    } else if (step == CoverStep::NativeImage && !success) {
+        s_cover_step = CoverStep::Thumbnail;
+        s_cover_fetch_pending = true;
+    } else if (step == CoverStep::Thumbnail && !success &&
+               s_cover_thumbnail_retries < 2U) {
+        ++s_cover_thumbnail_retries;
+        s_cover_step = CoverStep::Thumbnail;
+        s_cover_due = now + kCoverRetryDelay;
+        s_cover_fetch_pending = true;
+    } else {
+        // Complete or exhausted all bounded fallback/retry attempts.
+        s_cover_handle_requested = true;
+        s_cover_fetch_pending = false;
+    }
+}
 #endif
 
 static uint8_t next_label()
@@ -148,6 +206,13 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
         s_cover_peer_supported = false;
         s_cover_handle_requested = false;
         s_cover_epoch = cover_epoch;
+        s_cover_step = s_cover_active_step = CoverStep::Properties;
+        s_cover_discard_active = false;
+        s_cover_bad_data = false;
+        s_cover_rx_bytes = 0U;
+        s_cover_thumbnail_retries = 0U;
+        s_cover_connect_attempts = 0U;
+        s_cover_due = s_cover_started = s_cover_last_data = 0U;
 #endif
         s_last_cover_submitted = 0U;
         portEXIT_CRITICAL(&s_lock);
@@ -213,7 +278,12 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
                     s_cover_handle_ready = true;
                     s_cover_handle_requested = false;
                     s_cover_epoch = cover_epoch;
-                    // Download only after SDP announced Cover Art and OBEX is linked.
+                    s_cover_step = CoverStep::Properties;
+                    s_cover_thumbnail_retries = 0U;
+                    s_cover_due = 0U;
+                    // Do not overlap a new BIP operation with a previous song.
+                    // Drain its remaining callbacks, then request the new handle.
+                    if (s_cover_fetching) s_cover_discard_active = true;
                     s_cover_fetch_pending = s_cover_peer_supported && s_cover_link;
                 }
             }
@@ -278,8 +348,12 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
 #if defined(CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED) && CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED
                 s_cover_handle_ready = false;
                 s_cover_fetch_pending = false;
-                s_cover_fetching = false;
+                // The old OBEX transfer may still be in flight: drain, do not
+                // launch a new request until its final callback or timeout.
+                if (s_cover_fetching) s_cover_discard_active = true;
                 s_cover_handle_requested = false;
+                s_cover_step = CoverStep::Properties;
+                s_cover_thumbnail_retries = 0U;
                 s_cover_epoch = cover_epoch;
 #endif
                 s_last_cover_submitted = 0U;
@@ -314,15 +388,29 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
 #if defined(CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED) && CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED
     case ESP_AVRC_CT_COVER_ART_STATE_EVT: {
         const bool linked = param->cover_art_state.state == ESP_AVRC_COVER_ART_CONNECTED;
+        const TickType_t now = xTaskGetTickCount();
         portENTER_CRITICAL(&s_lock);
         s_cover_link = linked && s_active && s_connected;
-        s_cover_fetch_pending = s_cover_link && s_cover_handle_ready &&
-            !s_cover_handle_requested;
-        s_cover_fetching = false;
         if (s_cover_link) {
-            // Official example requests image handle after OBEX connects.
-            s_metadata_needed = true;
+            s_cover_connect_attempts = 0U;
+            s_cover_fetching = false;
+            s_cover_discard_active = false;
+            s_cover_fetch_pending = s_cover_handle_ready &&
+                !s_cover_handle_requested;
+            s_metadata_needed = true; // Refresh image handle after OBEX reconnect.
             s_metadata_poll_due = 0;
+        } else {
+            if (s_cover_fetching && !s_cover_discard_active)
+                cover_complete_step_locked(s_cover_active_step, false, now);
+            s_cover_fetching = false;
+            s_cover_discard_active = false;
+            // Bounded reconnect, with a delay to avoid repeated SDP/OBEX spam.
+            s_cover_tried_connect = false;
+            s_cover_connect_pending = s_active && s_connected &&
+                s_cover_peer_supported && s_cover_connect_attempts < 3U;
+            s_cover_due = now + kCoverRetryDelay;
+            s_cover_fetch_pending = s_cover_handle_ready &&
+                !s_cover_handle_requested;
         }
         portEXIT_CRITICAL(&s_lock);
         ESP_LOGI(TAG, "AVRCP_COVER OBEX=%s reason=%u",
@@ -332,23 +420,53 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
     }
     case ESP_AVRC_CT_COVER_ART_DATA_EVT: {
         const auto &data = param->cover_art_data;
+        const TickType_t now = xTaskGetTickCount();
         portENTER_CRITICAL(&s_lock);
         const bool expected = s_active && s_connected && s_cover_link && s_cover_fetching;
-        portEXIT_CRITICAL(&s_lock);
-        if (!expected) break; // Stale data after stop/disconnect/track change.
-        const bool success = data.status == ESP_BT_STATUS_SUCCESS;
-        const bool ok = success &&
-            bt_phone_cover_append(BtPhoneCoverSource::Avrcp,
-                data.p_data, data.data_len, data.final);
-        if (!ok || data.final) {
-            portENTER_CRITICAL(&s_lock);
-            s_cover_fetching = false;
-            portEXIT_CRITICAL(&s_lock);
+        const bool discard = s_cover_discard_active;
+        const CoverStep step = s_cover_active_step;
+        const bool prior_error = s_cover_bad_data;
+        if (expected) {
+            s_cover_last_data = now;
+            s_cover_rx_bytes += data.data_len;
         }
-        if (ok && data.final) ESP_LOGI(TAG, "AVRCP_COVER image complete (decode queued by service pump)");
-        if (!ok) ESP_LOGW(TAG, "AVRCP_COVER chunk error status=%u final=%u bytes=%u",
-            static_cast<unsigned>(data.status), data.final,
-            static_cast<unsigned>(data.data_len));
+        portEXIT_CRITICAL(&s_lock);
+        if (!expected) break;
+        const bool received = data.status == ESP_BT_STATUS_SUCCESS;
+        const bool finished = data.final || !received;
+        bool good = received && !prior_error;
+        if (!discard && step != CoverStep::Properties && good) {
+            good = bt_phone_cover_append(BtPhoneCoverSource::Avrcp,
+                data.p_data, data.data_len, data.final);
+        }
+        portENTER_CRITICAL(&s_lock);
+        if (s_cover_fetching && !s_cover_discard_active && !good)
+            s_cover_bad_data = true;
+        const bool final_good = !s_cover_bad_data && good;
+        const size_t total_bytes = s_cover_rx_bytes;
+        if (finished && s_cover_fetching) {
+            if (s_cover_discard_active) {
+                s_cover_fetching = false;
+                s_cover_discard_active = false;
+                s_cover_fetch_pending = s_cover_handle_ready &&
+                    !s_cover_handle_requested;
+            } else {
+                cover_complete_step_locked(step,
+                    step == CoverStep::Properties ? received : final_good, now);
+            }
+        }
+        portEXIT_CRITICAL(&s_lock);
+        if (finished) {
+            ESP_LOGI(TAG, "AVRCP_COVER %s completed ok=%u bytes=%u stale=%u status=%u",
+                cover_step_name(step), final_good ? 1U : 0U,
+                static_cast<unsigned>(total_bytes), discard ? 1U : 0U,
+                static_cast<unsigned>(data.status));
+        } else if (!good && !discard && !prior_error) {
+            ESP_LOGW(TAG, "AVRCP_COVER %s rejected chunk bytes=%u total=%u (limit=%u)",
+                cover_step_name(step), static_cast<unsigned>(data.data_len),
+                static_cast<unsigned>(total_bytes),
+                static_cast<unsigned>(BT_PHONE_COVER_MAX_BYTES));
+        }
         break;
     }
 #endif
@@ -441,6 +559,13 @@ static void reset_state()
     s_cover_peer_supported = false;
     s_cover_handle_requested = false;
     s_cover_epoch = 0U;
+    s_cover_step = s_cover_active_step = CoverStep::Properties;
+    s_cover_discard_active = false;
+    s_cover_bad_data = false;
+    s_cover_rx_bytes = 0U;
+    s_cover_thumbnail_retries = 0U;
+    s_cover_connect_attempts = 0U;
+    s_cover_due = s_cover_started = s_cover_last_data = 0U;
 #endif
     s_snapshot = {};
     s_snapshot.active = s_active;
@@ -583,6 +708,8 @@ void bt_audio_avrc_update()
     uint8_t cmd=0U;
 #if defined(CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED) && CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED
     bool connect_cover = false, fetch_cover = false, request_cover_metadata = false;
+    bool disconnect_cover = false;
+    CoverStep cover_step = CoverStep::Properties;
     uint8_t cover_handle[ESP_AVRC_CA_IMAGE_HANDLE_LEN] = {};
     uint32_t cover_epoch = 0U;
 #endif
@@ -649,17 +776,37 @@ void bt_audio_avrc_update()
         s_release_due = now + kPressHold;
     }
 #if defined(CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED) && CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED
-    if (connected && ct_ready && s_cover_connect_pending && !s_cover_tried_connect) {
+    if (connected && ct_ready && s_cover_fetching &&
+        ((now - s_cover_last_data > kCoverNoProgressTimeout) ||
+         (now - s_cover_started > kCoverTotalTimeout))) {
+        const CoverStep timed_out = s_cover_active_step;
+        if (!s_cover_discard_active)
+            cover_complete_step_locked(timed_out, false, now);
+        else {
+            s_cover_fetching = false;
+            s_cover_discard_active = false;
+        }
+        s_cover_link = false;
+        disconnect_cover = true;
+    }
+    if (connected && ct_ready && s_cover_connect_pending && !s_cover_tried_connect &&
+        static_cast<int32_t>(now - s_cover_due) >= 0) {
         s_cover_connect_pending = false;
         s_cover_tried_connect = true;
+        ++s_cover_connect_attempts;
         connect_cover = true;
     }
     if (connected && ct_ready && s_cover_peer_supported && s_cover_link &&
         s_cover_fetch_pending && s_cover_handle_ready && !s_cover_fetching &&
-        !s_cover_handle_requested) {
+        !s_cover_handle_requested &&
+        static_cast<int32_t>(now - s_cover_due) >= 0) {
         s_cover_fetch_pending = false;
         s_cover_fetching = true;
-        s_cover_handle_requested = true;
+        s_cover_active_step = s_cover_step;
+        s_cover_bad_data = false;
+        s_cover_rx_bytes = 0U;
+        s_cover_started = s_cover_last_data = now;
+        cover_step = s_cover_active_step;
         fetch_cover = true;
         memcpy(cover_handle, s_cover_handle, sizeof(cover_handle));
         cover_epoch = s_cover_epoch;
@@ -675,20 +822,49 @@ void bt_audio_avrc_update()
     if (!active) return;
 
 #if defined(CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED) && CONFIG_BT_AVRCP_CT_COVER_ART_ENABLED
+    if (disconnect_cover) {
+        ESP_LOGW(TAG, "AVRCP_COVER BIP timed out; resetting OBEX for fallback/recovery");
+        (void)esp_avrc_ct_cover_art_disconnect();
+    }
     if (connect_cover) {
         const esp_err_t err = esp_avrc_ct_cover_art_connect(ESP_AVRC_CA_MTU_MAX);
         ESP_LOGI(TAG, "AVRCP_COVER OBEX connect request: %s", esp_err_to_name(err));
-    }
-    if (fetch_cover) {
-        const bool ready = bt_phone_cover_begin(BtPhoneCoverSource::Avrcp, cover_epoch, 0U);
-        const esp_err_t err = ready
-            ? esp_avrc_ct_cover_art_get_linked_thumbnail(cover_handle)
-            : ESP_ERR_INVALID_STATE;
         if (err != ESP_OK) {
             portENTER_CRITICAL(&s_lock);
-            s_cover_fetching = false;
+            s_cover_tried_connect = false;
+            s_cover_connect_pending = s_cover_connect_attempts < 3U;
+            s_cover_due = xTaskGetTickCount() + kCoverRetryDelay;
             portEXIT_CRITICAL(&s_lock);
-            ESP_LOGW(TAG, "AVRCP_COVER thumbnail request: %s", esp_err_to_name(err));
+        }
+    }
+    if (fetch_cover) {
+        const bool ready = cover_step == CoverStep::Properties ||
+            bt_phone_cover_begin(BtPhoneCoverSource::Avrcp, cover_epoch, 0U);
+        esp_err_t err = ESP_ERR_INVALID_STATE;
+        if (ready) {
+            switch (cover_step) {
+            case CoverStep::Properties:
+                err = esp_avrc_ct_cover_art_get_image_properties(cover_handle);
+                break;
+            case CoverStep::NativeImage:
+                // Null descriptor requests the native image; do not hard-code a
+                // pixel size that a phone's BIP image representations may reject.
+                err = esp_avrc_ct_cover_art_get_image(cover_handle, nullptr, 0U);
+                break;
+            case CoverStep::Thumbnail:
+                err = esp_avrc_ct_cover_art_get_linked_thumbnail(cover_handle);
+                break;
+            }
+        }
+        ESP_LOGI(TAG, "AVRCP_COVER request=%s err=%s max_bytes=%u",
+            cover_step_name(cover_step), esp_err_to_name(err),
+            static_cast<unsigned>(BT_PHONE_COVER_MAX_BYTES));
+        if (err != ESP_OK) {
+            portENTER_CRITICAL(&s_lock);
+            if (s_cover_fetching && s_cover_active_step == cover_step &&
+                s_cover_epoch == cover_epoch && !s_cover_discard_active)
+                cover_complete_step_locked(cover_step, false, xTaskGetTickCount());
+            portEXIT_CRITICAL(&s_lock);
         }
     }
 #endif

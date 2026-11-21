@@ -14,7 +14,10 @@ struct BtPhoneCoverSnapshot {
     BtPhoneCoverSource source = BtPhoneCoverSource::None;
 };
 
-static constexpr size_t BT_PHONE_COVER_MAX_BYTES = 192U * 1024U;
+// Native BIP JPEGs can exceed the 192 KiB BLE fallback cap. Bound the
+// compressed staging buffer to 512 KiB in external PSRAM; overflow must
+// trigger the linked-thumbnail fallback instead of writing past the buffer.
+static constexpr size_t BT_PHONE_COVER_MAX_BYTES = 512U * 1024U;
 
 // Call from ordinary startup, not from a Bluetooth stack callback.
 bool bt_phone_cover_init();
