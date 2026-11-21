@@ -54,9 +54,15 @@
 static const char *TAG = "BT_AUDIO";
 namespace {
 
-// PSRAM 占用 32KB。高水位 120ms，既减缓抖动又避免无限制增加无线延迟。
-static constexpr size_t kRingFrames = 8192U;  // 170ms @48kHz
+// Keep the proven built-in SBC buffer unchanged. External codec workers
+// need extra headroom against occasional LVGL full-screen PSRAM stalls.
+#if FAKEPOD_A2DP_EXTERNAL_CODEC
+static constexpr size_t kRingFrames = 16384U; // 64 KiB PSRAM, ~341ms @48kHz
+static constexpr uint32_t kMaxQueueMs = 260U;
+#else
+static constexpr size_t kRingFrames = 8192U;  // 32 KiB, legacy SBC
 static constexpr uint32_t kMaxQueueMs = 120U;
+#endif
 static constexpr TickType_t kMediaRetryTicks = pdMS_TO_TICKS(600);
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
 
@@ -481,7 +487,8 @@ esp_err_t bt_audio_source_host_start()
             kRingFrames * 4U, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     }
     if (s_pcm_ring == nullptr) {
-        ESP_LOGE(TAG, "A2DP启动失败：无法分配32KB PSRAM PCM队列");
+        ESP_LOGE(TAG, "A2DP启动失败：无法分配%uB PSRAM PCM队列",
+                static_cast<unsigned>(kRingFrames * 4U));
         return ESP_ERR_NO_MEM;
     }
     ESP_LOGI(TAG, "A2DP启动：internal_free=%u psram_free=%u",

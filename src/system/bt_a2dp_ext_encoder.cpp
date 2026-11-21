@@ -104,6 +104,7 @@ static void worker(void *)
     uint16_t frames_per_packet = 0U;
     uint32_t timestamp = 0U;
     uint32_t sent = 0U, failed = 0U, underrun = 0U;
+    uint32_t max_lateness_us = 0U, late_over_40ms = 0U, late_over_80ms = 0U;
     const bool ready = open_codec(stream, &encoder, &in_bytes, &out_bytes,
                                   &frames_per_packet);
     if (!ready) {
@@ -141,6 +142,7 @@ static void worker(void *)
             unsigned(frames_per_packet));
 
         while (s_run) {
+            const int64_t due_us = next_us;
             const int64_t now = esp_timer_get_time();
             if (now < next_us) {
                 const uint32_t wait_ms = static_cast<uint32_t>(
@@ -151,6 +153,15 @@ static void worker(void *)
             }
             next_us += frame_us;
             if (!s_run) break;
+            // Time the actual task wakeup without per-packet logging overhead.
+            const int64_t started_us = esp_timer_get_time();
+            if (started_us > due_us) {
+                const uint32_t late = static_cast<uint32_t>(
+                    std::min<int64_t>(started_us - due_us, UINT32_MAX));
+                if (late > max_lateness_us) max_lateness_us = late;
+                if (late > 40000U) ++late_over_40ms;
+                if (late > 80000U) ++late_over_80ms;
+            }
             memset(pcm, 0, pcm_size);
             const int32_t got = stream.reader(pcm, static_cast<int32_t>(pcm_size));
             if (got != static_cast<int32_t>(pcm_size)) ++underrun;
@@ -198,10 +209,17 @@ static void worker(void *)
             else { ++failed; esp_a2d_audio_buff_free(packet); }
             timestamp += pcm_frames;
             if (((sent + failed) % 500U) == 0U && (sent + failed) > 0U)
-                ESP_LOGI(TAG, "A2DP_TX_EXT sent=%lu failed=%lu underrun=%lu",
+                ESP_LOGI(TAG,
+                    "A2DP_TX_EXT sent=%lu failed=%lu underrun=%lu late_max=%luus late40=%lu late80=%lu",
                     static_cast<unsigned long>(sent),
                     static_cast<unsigned long>(failed),
-                    static_cast<unsigned long>(underrun));
+                    static_cast<unsigned long>(underrun),
+                    static_cast<unsigned long>(max_lateness_us),
+                    static_cast<unsigned long>(late_over_40ms),
+                    static_cast<unsigned long>(late_over_80ms));
+                max_lateness_us = 0U;
+                late_over_40ms = 0U;
+                late_over_80ms = 0U;
         }
     }
 finish:

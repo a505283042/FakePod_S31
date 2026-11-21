@@ -1,6 +1,7 @@
 #include "audio_service.h"
 #include "bt_audio_source.h"
 #include "bt_audio_sink.h"
+#include "sdkconfig.h"
 
 #include <stdlib.h>
 #include <stdint.h>
@@ -589,7 +590,13 @@ static uint32_t g_bt_sink_output_rate = 0U;
 // decoder playback clock; provides a stable FFT capture frame offset.
 static uint64_t g_bt_sink_fft_frames = 0ULL;
 static TickType_t g_bt_sink_retry_due = 0;
+// Preserve 85ms for ESP-IDF built-in SBC; add buffer headroom only
+// when the AAC/SBC external encoder task handles outgoing packets.
+#if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
+static constexpr uint32_t kBtMusicQueueGoalMs = 180U;
+#else
 static constexpr uint32_t kBtMusicQueueGoalMs = 85U;
+#endif
 static constexpr uint32_t kBtMusicDrainTimeoutMs = 250U;
 static constexpr uint32_t kBtMusicMediaStartTimeoutMs = 8000U;
 static int64_t g_bt_music_media_wait_started_us = 0LL;
