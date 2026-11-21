@@ -24,6 +24,12 @@
 #define FAKEPOD_A2DP_SUPPORTED 0
 #endif
 
+// This experimental branch requires A2DP. A stale sdkconfig must fail the build
+// instead of flashing a firmware that silently displays 'not supported'.
+#if !FAKEPOD_A2DP_SUPPORTED
+#error "FakePod S31 A2DP source is disabled in generated sdkconfig. Check CONFIG_BT_CLASSIC_ENABLED=y, CONFIG_BT_A2DP_ENABLE=y, and CONFIG_BT_A2DP_USE_EXTERNAL_CODEC=n; rebuild with sdkconfig.fakepod_s31_a2dp."
+#endif
+
 #if FAKEPOD_A2DP_SUPPORTED
 #include "esp_a2dp_api.h"
 #include "esp_a2dp_legacy_api.h"
