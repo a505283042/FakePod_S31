@@ -92,9 +92,13 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
         s_connected = connected && s_active;
         s_snapshot.connected = s_connected;
         s_snapshot.playback_known = false;
-        s_snapshot.absolute_volume_supported = false;
-        s_volume_registered = false;
-        s_volume_interim_pending = false;
+        // CT and TG connect independently. Do not erase an already received
+        // TG volume subscription just because CT finished connecting later.
+        if (!connected) {
+            s_snapshot.absolute_volume_supported = false;
+            s_volume_registered = false;
+            s_volume_interim_pending = false;
+        }
         s_snapshot.metadata_valid = false;
         s_snapshot.title[0] = '\0';
         s_snapshot.artist[0] = '\0';
