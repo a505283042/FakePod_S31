@@ -30,9 +30,8 @@
 #include "esp_gap_bt_api.h"
 #endif
 
-static const char *TAG = "BT_AUDIO";
-
 #if FAKEPOD_A2DP_SUPPORTED
+static const char *TAG = "BT_AUDIO";
 namespace {
 
 // PSRAM 占用 32KB。高水位 120ms，既减缓抖动又避免无限制增加无线延迟。
@@ -58,6 +57,7 @@ static bool s_connecting = false;
 static bool s_connected = false;
 static bool s_streaming = false;
 static bool s_media_ctrl_pending = false;
+static bool s_deinit_confirmed = false;
 static TickType_t s_retry_due = 0U;
 static esp_bd_addr_t s_candidate_bda = {};
 static esp_bd_addr_t s_peer_bda = {};
@@ -87,6 +87,7 @@ static void a2dp_event(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         const bool ready = param->a2d_prof_stat.init_state == ESP_A2D_INIT_SUCCESS;
         portENTER_CRITICAL(&s_lock);
         s_profile_ready = ready && s_init_requested;
+        if (!ready) s_deinit_confirmed = true;
         portEXIT_CRITICAL(&s_lock);
         ESP_LOGI(TAG, "A2DP profile %s", ready ? "ready" : "stopped");
         break;
@@ -107,6 +108,7 @@ static void a2dp_event(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             }
         } else if (state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
             memset(s_peer_bda, 0, sizeof(s_peer_bda));
+            s_candidate_found = false; // 用户断开后下一次点击可重新搜索其它耳机。
             flush_locked();
         }
         portEXIT_CRITICAL(&s_lock);
@@ -177,9 +179,11 @@ static int32_t a2dp_pcm_callback(uint8_t *data, int32_t len)
     portENTER_CRITICAL(&s_lock);
     if (s_init_requested && s_streaming && s_pcm_ring != nullptr) {
         const size_t read_frames = requested < s_queued ? requested : s_queued;
-        for (size_t i = 0U; i < read_frames; ++i) {
-            const size_t frame = (s_read + i) % kRingFrames;
-            memcpy(data + i * 4U, s_pcm_ring + frame * 4U, 4U);
+        const size_t first = read_frames < (kRingFrames - s_read)
+            ? read_frames : kRingFrames - s_read;
+        memcpy(data, s_pcm_ring + s_read * 4U, first * 4U);
+        if (read_frames > first) {
+            memcpy(data + first * 4U, s_pcm_ring, (read_frames - first) * 4U);
         }
         s_read = (s_read + read_frames) % kRingFrames;
         s_queued -= read_frames;
@@ -205,6 +209,7 @@ static void classic_gap_event(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t
                 case ESP_BT_GAP_DEV_PROP_RSSI: memcpy(&rssi, prop.val, sizeof(rssi)); break;
                 case ESP_BT_GAP_DEV_PROP_EIR: eir = static_cast<uint8_t *>(prop.val); break;
                 case ESP_BT_GAP_DEV_PROP_BDNAME: {
+                    if (prop.len <= 0) break;
                     const size_t n = static_cast<size_t>(prop.len) < sizeof(name) - 1U
                         ? static_cast<size_t>(prop.len) : sizeof(name) - 1U;
                     memcpy(name, prop.val, n);
@@ -283,6 +288,7 @@ esp_err_t bt_audio_source_host_start()
     portENTER_CRITICAL(&s_lock);
     s_init_requested = true;
     s_profile_ready = false;
+    s_deinit_confirmed = false;
     s_scanning = false;
     s_candidate_found = false;
     s_connecting = false;
@@ -327,7 +333,21 @@ void bt_audio_source_host_stop()
     if (scanning) (void)esp_bt_gap_cancel_discovery();
     if (connected) (void)esp_a2d_source_disconnect(s_peer_bda);
     const esp_err_t err = esp_a2d_source_deinit();
-    if (err != ESP_OK) ESP_LOGW(TAG, "A2DP Source deinit: %s", esp_err_to_name(err));
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "A2DP Source deinit: %s", esp_err_to_name(err));
+    } else {
+        // A2DP deinit 是异步的；等 Profile 销毁回调再关闭共享 Bluedroid Host。
+        const TickType_t begin = xTaskGetTickCount();
+        bool confirmed = false;
+        do {
+            portENTER_CRITICAL(&s_lock);
+            confirmed = s_deinit_confirmed;
+            portEXIT_CRITICAL(&s_lock);
+            if (confirmed) break;
+            vTaskDelay(pdMS_TO_TICKS(20));
+        } while ((xTaskGetTickCount() - begin) < pdMS_TO_TICKS(1200));
+        if (!confirmed) ESP_LOGW(TAG, "A2DP Profile停止确认超时");
+    }
     // PSRAM buffer is kept across Host restarts to prevent callback/free races.
 #endif
 }
