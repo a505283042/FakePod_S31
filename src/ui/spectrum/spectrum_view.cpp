@@ -1277,11 +1277,15 @@ static void spectrum_timer_cb(lv_timer_t *timer)
     ++g_frame;
 
     if (g_time != nullptr) {
-        const uint64_t displayed_second = audio.position_ms / 1000ULL;
+        BtAudioAvrcSnapshot phone_clock = {};
+        const uint64_t position_ms = bt_audio_avrc_is_sink_mode() &&
+            bt_audio_avrc_get_snapshot(&phone_clock)
+            ? phone_clock.position_ms : audio.position_ms;
+        const uint64_t displayed_second = position_ms / 1000ULL;
         if (displayed_second != g_last_displayed_second) {
             g_last_displayed_second = displayed_second;
             char current[20] = {};
-            spectrum_format_time(audio.position_ms, current, sizeof(current));
+            spectrum_format_time(position_ms, current, sizeof(current));
             lv_label_set_text(g_time, current);
         }
     }
@@ -1425,9 +1429,13 @@ void spectrum_view_open()
             }
         }
         char current[20] = {};
-        spectrum_format_time(audio.position_ms, current, sizeof(current));
+        BtAudioAvrcSnapshot phone_clock = {};
+        const uint64_t position_ms = bt_audio_avrc_is_sink_mode() &&
+            bt_audio_avrc_get_snapshot(&phone_clock)
+            ? phone_clock.position_ms : audio.position_ms;
+        spectrum_format_time(position_ms, current, sizeof(current));
         lv_label_set_text(g_time, current);
-        g_last_displayed_second = audio.position_ms / 1000ULL;
+        g_last_displayed_second = position_ms / 1000ULL;
     }
     spectrum_update_bars();
     // 延迟 100ms 启动频谱定时器，让 LVGL 先完成页面切换首帧渲染，
