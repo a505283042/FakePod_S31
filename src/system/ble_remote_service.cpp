@@ -298,6 +298,10 @@ static bool execute_control_command(uint8_t command, uint8_t value = 0U)
             case 0x04U: return player_control_volume_up(1U);
             case 0x05U: return player_control_volume_down(1U);
             case 0x06U: return value <= 100U && player_control_set_volume(value);
+            // Existing Android Remote 0x10 command: route requested loop mode
+            // to the phone AVRCP controller without changing TF/NAS playback.
+            case 0x10U: return value <= 3U &&
+                player_control_set_loop_mode(static_cast<PlayerLoopMode>(value));
             default: break;
         }
     }
@@ -718,7 +722,11 @@ static TickType_t g_aux_check_due = 0;
 static void build_remote_ui_status(uint8_t packet[6])
 {
     packet[0] = 0x03U; packet[1] = kPhoneEventProtocolVersion;
-    packet[2] = static_cast<uint8_t>(player_control_get_loop_mode());
+    // Local/NAS loop state must not be reported as if it were confirmed on
+    // the remote phone. 0xFF = unavailable/unknown for old BLE Remote clients.
+    // The current IDF 6.1 AVRCP API cannot read back actual Repeat/Shuffle.
+    packet[2] = bt_audio_avrc_is_sink_mode()
+        ? 0xFFU : static_cast<uint8_t>(player_control_get_loop_mode());
     packet[3] = player_home_remote_get_view();
     packet[4] = static_cast<uint8_t>(screen_lock_simple_get_power());
     packet[5] = static_cast<uint8_t>(screen_lock_simple_get_lock());
