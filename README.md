@@ -156,12 +156,28 @@
   回到发射时先由 AudioTask 停止接收 I2S，再关闭 Sink 并恢复 Source。
 - **持久化**：模式切换成功后写入 device_cfg/btaudiorole（0=发射，1=接收）；
   上电蓝牙服务按上次成功角色启动。BLE 手机遥控保持同一 GATT 协议。
-  **接收模式不含 AVRCP 控制手机曲目**：手机音乐播放/暂停/切歌仍由手机控制。
+  **第一阶段 AVRCP 已接入（尚待实机验证）**：在接收模式下启用
+  AVRCP Controller + Target；既有屏幕控件、FakePod 实体按键、
+  BLE Remote App 的播放/暂停、上一曲、下一曲可发送给手机播放器。
+  歌名、歌手、专辑及播放时间由手机 AVRCP Metadata / Play Status 提供。
+  音频接收的 PCM 使用现有 256 点异步 FFT，复用频谱页。
+  手机 AVRCP 绝对音量命令进入唯一 AudioTask 调整 CS43131；
+  本机/App 的音量变化向手机注册的绝对音量通知通道反馈，
+  不增加第二层软件 PCM 音量衰减。Mute 使用统一音量=0及恢复值。
+  **若手机不提供 AVRCP Absolute Volume**，设备可调本地 DAC，
+  但无法保证手机音量显示双向同步；蓝牙页面明确标记“未同步”。
+  现有 Remote App 保留 BLE 控制命令与元数据通知包格式，
+  不要求为了按键控制升级 Android App。
 - **停止/断开**：接收模式可点击“音频接收”断开当前手机；
   或从手机 Bluetooth 设置断开。断开/暂停媒体后 AudioTask 释放 I2S DMA。
 - **首轮限制**：仅内部 SBC，常见 44.1/48kHz 立体声优先；
   32kHz 可工作；16kHz 目前没有 DAC rate profile，返回不支持；
   手机高品质 AAC 音频并未在本轮开启。
+- **第一阶段限制**：暂不把手机专辑封面和 LRC 歌词传入 FakePod，
+  原本地封面/磁带资源仍与本地曲库绑定。蓝牙接收模式下只接入歌曲
+  文本/进度及频谱；进度条暂为只读，不声明支持手机 AVRCP Seek。
+  具体手机 App 是否向 AVRCP 暴露时长/元数据/绝对音量取决于其实现。
+  AVRCP 模式切换不会重新初始化已有 BLE GATT 服务。
 - **已有 LVGL 修复**：实际运行恢复了 16 行 × 双 DMA 绘图缓冲，
   不可把历史实验段落中关于单缓冲的文字理解为当前配置。
 
@@ -182,6 +198,24 @@
    验证先前的 Source 发射不受影响；重启核验成功角色持久化。
 6. 关闭/重新打开蓝牙、切换 Wi-Fi 再回来，确认 BLE/GATT、经典蓝牙
    和 AudioTask 没有重复初始化、Crash 或 SDMMC DMA 错误。
+
+第一阶段 AVRCP/FFT 回归补充：
+
+7. 手机播放音乐后，观察串口 `AVRCP_CT connected`、
+   `AVRCP_META title received`，确认屏幕和 BLE Remote App
+   可以收到歌曲文本（不要求显示封面或歌词）。
+8. 在 FakePod 和 BLE Remote App 上分别测试
+   **上一曲/下一曲/播放/暂停**；对应日志为 `AVRCP_KEY`，
+   确认手机音乐 App 实际响应。
+9. 手机音量调至 20% / 50% / 80%，检查
+   `AVRCP_VOLUME phone->DAC`、FakePod 音量值、DAC 实际响度。
+   用 FakePod 本机音量键及 BLE App 反向调整，观察手机的音量显示。
+   不支持 AVRCP 绝对音量的手机应显示“未同步”，不能标为通过。
+10. 打开频谱页，检查手机播放时频谱随 PCM 变化；
+    暂停/断开后应停止，并确认 `A2DP_RX drop` 没有持续增长。
+11. 重复发射↔接收切换至少 5 次，验证 AVRCP CT/TG 释放、
+    BLE 手机遥控连接、I2S DMA 和 LVGL 16 行双缓冲保持正常。
+
 
 **状态：已提交源码，未完成编译/实机验收。** 蓝牙 Sink 使用当前 ESP-IDF
 release/v6.1 的 legacy 内部 SBC PCM callback；后续实机日志用于收敛延迟、

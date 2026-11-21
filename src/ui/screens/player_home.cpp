@@ -27,6 +27,8 @@
 #include "nas_library_source.h"
 #include "media/library/media_catalog_v2.h"
 #include "player_control.h"
+#include "system/bt_audio_sink.h"
+#include "system/bt_audio_avrc.h"
 #include "player_state.h"
 #include "library_view.h"
 #include "lyrics/lyrics_view.h"
@@ -372,6 +374,7 @@ static uint8_t g_volume_drag_start_percent = 0U;
 static uint8_t g_volume_preview_percent = 0U;
 static uint32_t g_volume_drag_sequence = 0U;
 static uint32_t g_last_audio_state_revision = UINT32_MAX;
+static bool g_last_audio_phone_mode = false;
 // P1.5.3.2R.19：记录主页最后已经绑定的 Player Track。切歌后不再等待 100ms Artwork timer，
 // 而是在当前 LVGL 线程立即把预热好的 RGB565 Surface 绑定到主页；20ms watcher 同时覆盖自然 EOF。
 static uint32_t g_last_artwork_bound_track = UINT32_MAX;
@@ -3792,6 +3795,26 @@ static void player_home_refresh_track(const AudioStateSnapshot *audio_snapshot)
         return;
     }
 
+    // Phone A2DP Sink is not a local/NAS catalog row. Reuse the same controls
+    // and text widgets, but never show the previous local track as phone media.
+    if (bt_audio_avrc_is_sink_mode()) {
+        BtAudioAvrcSnapshot phone = {};
+        BtAudioSinkSnapshot stream = {};
+        (void)bt_audio_avrc_get_snapshot(&phone);
+        (void)bt_audio_sink_get_snapshot(&stream);
+        player_home_label_set_text_if_changed(g_title,
+            phone.title[0] ? phone.title : "手机蓝牙音频");
+        player_home_label_set_text_if_changed(g_artist,
+            phone.artist[0] ? phone.artist :
+            (stream.connected ? "等待手机歌曲信息" : "等待手机连接"));
+        char detail[80] = {};
+        snprintf(detail, sizeof(detail),
+            "蓝牙接收 · SBC · %lu Hz",
+            static_cast<unsigned long>(stream.sample_rate_hz));
+        player_home_label_set_text_if_changed(g_track_info, detail);
+        return;
+    }
+
     const size_t list_count = player_state_get_list_count();
     if (!player_state_is_ready() || list_count == 0U) {
         player_home_label_set_text_if_changed(g_title, "暂无歌曲");
@@ -3899,7 +3922,16 @@ static void player_home_refresh_transport_controls(const AudioStateSnapshot *sna
 
 static void player_home_apply_audio_snapshot(const AudioStateSnapshot &snapshot)
 {
-    const bool pause_icon = snapshot.state == AudioPlaybackState::Playing;
+    BtAudioAvrcSnapshot phone = {};
+    BtAudioSinkSnapshot stream = {};
+    const bool phone_mode = bt_audio_avrc_is_sink_mode();
+    if (phone_mode) {
+        (void)bt_audio_avrc_get_snapshot(&phone);
+        (void)bt_audio_sink_get_snapshot(&stream);
+    }
+    const bool pause_icon = phone_mode
+        ? (phone.playback_known ? phone.playing : stream.streaming)
+        : snapshot.state == AudioPlaybackState::Playing;
     player_home_label_set_text_if_changed(
         g_play_symbol,
         pause_icon ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
@@ -3911,6 +3943,15 @@ static void player_home_apply_audio_snapshot(const AudioStateSnapshot &snapshot)
     }
 
     player_home_progress_sync(snapshot);
+    if (phone_mode) {
+        // Phase 1: display remote AVRCP position but do not expose a seek
+        // gesture until AVRCP browse/seek support is negotiated and tested.
+        player_home_progress_set_enabled(false);
+        player_home_slider_set_value_if_changed(g_progress,
+            player_home_progress_value_from_ms(
+                phone.position_ms, phone.duration_ms));
+        player_home_update_time_labels(phone.position_ms, phone.duration_ms);
+    }
     player_home_refresh_track(&snapshot);
     player_home_refresh_transport_controls(&snapshot);
 }
@@ -3973,15 +4014,22 @@ static void player_home_audio_timer_cb(lv_timer_t *timer)
     if (!audio_service_get_snapshot(&snapshot)) {
         return;
     }
-    if (snapshot.state_revision == g_last_audio_state_revision) {
+    const bool phone_mode = bt_audio_avrc_is_sink_mode();
+    if (!phone_mode && !g_last_audio_phone_mode &&
+        snapshot.state_revision == g_last_audio_state_revision) {
         return;
     }
+    // The local AudioTask revision does not change when remote AVRCP metadata,
+    // position, or playback state changes. Read phone snapshots while active,
+    // then refresh once more when returning to local music.
+    g_last_audio_phone_mode = phone_mode;
     g_last_audio_state_revision = snapshot.state_revision;
     player_home_apply_audio_snapshot(snapshot);
 }
 
 static bool player_home_nas_wifi_enabled_for_new_playback()
 {
+    if (bt_audio_avrc_is_sink_mode()) return true;
     if (player_state_get_source() != PlayerMediaSource::Nas) return true;
 
     DeviceSettingsSnapshot settings = {};
@@ -3996,6 +4044,7 @@ static bool player_home_nas_wifi_enabled_for_new_playback()
 
 static bool player_home_play_action_needs_network()
 {
+    if (bt_audio_avrc_is_sink_mode()) return false;
     if (player_state_get_source() != PlayerMediaSource::Nas) return false;
 
     AudioStateSnapshot snapshot = {};

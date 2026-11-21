@@ -12,6 +12,7 @@
 #include "audio_service.h"
 #include "bt_audio_source.h"
 #include "bt_audio_sink.h"
+#include "bt_audio_avrc.h"
 #include "app/app_manager.h"
 #include "battery_service.h"
 #include "media_catalog_v2.h"
@@ -286,6 +287,20 @@ static bool music_remote_ui_available()
 
 static bool execute_control_command(uint8_t command, uint8_t value = 0U)
 {
+    // Phone A2DP Sink is the current media owner. BLE Remote's playback
+    // and master-volume commands must bypass legacy NSF/Video dispatch even
+    // when their app state remains loaded in the background.
+    if (bt_audio_avrc_is_sink_mode()) {
+        switch (command) {
+            case 0x01U: return player_control_toggle_play_pause();
+            case 0x02U: return player_control_next();
+            case 0x03U: return player_control_previous();
+            case 0x04U: return player_control_volume_up(1U);
+            case 0x05U: return player_control_volume_down(1U);
+            case 0x06U: return value <= 100U && player_control_set_volume(value);
+            default: break;
+        }
+    }
     if (command >= 0x01U && command <= 0x03U && visual_music_app_remote_control_active()) {
         const NsfRemoteCommand nsf_command = command == 0x01U
             ? NsfRemoteCommand::TogglePlayPause
@@ -416,7 +431,9 @@ static void ensure_metadata_for_track(uint32_t track_index)
 
     if (!g_metadata_source_initialized || g_metadata_context != PhoneMediaContext::Music ||
         track_index != g_metadata_track_index ||
-        generation != g_metadata_catalog_generation) {
+        generation != g_metadata_catalog_generation ||
+        g_metadata_source_revision != 0U) {
+        // Clear former AVRCP phone media when returning to Local/NAS.
         queue_metadata(track_index, generation);
     }
 }
@@ -458,22 +475,45 @@ static void build_status_packet(
     const bool nsf_valid = visual_music_app_get_remote_snapshot(&nsf) && nsf.active;
     VideoRemoteSnapshot video = {};
     const bool video_valid = !nsf_valid && video_app_get_remote_snapshot(&video) && video.active;
-    const uint32_t track_index = nsf_valid
+    const bool phone_mode = bt_audio_avrc_is_sink_mode();
+    BtAudioAvrcSnapshot phone = {};
+    BtAudioSinkSnapshot phone_stream = {};
+    if (phone_mode) {
+        (void)bt_audio_avrc_get_snapshot(&phone);
+        (void)bt_audio_sink_get_snapshot(&phone_stream);
+    }
+    const uint32_t track_index = phone_mode ? UINT32_MAX : (nsf_valid
         ? nsf.track_index
-        : (video_valid ? video.item_index : (audio_valid ? audio.track_index : UINT32_MAX));
+        : (video_valid ? video.item_index : (audio_valid ? audio.track_index : UINT32_MAX)));
     if (out_playback_revision != nullptr) {
-        *out_playback_revision = nsf_valid
+        *out_playback_revision = phone_mode ? phone.playback_revision : (nsf_valid
             ? nsf.playback_revision
-            : (video_valid ? video.playback_revision : (audio_valid ? audio.playback_revision : 0U));
+            : (video_valid ? video.playback_revision : (audio_valid ? audio.playback_revision : 0U)));
     }
     if (out_seek_revision != nullptr) {
-        *out_seek_revision = (nsf_valid || video_valid) ? 0U : (audio_valid ? audio.seek_revision : 0U);
+        *out_seek_revision = phone_mode ? 0U :
+            ((nsf_valid || video_valid) ? 0U : (audio_valid ? audio.seek_revision : 0U));
     }
-    if (nsf_valid) ensure_metadata_for_nsf(nsf);
+    if (phone_mode) {
+        if (!g_metadata_source_initialized ||
+            g_metadata_context != PhoneMediaContext::Music ||
+            g_metadata_source_revision != phone.metadata_revision ||
+            g_metadata_track_index != UINT32_MAX) {
+            // Same existing BLE Remote metadata packet/chunk format, but the
+            // source is phone AVRCP rather than the FakePod local catalog.
+            queue_metadata_text(
+                phone.title, phone.artist, UINT32_MAX, 0U,
+                PhoneMediaContext::Music, phone.metadata_revision);
+        }
+    } else if (nsf_valid) ensure_metadata_for_nsf(nsf);
     else if (video_valid) ensure_metadata_for_video(video);
     else ensure_metadata_for_track(track_index);
 
-    packet[2] = nsf_valid
+    packet[2] = phone_mode
+        ? static_cast<uint8_t>(phone.playback_known
+            ? (phone.playing ? AudioPlaybackState::Playing : AudioPlaybackState::Paused)
+            : (phone_stream.streaming ? AudioPlaybackState::Playing : AudioPlaybackState::Stopped))
+        : (nsf_valid
         ? static_cast<uint8_t>(nsf.paused
             ? AudioPlaybackState::Paused
             : (nsf.playing ? AudioPlaybackState::Playing : AudioPlaybackState::Preparing))
@@ -481,7 +521,7 @@ static void build_status_packet(
             ? static_cast<uint8_t>(video.paused
                 ? AudioPlaybackState::Paused
                 : (video.playing ? AudioPlaybackState::Playing : AudioPlaybackState::Preparing))
-            : (audio_valid ? static_cast<uint8_t>(audio.state) : 0xFFU));
+            : (audio_valid ? static_cast<uint8_t>(audio.state) : 0xFFU)));
     packet[3] = audio_valid ? audio.volume_percent : 0U;
 
     BatterySnapshot battery = {};
@@ -492,24 +532,25 @@ static void build_status_packet(
     if (audio_valid && audio.user_muted) flags |= 0x01U;
     if (battery_valid) flags |= 0x02U;
     if (track_index != UINT32_MAX) flags |= 0x04U;
-    if (video_valid) flags |= 0x08U; // media context = VIDEO
-    if (nsf_valid) flags |= 0x10U;   // R46.0.50: media context = NSF
+    if (!phone_mode && video_valid) flags |= 0x08U; // media context = VIDEO
+    if (!phone_mode && nsf_valid) flags |= 0x10U;   // R46.0.50: media context = NSF
     if (music_remote_ui_available()) flags |= 0x20U; // Music APP foreground
-    if (player_state_get_source() == PlayerMediaSource::Nas ||
-        (audio_valid && audio.source == AudioPlaybackSource::NasHttp)) flags |= 0x40U;
-    if (!nsf_valid && !video_valid && music_remote_ui_available() && audio_valid &&
+    if (!phone_mode && (player_state_get_source() == PlayerMediaSource::Nas ||
+        (audio_valid && audio.source == AudioPlaybackSource::NasHttp))) flags |= 0x40U;
+    if (!phone_mode && !nsf_valid && !video_valid && music_remote_ui_available() && audio_valid &&
         player_control_local_seek_available(audio)) flags |= 0x80U;
     packet[5] = flags;
 
     write_u32_le(&packet[6], track_index);
-    write_u32_le(&packet[10], nsf_valid
+    write_u32_le(&packet[10], phone_mode ? phone.position_ms : (nsf_valid
         ? nsf.position_ms
         : (video_valid
             ? video.position_ms
-            : (audio_valid ? clamp_u64_to_u32(audio.position_ms) : 0U)));
+            : (audio_valid ? clamp_u64_to_u32(audio.position_ms) : 0U))));
 
-    uint64_t duration_ms = nsf_valid ? nsf.duration_ms : (video_valid ? video.duration_ms : 0ULL);
-    if (!nsf_valid && !video_valid && audio_valid &&
+    uint64_t duration_ms = phone_mode ? phone.duration_ms :
+        (nsf_valid ? nsf.duration_ms : (video_valid ? video.duration_ms : 0ULL));
+    if (!phone_mode && !nsf_valid && !video_valid && audio_valid &&
         audio.sample_rate_hz > 0U && audio.total_frames > 0ULL) {
         duration_ms = (audio.total_frames * 1000ULL) / audio.sample_rate_hz;
     }
