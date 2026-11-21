@@ -16,6 +16,13 @@ constexpr const char *TAG = "JPEG_HW";
 constexpr int kEngineTimeoutMs = 800;
 // 失败原因只打印前几次，避免视频逐帧回退时刷屏。
 constexpr int kMaxFailureLogs = 3;
+// IDF 6.1 jpeg_new_decoder_engine() allocates two internal DMA descriptors
+// and calls jpeg_del_decoder_engine() on an incomplete engine if one fails.
+// Its cleanup may dereference a null codec pointer (see jpeg_common.c).
+// Prewarm in ui_manager before radio and avoid late lazy initialization under
+// low-memory 96kHz/BT playback. Already-initialized engine needs no such guard.
+constexpr size_t kJpegEngineInitMinDmaFree = 16U * 1024U;
+constexpr size_t kJpegEngineInitMinDmaLargest = 4U * 1024U;
 
 SemaphoreHandle_t g_lock = nullptr;
 jpeg_decoder_handle_t g_engine = nullptr;
@@ -24,6 +31,7 @@ uint8_t *g_pad_buffer = nullptr;
 size_t g_pad_capacity = 0;
 int g_failure_logs = 0;
 bool g_logged_first_success = false;
+bool g_logged_dma_guard = false;
 
 SemaphoreHandle_t lock()
 {
@@ -37,6 +45,23 @@ bool ensure_engine_locked()
     if (g_engine != nullptr) return true;
     if (g_engine_init_failed) return false;
 
+    const size_t dma_free = heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    const size_t dma_largest =
+        heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+    if (dma_free < kJpegEngineInitMinDmaFree ||
+        dma_largest < kJpegEngineInitMinDmaLargest) {
+        // This is a transient resource shortage, NOT a permanent unsupported
+        // JPEG engine: let the caller fall back to software and retry later.
+        if (!g_logged_dma_guard) {
+            g_logged_dma_guard = true;
+            ESP_LOGW(TAG,
+                "JPEG引擎延迟初始化已跳过：DMA_free=%u largest=%u，"
+                "优先保证I2S/蓝牙，封面改用软件解码",
+                (unsigned)dma_free, (unsigned)dma_largest);
+        }
+        return false;
+    }
+
     jpeg_decode_engine_cfg_t cfg = {};
     cfg.intr_priority = 0;
     cfg.timeout_ms = kEngineTimeoutMs;
@@ -48,7 +73,9 @@ bool ensure_engine_locked()
         ESP_LOGW(TAG, "硬件 JPEG 引擎初始化失败(%s)，固定回退软件解码", esp_err_to_name(err));
         return false;
     }
-    ESP_LOGI(TAG, "硬件 JPEG 解码引擎就绪");
+    ESP_LOGI(TAG, "硬件 JPEG 解码引擎就绪：DMA_free=%u largest=%u",
+        (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
     return true;
 }
 
