@@ -1,0 +1,17 @@
+# FakePod S31 Bluetooth dual-mode profile (ESP-IDF 6.1)
+# Preserve Android encrypted BLE GATT remote while sending audio over Classic A2DP.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_CONTROLLER_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=y
+
+# A2DP source requires BR/EDR. Use the built-in SBC encoder with legacy PCM data callback.
+CONFIG_BT_CLASSIC_ENABLED=y
+CONFIG_BT_A2DP_ENABLE=y
+# CONFIG_BT_A2DP_USE_EXTERNAL_CODEC is not set
+
+# Android GATT remote service: BLE 4.2 GATTS and encrypted bonding.
+CONFIG_BT_BLE_ENABLED=y
+CONFIG_BT_BLE_42_FEATURES_SUPPORTED=y
+# CONFIG_BT_BLE_50_FEATURES_SUPPORTED is not set
+CONFIG_BT_GATTS_ENABLE=y
+CONFIG_BT_BLE_SMP_ENABLE=y
