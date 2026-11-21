@@ -3,6 +3,7 @@
 managed_components/
 sdkconfig.*
 !sdkconfig.defaults
+!sdkconfig.bluetooth.defaults
 
 *.bin
 *.elf
