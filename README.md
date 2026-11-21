@@ -124,6 +124,49 @@
 
 ## 蓝牙音频发射 + 手机遥控共存（实验分支）
 
+### 修复连接耳机后 FLAC 无法播放：SDMMC / I2S DMA 内存不足
+
+实机确认耳机 MH-M18 可被搜索、A2DP Profile 和媒体流已启动、手机 BLE GATT 遥控同时连接成功。
+但起播后 `sdmmc_cmd: allocate_dma_buf: not enough mem`、`diskio_sdmmc: sdmmc_read_blocks failed`、
+`i2s_alloc_dma_desc: allocate DMA buffer failed`，故障时剩余 Internal 约 18.9KB，
+DMA 只有约 3.8KB（而 PSRAM 仍有 15MB 以上）。
+
+ESP-IDF 的 `sdmmc_read_sectors` 在 FAT 文件目标缓冲不支持直接 DMA 时，会临时尝试
+`heap_caps_malloc(..., MALLOC_CAP_DMA)`，不断将容量减半直到 512B。
+在双模 BT + I2S 模式下，内部 DMA 堆碎片或缺口导致 SD 文件读失败。
+FLAC `ESP_ERR_INVALID_STATE` 是该读取失败的**后果**，并非文件损坏。
+
+实验分支修复：
+
+- 调整 `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL`：**16384 → 2048**。普通小内存申请更多偏向
+  PSRAM，优先保留内部 RAM 给 BT 主机、SDMMC、I2S DMA 和必需的任务栈。
+- `sdcard_init()` 挂载时就申请**专用 4096B DMA bounce 缓冲**，
+  `host.dma_aligned_buffer` 指向它，同时限制单次非对齐读到 8 个扇区。
+  已挂载期间整个 SDMMC Host 复用，避免播放期间反复临时分配。
+  挂载失败/USB MSC 卸载成功后按所有权释放，保留原 USB 热切换流程。
+- 新配置文件 `sdkconfig.fakepod_s31_bt_dma`，防止旧固件配置被继续复用；
+  编译时检查 PSRAM malloc 阈值必须 ≤2048。
+- 每 10 秒 `A2DP_TX` 日志附带 `DMA_free`、`DMA_largest`，用于判断是否留足连续 DMA 空间。
+
+重新构建、确认新配置并烧录：
+
+```powershell
+git switch feat/a2dp-source-ble-remote
+git pull --ff-only
+pio run -e fakepod_s31 -t clean
+pio run -e fakepod_s31
+Select-String .\sdkconfig.fakepod_s31_bt_dma -Pattern 'CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL|CONFIG_BTDM_CTRL_MODE_BTDM'
+pio run -e fakepod_s31 -t upload
+pio device monitor -e fakepod_s31
+```
+
+正确应显示 `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=2048`、
+`CONFIG_BTDM_CTRL_MODE_BTDM=y`，启动期应有
+`SDMMC持久DMA缓存：4096B`，后续 A2DP 播放日志有 `DMA_largest`。
+请依次测试 **耳机连接 → FLAC 44.1kHz/16-bit 连续 2 分钟 → MP3 → 暂停/切歌 → 手机BLE遥控**。
+若仍报 DMA 内存不足，不要继续盲目改 DMA desc 或 FLAC ring，请保留
+`SDMMC持久DMA缓存`、`A2DP_TX` 和 `AUDIO_FAULT` 的 RAM 数字后再精确优化。
+
 ### 修复“启动·使能Host”卡住：底层控制器未启用双模
 
 实机日志确定卡在 `BLE_START step=4 bluedroid_enable`，控制器初始化已成功。
@@ -136,7 +179,7 @@ choice，可能默认保持 BLE Only，结果 Bluedroid 同时启动 Classic 与
 已修复：在 `sdkconfig.bluetooth.defaults` 明确配置
 `CONFIG_BTDM_CTRL_MODE_BTDM=y`，增加 `CONFIG_BT_CTRL_BREDR_ENABLE` 与
 双模模式的编译期检查，并把本分支 sdkconfig 改为独立的
-`sdkconfig.fakepod_s31_bt_dualmode`，确保从新的默认配置生成，不复用旧
+`sdkconfig.fakepod_s31_bt_dma`，确保从新的默认配置生成，不复用旧
 `sdkconfig.fakepod_s31_a2dp` 或主线配置。
 
 更新后的实机测试命令：
@@ -146,7 +189,7 @@ git switch feat/a2dp-source-ble-remote
 git pull --ff-only
 pio run -e fakepod_s31 -t clean
 pio run -e fakepod_s31
-Select-String -Path .\sdkconfig.fakepod_s31_bt_dualmode -Pattern '^(CONFIG_BTDM_CTRL_MODE_BTDM=y|CONFIG_BT_CTRL_BREDR_ENABLE=y|CONFIG_BT_CLASSIC_ENABLED=y|CONFIG_BT_A2DP_ENABLE=y)'
+Select-String -Path .\sdkconfig.fakepod_s31_bt_dma -Pattern '^(CONFIG_BTDM_CTRL_MODE_BTDM=y|CONFIG_BT_CTRL_BREDR_ENABLE=y|CONFIG_BT_CLASSIC_ENABLED=y|CONFIG_BT_A2DP_ENABLE=y)'
 pio run -e fakepod_s31 -t upload
 pio device monitor -e fakepod_s31
 ```
@@ -186,7 +229,7 @@ pio device monitor -e fakepod_s31
 这样 Android BLE 仍能正常“广播中”，但 A2DP Source 宏被编译为关闭，
 UI 就会显示“不支持”。
 
-本分支已将 `platformio.ini` 的 sdkconfig 文件切换为 **`sdkconfig.fakepod_s31_bt_dualmode`**。
+本分支已将 `platformio.ini` 的 sdkconfig 文件切换为 **`sdkconfig.fakepod_s31_bt_dma`**。
 第一次重新构建会从 `sdkconfig.defaults;sdkconfig.bluetooth.defaults` 生成新的配置，
 不触碰主线原有的 `sdkconfig.fakepod_s31`，因此切回 `main` 也不影响原设置。
 同时增加编译期强制检查，若 Classic / A2DP / 内置 SBC 没有生效，编译会报错，
@@ -204,7 +247,7 @@ pio run -e fakepod_s31
 确认实际 SDK 配置：
 
 ```powershell
-Select-String -Path .\sdkconfig.fakepod_s31_bt_dualmode -Pattern '^(CONFIG_BT_(BLUEDROID_ENABLED|CLASSIC_ENABLED|A2DP_ENABLE|BLE_ENABLED|GATTS_ENABLE)=y|# CONFIG_BT_A2DP_USE_EXTERNAL_CODEC is not set)'
+Select-String -Path .\sdkconfig.fakepod_s31_bt_dma -Pattern '^(CONFIG_BT_(BLUEDROID_ENABLED|CLASSIC_ENABLED|A2DP_ENABLE|BLE_ENABLED|GATTS_ENABLE)=y|# CONFIG_BT_A2DP_USE_EXTERNAL_CODEC is not set)'
 ```
 
 **正确结果应同时包含** `CONFIG_BT_CLASSIC_ENABLED=y`、`CONFIG_BT_A2DP_ENABLE=y`，
