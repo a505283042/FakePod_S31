@@ -15,6 +15,7 @@
 #include "lyrics_text_layout.h"
 #include "media_catalog_v2.h"
 #include "player_control.h"
+#include "system/bt_audio_avrc.h"
 #include "player_state.h"
 #include "system/screen_lock_simple.h"
 #include "screens/cassette_view.h"
@@ -91,6 +92,8 @@ static lv_obj_t *g_overlay_total_time = nullptr;
 static lv_obj_t *g_overlay_volume = nullptr;
 static lv_obj_t *g_overlay_volume_button = nullptr;
 static lv_obj_t *g_overlay_mode_button = nullptr;
+static bool g_last_mode_phone = false;
+static uint32_t g_last_avrc_loop_revision = UINT32_MAX;
 static lv_obj_t *g_overlay_play_symbol = nullptr;
 static lv_timer_t *g_overlay_timer = nullptr;
 static bool g_overlay_visible = false;
@@ -237,7 +240,39 @@ static void lyrics_view_mode_icon_draw_cb(lv_event_t *event)
         draw(x + 6, y + 5, x, y);
     };
 
-    switch (player_control_get_loop_mode()) {
+    PlayerLoopMode visible_mode = player_control_get_loop_mode();
+    const bool phone_mode = bt_audio_avrc_is_sink_mode();
+    BtAudioAvrcSnapshot avrc = {};
+    if (phone_mode) {
+        (void)bt_audio_avrc_get_snapshot(&avrc);
+        line.color = lv_color_hex(0x8894A6);
+        if (!avrc.connected || avrc.loop_support == BtAvrcLoopSupport::Checking) {
+            draw(cx - 10, cy - 12, cx + 10, cy - 12);
+            draw(cx - 10, cy + 12, cx + 10, cy + 12);
+            draw(cx - 9, cy - 10, cx + 9, cy + 10);
+            draw(cx + 9, cy - 10, cx - 9, cy + 10);
+            return;
+        }
+        if (avrc.loop_support == BtAvrcLoopSupport::Unsupported) {
+            draw(cx - 12, cy - 12, cx + 12, cy + 12);
+            draw(cx + 12, cy - 12, cx - 12, cy + 12);
+            return;
+        }
+        if (avrc.loop_support == BtAvrcLoopSupport::Unverified &&
+            !avrc.loop_request_pending && !avrc.loop_request_sent) {
+            draw(cx - 8, cy - 9, cx - 4, cy - 13);
+            draw(cx - 4, cy - 13, cx + 7, cy - 13);
+            draw(cx + 7, cy - 13, cx + 11, cy - 8);
+            draw(cx + 11, cy - 8, cx + 4, cy + 1);
+            draw(cx + 4, cy + 1, cx + 4, cy + 4);
+            draw(cx + 4, cy + 11, cx + 4, cy + 12);
+            return;
+        }
+        visible_mode = static_cast<PlayerLoopMode>(avrc.loop_requested_mode);
+        if (avrc.loop_support == BtAvrcLoopSupport::Confirmed)
+            line.color = lv_color_hex(0xF5F7FA);
+    }
+    switch (visible_mode) {
         case PlayerLoopMode::Sequential:
             draw(cx - 15, cy, cx + 13, cy);
             arrow_right(cx + 13, cy);
@@ -250,7 +285,7 @@ static void lyrics_view_mode_icon_draw_cb(lv_event_t *event)
             draw(cx + 13, cy + 9, cx - 11, cy + 9);
             arrow_left(cx - 11, cy + 9);
             draw(cx - 14, cy + 5, cx - 14, cy - 6);
-            if (player_control_get_loop_mode() == PlayerLoopMode::SingleRepeat) {
+            if (visible_mode == PlayerLoopMode::SingleRepeat) {
                 draw(cx, cy - 3, cx, cy + 4);
                 draw(cx - 2, cy - 1, cx, cy - 3);
             }
@@ -265,6 +300,13 @@ static void lyrics_view_mode_icon_draw_cb(lv_event_t *event)
             draw(cx + 6, cy - 9, cx + 14, cy - 9);
             arrow_right(cx + 14, cy - 9);
             break;
+    }
+    if (phone_mode && avrc.loop_support == BtAvrcLoopSupport::Unverified) {
+        line.width = 2;
+        draw(cx + 16, cy - 20, cx + 22, cy - 20);
+        draw(cx + 22, cy - 20, cx + 22, cy - 14);
+        draw(cx + 22, cy - 14, cx + 18, cy - 11);
+        draw(cx + 18, cy - 7, cx + 18, cy - 6);
     }
 }
 
@@ -693,6 +735,26 @@ static void lyrics_view_overlay_mode_cb(lv_event_t *event)
         return;
     }
 
+    if (bt_audio_avrc_is_sink_mode()) {
+        BtAudioAvrcSnapshot phone = {};
+        (void)bt_audio_avrc_get_snapshot(&phone);
+        if (!phone.connected || phone.loop_support == BtAvrcLoopSupport::Checking) {
+            ui_common_show_notice("循环模式", "正在检测手机 AVRCP 能力");
+            return;
+        }
+        if (phone.loop_support == BtAvrcLoopSupport::Unsupported) {
+            ui_common_show_notice("循环模式不可用", "手机未提供相关 AVRCP 播放控制类别");
+            return;
+        }
+        const uint8_t next = static_cast<uint8_t>((phone.loop_requested_mode + 1U) % 4U);
+        if (!player_control_set_loop_mode(static_cast<PlayerLoopMode>(next))) {
+            ui_common_show_notice("循环模式", "向手机发送循环请求失败");
+            return;
+        }
+        if (g_overlay_mode_button != nullptr) lv_obj_invalidate(g_overlay_mode_button);
+        lyrics_view_overlay_arm_timeout();
+        return;
+    }
     const PlayerLoopMode previous_mode = player_control_get_loop_mode();
     const PlayerLoopMode mode = player_control_cycle_loop_mode();
     if (mode != previous_mode) {
@@ -1094,6 +1156,16 @@ static void lyrics_view_timer_cb(lv_timer_t *timer)
     // 全局屏幕动作菜单显示时，歌词页整层保持最后一帧。
     if (screen_action_menu_is_open()) {
         return;
+    }
+    const bool phone_mode = bt_audio_avrc_is_sink_mode();
+    BtAudioAvrcSnapshot loop_info = {};
+    if (phone_mode) (void)bt_audio_avrc_get_snapshot(&loop_info);
+    if (g_overlay_mode_button != nullptr &&
+        (phone_mode != g_last_mode_phone ||
+         (phone_mode && g_last_avrc_loop_revision != loop_info.loop_revision))) {
+        g_last_mode_phone = phone_mode;
+        g_last_avrc_loop_revision = phone_mode ? loop_info.loop_revision : UINT32_MAX;
+        lv_obj_invalidate(g_overlay_mode_button);
     }
 
     if (!lyrics_service_is_ready()) {
