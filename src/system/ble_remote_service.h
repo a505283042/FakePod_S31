@@ -27,6 +27,7 @@ struct BleRemoteSnapshot {
     bool connected = false;
     BleRemoteState state = BleRemoteState::Disabled;
     esp_err_t last_error = ESP_OK;
+    uint8_t startup_stage = 0; // 0=准备, 1-10=控制器/Host/A2DP/GATT/广播启动阶段
 };
 
 // 轻量初始化；不会在用户关闭 BLE 时启动蓝牙栈。
@@ -42,3 +43,4 @@ bool ble_remote_service_controller_supported();
 
 bool ble_remote_service_get_snapshot(BleRemoteSnapshot *out_snapshot);
 const char *ble_remote_service_state_name(BleRemoteState state);
+const char *ble_remote_service_startup_stage_name(uint8_t startup_stage);
