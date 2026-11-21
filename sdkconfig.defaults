@@ -69,6 +69,6 @@ CONFIG_TINYUSB_DESC_CDC_STRING="FakePod Serial"
 
 
 # FakePod Bluetooth：Bluedroid 双模（BLE 手机遥控 + Classic 预留 A2DP Source）
-# 具体 Host/Controller 选项见 sdkconfig.ble.defaults。
+# 具体 Host/Controller/A2DP 选项见 sdkconfig.bluetooth.defaults。
 CONFIG_BT_ENABLED=y
 CONFIG_BT_CONTROLLER_ENABLED=y
