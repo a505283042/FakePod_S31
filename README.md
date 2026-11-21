@@ -788,6 +788,12 @@ python tests/host/test_library_row_recycling.py
 
 ---
 
+## 许可证
+
+本项目采用 [MIT License](LICENSE)：任何人都可以自由使用、复制、修改、合并、发布、分发、再授权或销售本项目的代码与文档，唯一要求是保留原始版权声明和许可声明。
+
+第三方组件的许可证不受此影响，仍以各自目录内的声明为准（见下节）。
+
 ## 第三方组件
 
 固件基于 ESP-IDF 6.1 构建，依赖并以 `managed_components/` 形式引入：LVGL 9.x、esp_extractor、esp_lv_decoder、esp_new_jpeg、libpng、esp_lcd_co5300、esp_lvgl_port、esp_audio_codec、esp_tinyusb 3.0.1、cmake_utilities，另有本地 vendored 的 ESP-DSP。各组件的许可证与版权声明见对应目录内的 `README.md` / `LICENSE`。
