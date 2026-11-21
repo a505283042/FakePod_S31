@@ -287,6 +287,20 @@ static bool music_remote_ui_available()
 
 static bool execute_control_command(uint8_t command, uint8_t value = 0U)
 {
+    // Phone A2DP Sink is the current media owner. BLE Remote's playback
+    // and master-volume commands must bypass legacy NSF/Video dispatch even
+    // when their app state remains loaded in the background.
+    if (bt_audio_avrc_is_sink_mode()) {
+        switch (command) {
+            case 0x01U: return player_control_toggle_play_pause();
+            case 0x02U: return player_control_next();
+            case 0x03U: return player_control_previous();
+            case 0x04U: return player_control_volume_up(1U);
+            case 0x05U: return player_control_volume_down(1U);
+            case 0x06U: return value <= 100U && player_control_set_volume(value);
+            default: break;
+        }
+    }
     if (command >= 0x01U && command <= 0x03U && visual_music_app_remote_control_active()) {
         const NsfRemoteCommand nsf_command = command == 0x01U
             ? NsfRemoteCommand::TogglePlayPause
