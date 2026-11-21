@@ -73,6 +73,9 @@ static bool s_init_requested = false;
 static bool s_profile_ready = false;
 static bool s_scanning = false;
 static bool s_candidate_found = false;
+static BtAudioSourceDevice s_devices[BT_AUDIO_SOURCE_MAX_DEVICES] = {};
+static uint8_t s_device_count = 0U;
+static uint32_t s_discovery_revision = 0U;
 static bool s_connecting = false;
 static bool s_connected = false;
 static bool s_streaming = false;
@@ -152,6 +155,55 @@ static void set_peer_name_locked(const char *name)
              name != nullptr && name[0] != '\0' ? name : "蓝牙音频设备");
 }
 
+static void discovery_revision_bump_locked()
+{
+    if (++s_discovery_revision == 0U) ++s_discovery_revision;
+}
+
+static void remember_audio_device_locked(const uint8_t address[6], const char *name, int8_t rssi)
+{
+    if (!s_scanning || address == nullptr) return;
+    int slot = -1;
+    for (uint8_t i = 0; i < s_device_count; ++i) {
+        if (memcmp(s_devices[i].address, address, 6U) == 0) {
+            slot = static_cast<int>(i);
+            break;
+        }
+    }
+    if (slot < 0 && s_device_count < BT_AUDIO_SOURCE_MAX_DEVICES)
+        slot = static_cast<int>(s_device_count++);
+    if (slot < 0) {
+        // Keep stronger receivers if more than 12 are discovered.
+        int weakest = 0;
+        for (uint8_t i = 1; i < s_device_count; ++i)
+            if (s_devices[i].rssi < s_devices[weakest].rssi) weakest = i;
+        if (rssi <= s_devices[weakest].rssi) return;
+        slot = weakest;
+    }
+    BtAudioSourceDevice &device = s_devices[slot];
+    const bool same = memcmp(device.address, address, 6U) == 0;
+    bool changed = !same;
+    if (!same) {
+        device = {};
+        memcpy(device.address, address, 6U);
+        device.rssi = rssi;
+    } else if (rssi > device.rssi + 3) {
+        // Small RSSI fluctuations should not rebuild the entire LVGL list.
+        device.rssi = rssi;
+        changed = true;
+    }
+    if (name != nullptr && name[0] != '\0' &&
+        strcmp(device.name, name) != 0) {
+        snprintf(device.name, sizeof(device.name), "%s", name);
+        changed = true;
+    }
+    if (device.name[0] == '\0') {
+        snprintf(device.name, sizeof(device.name), "未命名音频设备");
+        changed = true;
+    }
+    if (changed) discovery_revision_bump_locked();
+}
+
 static void a2dp_event(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
 {
     if (param == nullptr) return;
@@ -189,6 +241,7 @@ static void a2dp_event(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
         s_media_ctrl_pending = false;
         s_retry_due = xTaskGetTickCount() + kMediaRetryTicks;
         s_negotiated_codec = 0xFFU;
+        discovery_revision_bump_locked();
 #if FAKEPOD_A2DP_EXTERNAL_CODEC
         s_mcc_ready = false;
         s_conn_hdl = s_connected ? param->conn_stat.conn_hdl : 0U;
@@ -202,7 +255,8 @@ static void a2dp_event(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             }
         } else if (state == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
             memset(s_peer_bda, 0, sizeof(s_peer_bda));
-            s_candidate_found = false; // 用户断开后下一次点击可重新搜索其它耳机。
+            s_candidate_found = false; // Retain scan list for manual reselection.
+            discovery_revision_bump_locked();
             flush_locked();
         }
         portEXIT_CRITICAL(&s_lock);
@@ -331,8 +385,26 @@ static void classic_gap_event(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t
                 default: break;
             }
         }
-        if (!esp_bt_gap_is_valid_cod(cod) ||
-            !(esp_bt_gap_get_cod_srvc(cod) & ESP_BT_COD_SRVC_RENDERING)) return;
+        // Some headphones advertise A/V class without the optional rendering
+        // service bit. Keep both, while excluding phones/keyboard peripherals.
+        const bool audio_class = esp_bt_gap_is_valid_cod(cod) &&
+            ((esp_bt_gap_get_cod_srvc(cod) & ESP_BT_COD_SRVC_RENDERING) ||
+             esp_bt_gap_get_cod_major_dev(cod) == ESP_BT_COD_MAJOR_DEV_AV);
+        if (!audio_class) {
+            // ESP-IDF may report a device name in a separate inquiry result
+            // without CoD. Update names only for addresses already classified
+            // as audio renderers, never create a non-audio entry.
+            if (name[0] == '\0') return;
+            portENTER_CRITICAL(&s_lock);
+            for (uint8_t i = 0U; i < s_device_count; ++i) {
+                if (memcmp(s_devices[i].address, param->disc_res.bda, 6U) == 0) {
+                    remember_audio_device_locked(param->disc_res.bda, name, rssi);
+                    break;
+                }
+            }
+            portEXIT_CRITICAL(&s_lock);
+            return;
+        }
         if (name[0] == '\0' && eir != nullptr) {
             uint8_t n = 0;
             uint8_t *p = esp_bt_gap_resolve_eir_data(eir, ESP_BT_EIR_TYPE_CMPL_LOCAL_NAME, &n);
@@ -344,6 +416,7 @@ static void classic_gap_event(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t
             }
         }
         portENTER_CRITICAL(&s_lock);
+        remember_audio_device_locked(param->disc_res.bda, name, rssi);
         if (s_scanning && (!s_candidate_found || rssi > s_best_rssi)) {
             s_candidate_found = true;
             s_best_rssi = rssi;
@@ -357,6 +430,7 @@ static void classic_gap_event(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t
             char name[48];
             portENTER_CRITICAL(&s_lock);
             s_scanning = false;
+            discovery_revision_bump_locked();
             found = s_candidate_found;
             memcpy(name, s_candidate_name, sizeof(name));
             portEXIT_CRITICAL(&s_lock);
@@ -431,6 +505,9 @@ esp_err_t bt_audio_source_host_start()
     s_deinit_confirmed = false;
     s_scanning = false;
     s_candidate_found = false;
+    s_device_count = 0U;
+    memset(s_devices, 0, sizeof(s_devices));
+    discovery_revision_bump_locked();
     s_connecting = false;
     s_connected = false;
     s_streaming = false;
@@ -482,6 +559,9 @@ void bt_audio_source_host_stop()
     s_connected = false;
     s_connecting = false;
     s_scanning = false;
+    s_candidate_found = false;
+    s_device_count = 0U;
+    discovery_revision_bump_locked();
     flush_locked();
     portEXIT_CRITICAL(&s_lock);
     if (!old_init) return;
@@ -521,7 +601,10 @@ esp_err_t bt_audio_source_scan()
         s_candidate_found = false;
         s_scanning = true;
         s_best_rssi = -127;
+        s_device_count = 0U;
+        memset(s_devices, 0, sizeof(s_devices));
         memset(s_candidate_name, 0, sizeof(s_candidate_name));
+        discovery_revision_bump_locked();
     }
     portEXIT_CRITICAL(&s_lock);
     if (!allowed) return ESP_ERR_INVALID_STATE;
@@ -529,10 +612,86 @@ esp_err_t bt_audio_source_scan()
     if (err != ESP_OK) {
         portENTER_CRITICAL(&s_lock);
         s_scanning = false;
+        discovery_revision_bump_locked();
         portEXIT_CRITICAL(&s_lock);
     }
     return err;
 #else
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
+}
+
+bool bt_audio_source_get_device_list(BtAudioSourceDeviceList *out)
+{
+    if (out == nullptr) return false;
+    BtAudioSourceDeviceList snapshot = {};
+#if FAKEPOD_A2DP_SUPPORTED
+    portENTER_CRITICAL(&s_lock);
+    snapshot.revision = s_discovery_revision;
+    snapshot.scanning = s_scanning;
+    snapshot.count = s_device_count;
+    memcpy(snapshot.devices, s_devices, sizeof(s_devices));
+    portEXIT_CRITICAL(&s_lock);
+    // Sort only the snapshot: callback-owned entries remain stable in memory.
+    for (uint8_t i = 0U; i < snapshot.count; ++i) {
+        for (uint8_t j = i + 1U; j < snapshot.count; ++j) {
+            if (snapshot.devices[j].rssi > snapshot.devices[i].rssi) {
+                BtAudioSourceDevice tmp = snapshot.devices[i];
+                snapshot.devices[i] = snapshot.devices[j];
+                snapshot.devices[j] = tmp;
+            }
+        }
+    }
+#endif
+    *out = snapshot;
+    return true;
+}
+
+esp_err_t bt_audio_source_connect_device(const uint8_t address[6])
+{
+#if FAKEPOD_A2DP_SUPPORTED
+    if (address == nullptr) return ESP_ERR_INVALID_ARG;
+    esp_bd_addr_t target = {};
+    char name[48] = {};
+    bool allowed = false;
+    portENTER_CRITICAL(&s_lock);
+    if (s_init_requested && s_profile_ready &&
+        !s_scanning && !s_connected && !s_connecting) {
+        for (uint8_t i = 0U; i < s_device_count; ++i) {
+            if (memcmp(s_devices[i].address, address, sizeof(target)) == 0) {
+                memcpy(target, s_devices[i].address, sizeof(target));
+                snprintf(name, sizeof(name), "%s", s_devices[i].name);
+                allowed = true;
+                break;
+            }
+        }
+        if (allowed) {
+            memcpy(s_peer_bda, target, sizeof(target));
+            memcpy(s_candidate_bda, target, sizeof(target));
+            snprintf(s_candidate_name, sizeof(s_candidate_name), "%s", name);
+            s_candidate_found = true;
+            set_peer_name_locked(name);
+            s_connecting = true;
+            discovery_revision_bump_locked();
+        }
+    }
+    portEXIT_CRITICAL(&s_lock);
+    if (!allowed) return ESP_ERR_INVALID_STATE;
+    const esp_err_t err = esp_a2d_source_connect(target);
+    if (err != ESP_OK) {
+        portENTER_CRITICAL(&s_lock);
+        s_connecting = false;
+        discovery_revision_bump_locked();
+        portEXIT_CRITICAL(&s_lock);
+    }
+    ESP_LOGI(TAG, "A2DP selected %02X:%02X:%02X:%02X:%02X:%02X (%s): %s",
+             static_cast<unsigned>(target[0]), static_cast<unsigned>(target[1]),
+             static_cast<unsigned>(target[2]), static_cast<unsigned>(target[3]),
+             static_cast<unsigned>(target[4]), static_cast<unsigned>(target[5]),
+             name, esp_err_to_name(err));
+    return err;
+#else
+    (void)address;
     return ESP_ERR_NOT_SUPPORTED;
 #endif
 }

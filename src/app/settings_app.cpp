@@ -90,6 +90,7 @@ enum class SettingsPage : uint8_t {
     Main = 0,
     Connection,
     Bluetooth,
+    BluetoothDevices,
     Applications,
     MusicPlayer,
     ElectronicFlow,
@@ -168,7 +169,10 @@ static bool g_controls_auto_hide_dirty = false;
 static uint8_t g_nsf_gain_saved_db = 3U;
 static uint8_t g_nsf_gain_pending_db = 3U;
 static bool g_nsf_gain_dirty = false;
-static int32_t g_detail_saved_scroll_y[8] = {};
+static int32_t g_detail_saved_scroll_y[9] = {};
+static uint32_t g_bt_list_displayed_revision = UINT32_MAX;
+static uint32_t g_bt_list_displayed_state = UINT32_MAX;
+static bool g_bt_scan_on_entry_pending = false;
 static int32_t g_detail_scroll_y = 0;
 static int32_t g_detail_scroll_max_y = 0;
 static int32_t g_detail_drag_start_scroll_y = 0;
@@ -222,6 +226,7 @@ static const char *page_title(SettingsPage page)
         case SettingsPage::Main: return "设置";
         case SettingsPage::Connection: return "连接";
         case SettingsPage::Bluetooth: return "蓝牙";
+    case SettingsPage::BluetoothDevices: return "蓝牙音频设备";
         case SettingsPage::Applications: return "应用";
         case SettingsPage::MusicPlayer: return "音乐播放器";
         case SettingsPage::ElectronicFlow: return "电子音流";
@@ -250,6 +255,8 @@ static SettingsPage parent_page(SettingsPage page)
             return SettingsPage::Applications;
         case SettingsPage::Bluetooth:
             return SettingsPage::Connection;
+        case SettingsPage::BluetoothDevices:
+            return SettingsPage::Bluetooth;
         case SettingsPage::Connection:
         case SettingsPage::Applications:
         case SettingsPage::System:
@@ -275,7 +282,7 @@ static void clear_detail_value_refs()
 static size_t settings_page_index(SettingsPage page)
 {
     const size_t index = static_cast<size_t>(page);
-    return index < 8U ? index : 0U;
+    return index < 9U ? index : 0U;
 }
 
 static lv_obj_t *detail_parent()
@@ -355,6 +362,11 @@ static uint16_t detail_row_count_for_page(SettingsPage page)
     switch (page) {
         case SettingsPage::Connection: return 6U;
         case SettingsPage::Bluetooth: return 5U;
+        case SettingsPage::BluetoothDevices: {
+            BtAudioSourceDeviceList list = {};
+            (void)bt_audio_source_get_device_list(&list);
+            return static_cast<uint16_t>(2U + (list.count > 0U ? list.count : 1U));
+        }
         case SettingsPage::Applications: return 5U;
         case SettingsPage::MusicPlayer: return 5U;
         case SettingsPage::ElectronicFlow: return 1U;
@@ -1734,42 +1746,103 @@ static void format_bt_audio_value(char *out, size_t cap)
     else if (s.connected) snprintf(out, cap, "已连接·%s", s.peer_name);
     else if (s.connecting) snprintf(out, cap, "正在连接");
     else if (s.scanning) snprintf(out, cap, "搜索耳机中");
-    else if (s.candidate_found) snprintf(out, cap, "连接·%s", s.peer_name);
-    else snprintf(out, cap, "点击搜索耳机");
+    else {
+        BtAudioSourceDeviceList list = {};
+        (void)bt_audio_source_get_device_list(&list);
+        if (list.count != 0U)
+            snprintf(out, cap, "发现%u台·点击选择", static_cast<unsigned>(list.count));
+        else snprintf(out, cap, "点击选择耳机");
+    }
 }
 
-static void bluetooth_audio_click_cb(lv_event_t *event)
+// Separate device picker: the Transmit row is a navigation entry, not a
+// "scan once then connect the strongest device" toggle.
+static uint32_t bluetooth_devices_state_signature()
 {
-    if (!click_is_valid(event) || g_page != SettingsPage::Bluetooth) return;
-    BtAudioSourceSnapshot s = {};
-    (void)bt_audio_source_get_snapshot(&s);
-    if (!s.available) {
-        ui_common_show_notice("蓝牙音频不可用", "请检查Classic/A2DP编译配置");
-        return;
-    }
-    if (!s.initialized) {
-        ui_common_show_notice("蓝牙尚未启动", "请先开启手机蓝牙遥控模式");
-        return;
-    }
-    if (s.scanning || s.connecting) return;
+    BleRemoteSnapshot ble = {};
+    BtAudioSourceSnapshot source = {};
+    (void)ble_remote_service_get_snapshot(&ble);
+    (void)bt_audio_source_get_snapshot(&source);
+    return (static_cast<uint32_t>(ble.audio_role) << 8U) |
+        (ble.audio_role_switching ? 1U : 0U) |
+        (ble.stack_initialized ? 2U : 0U) |
+        (source.initialized ? 4U : 0U) |
+        (source.scanning ? 8U : 0U) |
+        (source.connecting ? 16U : 0U) |
+        (source.connected ? 32U : 0U);
+}
 
-    esp_err_t ret = ESP_ERR_INVALID_STATE;
-    if (s.connected) {
-        ret = bt_audio_source_disconnect();
-    } else if (s.candidate_found) {
-        ret = bt_audio_source_connect_candidate();
-    } else {
-        ret = bt_audio_source_scan();
+static void bluetooth_device_disconnect_click_cb(lv_event_t *event)
+{
+    if (!click_is_valid(event) || g_page != SettingsPage::BluetoothDevices) return;
+    BtAudioSourceSnapshot source = {};
+    (void)bt_audio_source_get_snapshot(&source);
+    if (!source.connected && !source.connecting) return;
+    const esp_err_t ret = bt_audio_source_disconnect();
+    if (ret == ESP_OK)
+        ui_common_show_notice("正在断开蓝牙音频", "断开后可选择另一台耳机／音箱");
+    else
+        ui_common_show_notice("蓝牙断开失败", esp_err_to_name(ret));
+}
+
+static void bluetooth_device_scan_click_cb(lv_event_t *event)
+{
+    if (!click_is_valid(event) || g_page != SettingsPage::BluetoothDevices) return;
+    BleRemoteSnapshot ble = {};
+    BtAudioSourceSnapshot source = {};
+    (void)ble_remote_service_get_snapshot(&ble);
+    (void)bt_audio_source_get_snapshot(&source);
+    if (ble.audio_role_switching || ble.audio_role != DeviceBluetoothAudioRole::Transmit ||
+        !source.initialized) {
+        ui_common_show_notice("蓝牙发射尚未就绪", "请开启蓝牙并等待音频发射启动");
+        return;
     }
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "蓝牙音频操作失败：%s", esp_err_to_name(ret));
-        ui_common_show_notice("蓝牙音频操作失败", "请检查耳机是否进入配对模式");
+    if (source.scanning) return;
+    if (source.connected || source.connecting) {
+        ui_common_show_notice("当前已有音频连接", "请先点击“当前设备”断开，再重新扫描");
+        return;
     }
-    if (g_detail_values[2] != nullptr) {
-        char value[72] = {};
-        format_bt_audio_value(value, sizeof(value));
-        lv_label_set_text(g_detail_values[2], value);
+    g_bt_scan_on_entry_pending = false;
+    const esp_err_t ret = bt_audio_source_scan();
+    if (ret != ESP_OK)
+        ui_common_show_notice("扫描未能启动", esp_err_to_name(ret));
+}
+
+static void bluetooth_device_select_click_cb(lv_event_t *event)
+{
+    if (!click_is_valid(event) || g_page != SettingsPage::BluetoothDevices) return;
+    const uintptr_t user_index = reinterpret_cast<uintptr_t>(lv_event_get_user_data(event));
+    if (user_index == 0U) return;
+    const size_t index = static_cast<size_t>(user_index - 1U);
+    BtAudioSourceDeviceList list = {};
+    BtAudioSourceSnapshot source = {};
+    BleRemoteSnapshot ble = {};
+    (void)bt_audio_source_get_device_list(&list);
+    (void)bt_audio_source_get_snapshot(&source);
+    (void)ble_remote_service_get_snapshot(&ble);
+    if (index >= list.count) return;
+    if (ble.audio_role_switching ||
+        ble.audio_role != DeviceBluetoothAudioRole::Transmit) {
+        ui_common_show_notice("蓝牙发射尚未就绪", "请等待发射模式切换完成");
+        return;
     }
+    if (list.scanning) {
+        ui_common_show_notice("正在扫描", "搜索完成后再点击设备");
+        return;
+    }
+    if (!source.initialized) {
+        ui_common_show_notice("蓝牙发射未就绪", "请等待音频发射启动");
+        return;
+    }
+    if (source.connected || source.connecting) {
+        ui_common_show_notice("已经连接或正在连接", "请先断开当前设备");
+        return;
+    }
+    const esp_err_t ret = bt_audio_source_connect_device(list.devices[index].address);
+    if (ret == ESP_OK)
+        ui_common_show_notice("正在连接蓝牙设备", list.devices[index].name);
+    else
+        ui_common_show_notice("蓝牙连接请求失败", esp_err_to_name(ret));
 }
 
 // The Connection menu contains a single Bluetooth entrance. Its child page
@@ -1858,11 +1931,19 @@ static void bluetooth_transmit_click_cb(lv_event_t *event)
     }
     if (ble.audio_role != DeviceBluetoothAudioRole::Transmit) {
         if (ble_remote_service_request_audio_role(DeviceBluetoothAudioRole::Transmit)) {
+            g_bt_scan_on_entry_pending = true;
+            g_pending_page = SettingsPage::BluetoothDevices;
+            lv_async_call(show_page_async, nullptr);
             ui_common_show_notice("切换蓝牙音频发射", "正在切换：FakePod → 耳机／音箱");
+        } else {
+            ui_common_show_notice("发射模式切换失败", "请重试或检查蓝牙状态");
         }
         return;
     }
-    bluetooth_audio_click_cb(event);
+    // Active Transmit now opens a list; the user explicitly chooses a peer.
+    g_bt_scan_on_entry_pending = true;
+    g_pending_page = SettingsPage::BluetoothDevices;
+    lv_async_call(show_page_async, nullptr);
 }
 
 static void bluetooth_receive_click_cb(lv_event_t *event)
@@ -2161,6 +2242,55 @@ static void create_bluetooth_page(const DeviceSettingsSnapshot &settings)
 #else
     add_detail_row(4, "音频编码", "固定SBC", SettingsDetailIcon::Bluetooth, false);
 #endif
+}
+
+static void create_bluetooth_devices_page()
+{
+    BtAudioSourceSnapshot source = {};
+    BtAudioSourceDeviceList list = {};
+    BleRemoteSnapshot ble = {};
+    (void)bt_audio_source_get_snapshot(&source);
+    (void)bt_audio_source_get_device_list(&list);
+    (void)ble_remote_service_get_snapshot(&ble);
+    const bool transmitter = ble.audio_role == DeviceBluetoothAudioRole::Transmit &&
+                             !ble.audio_role_switching;
+    const char *current = !transmitter ? "切换发射中" :
+                          !source.initialized ? "启动中" :
+                          source.connected ? source.peer_name :
+                          source.connecting ? "正在连接..." : "未连接";
+    add_clickable_detail_row(0, "当前设备", current,
+                             SettingsDetailIcon::Bluetooth,
+                             bluetooth_device_disconnect_click_cb);
+    add_clickable_detail_row(1, "扫描设备",
+        !transmitter || !source.initialized ? "等待启动" :
+        source.scanning ? "搜索中..." :
+        source.connected || source.connecting ? "需先断开" : "点击重新扫描",
+        SettingsDetailIcon::Bluetooth, bluetooth_device_scan_click_cb);
+
+    if (list.count == 0U) {
+        add_detail_row(2, source.scanning ? "正在寻找耳机／音箱" : "未发现音频设备",
+            source.scanning ? "搜索约5秒" : "点击扫描设备",
+            SettingsDetailIcon::Bluetooth, false);
+    } else {
+        for (uint8_t i = 0U; i < list.count; ++i) {
+            const BtAudioSourceDevice &device = list.devices[i];
+            char info[48] = {};
+            snprintf(info, sizeof(info), "%02X:%02X · %ddBm",
+                static_cast<unsigned>(device.address[4]),
+                static_cast<unsigned>(device.address[5]),
+                static_cast<int>(device.rssi));
+            // Encode index+1 in LVGL user_data. The picker only accepts a
+            // selection after inquiry completes, so this sorted list is stable.
+            (void)create_row(
+                detail_parent(), detail_row_y(static_cast<int16_t>(i + 2U)),
+                kDetailRowHeight, device.name, info,
+                SettingsDetailIcon::Bluetooth, true,
+                bluetooth_device_select_click_cb,
+                reinterpret_cast<void *>(static_cast<uintptr_t>(i + 1U)));
+        }
+    }
+    g_bt_list_displayed_revision = list.revision;
+    g_bt_list_displayed_state = bluetooth_devices_state_signature();
 }
 
 static PlayerFolderScope player_folder_scope_from_setting(DeviceMusicListScope scope)
@@ -2796,6 +2926,8 @@ static void show_page(SettingsPage page)
     brightness_disarm();
     lv_obj_clean(g_content);
     clear_detail_value_refs();
+    if (page != SettingsPage::BluetoothDevices)
+        g_bt_scan_on_entry_pending = false;
     g_page = page;
     lv_label_set_text(g_header_title, page_title(page));
 
@@ -2815,6 +2947,7 @@ static void show_page(SettingsPage page)
         case SettingsPage::Main: create_main_page(); break;
         case SettingsPage::Connection: create_connection_page(settings); break;
         case SettingsPage::Bluetooth: create_bluetooth_page(settings); break;
+        case SettingsPage::BluetoothDevices: create_bluetooth_devices_page(); break;
         case SettingsPage::Applications: create_applications_page(settings); break;
         case SettingsPage::MusicPlayer: create_music_player_page(settings); break;
         case SettingsPage::ElectronicFlow: create_electronic_flow_page(settings); break;
@@ -2966,6 +3099,34 @@ static void refresh_timer_cb(lv_timer_t *timer)
 #else
             lv_label_set_text(g_detail_values[4], "固定SBC");
 #endif
+        }
+    }
+    if (g_page == SettingsPage::BluetoothDevices) {
+        // The first entry into the transmitter picker starts one scan only
+        // when no previous results exist. Never auto-retry an empty inquiry.
+        if (g_bt_scan_on_entry_pending) {
+            BleRemoteSnapshot ble = {};
+            BtAudioSourceSnapshot source = {};
+            BtAudioSourceDeviceList list = {};
+            (void)ble_remote_service_get_snapshot(&ble);
+            (void)bt_audio_source_get_snapshot(&source);
+            (void)bt_audio_source_get_device_list(&list);
+            if (source.connected || source.connecting || source.scanning || list.count != 0U) {
+                g_bt_scan_on_entry_pending = false;
+            } else if (!ble.audio_role_switching &&
+                       ble.audio_role == DeviceBluetoothAudioRole::Transmit &&
+                       source.initialized) {
+                const esp_err_t ret = bt_audio_source_scan();
+                g_bt_scan_on_entry_pending = false;
+                if (ret != ESP_OK)
+                    ui_common_show_notice("扫描未能启动", esp_err_to_name(ret));
+            }
+        }
+        BtAudioSourceDeviceList list = {};
+        (void)bt_audio_source_get_device_list(&list);
+        if (list.revision != g_bt_list_displayed_revision ||
+            bluetooth_devices_state_signature() != g_bt_list_displayed_state) {
+            show_page(SettingsPage::BluetoothDevices);
         }
     }
     if (g_page == SettingsPage::About) {
@@ -3138,6 +3299,9 @@ static esp_err_t settings_enter()
         g_brightness_pending_level = g_brightness_saved_level;
     }
     g_brightness_dirty = false;
+    g_bt_scan_on_entry_pending = false;
+    g_bt_list_displayed_revision = UINT32_MAX;
+    g_bt_list_displayed_state = UINT32_MAX;
     g_music_scope_dirty[0] = false;
     g_music_scope_dirty[1] = false;
     g_music_source_dirty = false;

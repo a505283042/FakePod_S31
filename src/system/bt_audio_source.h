@@ -6,6 +6,20 @@
 
 // A2DP Source 与手机 BLE GATT 共享 Bluedroid Host/Controller。
 // 此服务绝不独立初始化/销毁 Bluetooth Host；生命周期由 ble_remote_service 统一管理。
+// Classic Bluetooth (BR/EDR) receivers found during inquiry.
+static constexpr size_t BT_AUDIO_SOURCE_MAX_DEVICES = 12U;
+struct BtAudioSourceDevice {
+    uint8_t address[6] = {};
+    char name[48] = {};
+    int8_t rssi = -127;
+};
+struct BtAudioSourceDeviceList {
+    uint32_t revision = 0U;
+    uint8_t count = 0U;
+    bool scanning = false;
+    BtAudioSourceDevice devices[BT_AUDIO_SOURCE_MAX_DEVICES] = {};
+};
+
 struct BtAudioSourceSnapshot {
     bool available = false;
     bool initialized = false;
@@ -29,8 +43,12 @@ esp_err_t bt_audio_source_host_start();
 void bt_audio_source_host_stop();
 
 // 只从非蓝牙回调任务触发扫描和连接；不影响 GATT 手机遥控会话。
-// 扫描 5.12 秒后保存信号最强的已发现音频接收设备，须再次点击连接。
+// Scan 5.12 seconds, deduplicate/sort up to 12 audio receivers and select by BD_ADDR.
+// The list remains available until the next scan or A2DP Source host shutdown.
 esp_err_t bt_audio_source_scan();
+bool bt_audio_source_get_device_list(BtAudioSourceDeviceList *out);
+esp_err_t bt_audio_source_connect_device(const uint8_t address[6]);
+// Legacy strongest-candidate API retained for older callers.
 esp_err_t bt_audio_source_connect_candidate();
 esp_err_t bt_audio_source_disconnect();
 void bt_audio_source_update();
