@@ -44,7 +44,7 @@
 | 图片浏览 | 扫描 SD 卡内 JPG / PNG，翻页浏览 |
 | 系统 | 锁屏 / AOD 息屏 / 全黑熄屏、亮度、自动熄屏、输出模式（普通耳机 / 高阻耳机 / 线路输出）、辅助键模式 |
 | 交互 | 触摸手势、电源键（AXP2101 PWRKEY）、辅助键 K1、体感翻转与双击、BLE 遥控 / BLE 手柄 |
-| 连接 | USB TinyUSB MSC + CDC：电脑直接管理 TF 卡；BLE 双角色（手机 GATT 外设 / 手柄 HID 主机，运行期互斥） |
+| 连接 | USB TinyUSB MSC + CDC；BLE 手机 GATT 遥控 + Classic A2DP Source 可同时运行（HID 手柄 Host 当前仍关闭） |
 | 电源 | AXP2101 电池电压/电量采集、上下电时序、机身姿态检测、关机前保存现场 |
 
 完整操作说明见 [FakePod 使用操作说明](FakePod_使用操作说明.md)，视频手势见 [视频播放操作说明](视频播放操作说明.md)。
@@ -98,7 +98,7 @@
 ├── platformio.ini              # PlatformIO 环境定义（默认 fakepod_s31）
 ├── partitions.csv              # 16MB 分区表
 ├── sdkconfig.defaults          # 基础 sdkconfig 片段
-├── sdkconfig.ble.defaults      # BLE 相关 sdkconfig 片段
+├── sdkconfig.bluetooth.defaults # Bluedroid 双模：BLE GATT + A2DP SBC
 ├── boards/fakepod_s31.json     # esp32s31 板卡定义
 ├── platform/espressif32_s31/   # 本地补丁的 PlatformIO 平台（必须保留）
 ├── src/
@@ -119,6 +119,53 @@
 ├── tools/                      # 电脑端工具（视频转换、NAS、固件合并）
 └── tests/host/                 # 主机回归脚本
 ```
+
+---
+
+## 蓝牙音频发射 + 手机遥控共存（实验分支）
+
+在 `feat/a2dp-source-ble-remote` 分支上，蓝牙 Host 由 `ble_remote_service` **唯一初始化/停止**；
+A2DP Source 与原手机 GATT 遥控共用 Bluedroid。音源解码后从 AudioTask 的 PCM
+旁路复制到独立 PSRAM 环形缓存；蓝牙回调取 S16 立体声数据交给 ESP-IDF 的
+**内置 SBC 编码器**。已有的 I²S → CS43131 有线 DAC 播放链不改变。
+
+### 使用步骤
+
+1. 「设置 → 连接 → 蓝牙模式」选择 **手机遥控**，保持 BLE GATT 广播；手机仍可连接并控制播放。
+2. 让蓝牙耳机/蓝牙音箱进入**传统蓝牙配对/可发现模式**。
+3. 点击「蓝牙音频发射」一次，发起约 5 秒扫描；再次点击连接搜索到的**信号最强**音频设备。设备名称显示在同一行。
+4. 成功连接并协商 SBC 采样率后，音乐开始同时由本机有线 DAC 和蓝牙发送；再点击可断开蓝牙耳机（手机 BLE 继续连接）。
+5. 关闭「蓝牙模式」则会同时关闭 BLE GATT 和 Classic A2DP，切换 Wi-Fi 时也如此。
+
+### 已实现及限制
+
+- 手机 **BLE GATT 遥控与 A2DP Source 可同时连接**；这不等于当前 HID 手柄主机也已恢复。
+- A2DP 使用经典蓝牙 SBC，**不是**通过 BLE Audio / LE Audio 发声；发射默认按 16-bit
+  PCM 重采样至耳机协商的 44.1/48 kHz（支持其余 SBC 协商档），96 kHz/24-bit
+  FLAC 仍经主解码器输出，再在旁路中降采样。当前采用轻量采样保持（无高阶 SRC），
+  音质与低延迟有待实机调校。
+- PCM 旁路覆盖音乐、AVI MP3 和 NSF。当前是**有线+蓝牙镜像输出**，不是独占的蓝牙输出模式；
+  DAC 用户音量会转换成蓝牙软件增益，蓝牙耳机本身也可调整音量。
+- 32 KB PSRAM 蓝牙环形缓存，最大堆积限制约 120ms；蓝牙回调缺数据时补零，积压时只丢弃蓝牙
+  旧帧，**不阻塞 I²S**。蓝牙耳机固有延时可能明显高于有线，视频口型同步尚未校准。
+- 目前扫描结果自动保留信号最强的 **Rendering** 类设备；**没有设备列表**。如搜索到错误的
+  音箱，可将目标耳机靠近设备并重试。蓝牙自动重连、记忆设备、AVRCP 耳机按键均未实现。
+- 保留原有 Wi-Fi 与蓝牙的运行期互斥策略，所以 **NAS Wi-Fi 流播放不能同时使用 A2DP**。
+- 由于本分支需新增双模蓝牙内存开销，首次测试应同时观察 internal RAM、PSRAM、
+  `BT_AUDIO` 状态及 BLE 配对通知。仅提交代码不代表已通过实机 SBC/共存测试。
+
+### 编译与诊断
+
+```powershell
+git fetch origin
+git switch feat/a2dp-source-ble-remote
+pio run -e fakepod_s31
+```
+
+观察日志关键字 `BT_AUDIO`：`A2DP profile ready`、`A2DP scan finished`、
+`A2DP connection state=2`、`A2DP negotiated PCM 44100Hz/48000Hz`、
+`A2DP audio STARTED`。真机回归还应检查：手机 GATT 在耳机连接前后不断线、切歌/暂停/SEEK、
+耳机断开后仍能正常从有线 DAC 播放，以及长时间播放是否出现 PCM 欠载或大量丢帧。
 
 ---
 
@@ -165,7 +212,7 @@ pio device monitor
 - `platform = symlink://./platform/espressif32_s31`：本地补丁平台，在 `platform.py`、`builder/main.py`、`builder/frameworks/espidf.py` 中补充 `esp32s31` 与 RISC-V 工具链分支。
 - **必须使用 `symlink://`**。`file://` 会被 PlatformIO 按内容哈希缓存旧副本，导致补丁不生效。
 - `board_build.esp-idf.sdkconfig_path = sdkconfig.fakepod_s31`（由 `sdkconfig.defaults;sdkconfig.ble.defaults` 生成）。
-- `sdkconfig.defaults` 关键项：320MHz、DIO/80MHz/16MB、16MB Octal PSRAM（200MHz）、`CONFIG_SPIRAM_USE_MALLOC`、AVI 之外的其他解封装器全部关闭、TinyUSB MSC+CDC、NimBLE 双角色、BLE Central + GATT Client（esp_hid 主机侧需要）。
+- `sdkconfig.defaults` 关键项：320MHz、DIO/80MHz/16MB、16MB Octal PSRAM（200MHz）、TinyUSB MSC+CDC；蓝牙配置放在 **已入库** 的 `sdkconfig.bluetooth.defaults`：Bluedroid、BLE GATT Server、Classic A2DP Source/SBC。
 - LVGL 使用内置 TLSF，128KB pool 强制落在 PSRAM（见 [src/CMakeLists.txt](src/CMakeLists.txt)）。
 - `esp_lcd_panel_rgb.c` 单独使用 `-O0`，规避 GCC 在 IRA 阶段的问题；本项目实际走 QSPI CO5300，不使用 RGB 数据路径。
 - GCC 15 对带默认成员初始值的结构体 `memset` 产生新告警，已用 `-Wno-error=class-memaccess` 降级。
@@ -197,7 +244,7 @@ pio device monitor
 
 - `managed_components/` 被 `.gitignore` 忽略，组件由 `dependencies.lock` 复现，不要手工改动其中的版本。
 - PlatformIO Core 只保留一个安装：多版本共存会触发 `Obsolete PIO Core` 警告，并可能在 `platforms.lock` 上出现 `PermissionError`。
-- `sdkconfig.*` 生成物不入库（`sdkconfig.defaults` 除外），由配置文件重新生成；`sdkconfig.ble.defaults` 也受该规则忽略，首次克隆需自行补齐。
+- `sdkconfig.*` 生成物不入库；`sdkconfig.defaults` 与 `sdkconfig.bluetooth.defaults` 已明确加入 Git，不需手动补齐。
 
 ---
 
@@ -312,7 +359,7 @@ python tests/host/test_library_row_recycling.py
 
 | 现象 | 原因与处理 |
 |---|---|
-| CMake 报 `SDKCONFIG_DEFAULTS 'sdkconfig.ble.defaults' does not exist` | 该文件被 `.gitignore` 的 `sdkconfig.*` 规则忽略，不在版本库中。首次克隆需自行补齐该文件，或删除 `board_build.cmake_extra_args` 中的对应项后重新配置。 |
+| 蓝牙发射不可用（A2DP 未初始化） | 检查 `sdkconfig.bluetooth.defaults` 是否生效，确认 `CONFIG_BT_CLASSIC_ENABLED=y`、`CONFIG_BT_A2DP_ENABLE=y` 且未使用 external codec。清理旧 `sdkconfig.fakepod_s31` 后重新构建。 |
 | 编译出现 `KeyError: 'toolchain-xtensa-esp-elf'` 或调用 xtensa 工具链 | 本地平台补丁未生效。确认 `platform = symlink://./platform/espressif32_s31`，并清理 `.pio` 缓存后重建。 |
 | `Tool doesn't match supported version ['esp-15.2.0_20251204']` | ESP-IDF 6.1 要求 `toolchain-riscv32-esp@15.2.0+20251204`，检查 `platform_packages` 是否被覆盖。 |
 | `PermissionError: platforms.lock` | 系统存在多个 PlatformIO Core（提示 obsolete PIO Core），或对平台目录无写权限。清理多余安装、统一 Core 版本后重试。 |
