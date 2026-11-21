@@ -585,6 +585,9 @@ static bool g_music_bt_only = false;
 static bool g_bt_sink_output_enabled = false;
 static bool g_bt_sink_output_active = false;
 static uint32_t g_bt_sink_output_rate = 0U;
+// PCM submitted to wired I2S in phone-receive mode. Independent of the local
+// decoder playback clock; provides a stable FFT capture frame offset.
+static uint64_t g_bt_sink_fft_frames = 0ULL;
 static TickType_t g_bt_sink_retry_due = 0;
 static constexpr uint32_t kBtMusicQueueGoalMs = 85U;
 static constexpr uint32_t kBtMusicDrainTimeoutMs = 250U;
@@ -6537,6 +6540,8 @@ static void audio_task_handle_bluetooth_sink_enable(AudioRequest *request)
             g_bt_sink_output_rate, "Bluetooth-Sink");
         g_bt_sink_output_active = false;
         g_bt_sink_output_rate = 0U;
+        g_bt_sink_fft_frames = 0ULL;
+        audio_spectrum_snapshot_reset(g_task_playback_revision, UINT32_MAX, 0U);
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "蓝牙接收I2S停止返回：%s", esp_err_to_name(ret));
         }
@@ -6560,6 +6565,8 @@ static void audio_task_service_bluetooth_sink()
             g_bt_sink_output_rate, "Bluetooth-Sink-Suspend");
         g_bt_sink_output_active = false;
         g_bt_sink_output_rate = 0U;
+        g_bt_sink_fft_frames = 0ULL;
+        audio_spectrum_snapshot_reset(g_task_playback_revision, UINT32_MAX, 0U);
         bt_audio_sink_flush();
         ESP_LOGI(TAG, "BT_SINK_OUTPUT: 连接/采样率改变，释放I2S DMA");
     }
@@ -6584,6 +6591,9 @@ static void audio_task_service_bluetooth_sink()
         }
         g_bt_sink_output_active = true;
         g_bt_sink_output_rate = bt.sample_rate_hz;
+        g_bt_sink_fft_frames = 0ULL;
+        audio_spectrum_snapshot_reset(
+            g_task_playback_revision, UINT32_MAX, bt.sample_rate_hz);
         ESP_LOGI(TAG,
             "BT_SINK_OUTPUT: started rate=%lu PCM=S16->32 I2S->CS43131",
             (unsigned long)g_bt_sink_output_rate);
@@ -6598,6 +6608,7 @@ static void audio_task_service_bluetooth_sink()
         if (ret != ESP_OK) ESP_LOGW(TAG, "BT_SINK_OUTPUT: 补零失败：%s", esp_err_to_name(ret));
         return;
     }
+    const size_t real_frames = frames;
     if (frames < AUDIO_STREAM_FRAMES) {
         memset(g_pcm_block + frames * 2U, 0,
                (AUDIO_STREAM_FRAMES - frames) * 2U * sizeof(int32_t));
@@ -6607,12 +6618,24 @@ static void audio_task_service_bluetooth_sink()
     esp_err_t ret = audio_task_unmute_when_pcm_ready();
     if (ret == ESP_OK) ret = i2s_output_stream_write_pcm32(
         g_pcm_block, frames, AUDIO_I2S_WRITE_TIMEOUT_MS);
+    if (ret == ESP_OK) {
+        // Publish the ACTUAL decoded phone PCM only after successful I2S
+        // submission, using the existing non-blocking 256-point FFT path.
+        // UINT32_MAX marks external phone media (not a TF/NAS catalog row).
+        g_bt_sink_fft_frames += real_frames;
+        audio_spectrum_snapshot_publish_pcm(
+            g_pcm_block, real_frames, AudioPlaybackSource::Local,
+            g_task_playback_revision, UINT32_MAX,
+            g_bt_sink_output_rate, g_bt_sink_fft_frames);
+    }
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "BT_SINK_OUTPUT: I2S写入失败：%s，释放输出并等待恢复",
                  esp_err_to_name(ret));
         (void)audio_task_shutdown_output_hardware(g_bt_sink_output_rate, "Bluetooth-Sink-Error");
         g_bt_sink_output_active = false;
         g_bt_sink_output_rate = 0U;
+        g_bt_sink_fft_frames = 0ULL;
+        audio_spectrum_snapshot_reset(g_task_playback_revision, UINT32_MAX, 0U);
         g_bt_sink_retry_due = xTaskGetTickCount() + pdMS_TO_TICKS(2000);
     }
 }
