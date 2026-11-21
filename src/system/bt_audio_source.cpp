@@ -506,7 +506,7 @@ esp_err_t bt_audio_source_host_start()
     s_scanning = false;
     s_candidate_found = false;
     s_device_count = 0U;
-    memset(s_devices, 0, sizeof(s_devices));
+    for (BtAudioSourceDevice &device : s_devices) device = BtAudioSourceDevice{};
     discovery_revision_bump_locked();
     s_connecting = false;
     s_connected = false;
@@ -602,7 +602,7 @@ esp_err_t bt_audio_source_scan()
         s_scanning = true;
         s_best_rssi = -127;
         s_device_count = 0U;
-        memset(s_devices, 0, sizeof(s_devices));
+        for (BtAudioSourceDevice &device : s_devices) device = BtAudioSourceDevice{};
         memset(s_candidate_name, 0, sizeof(s_candidate_name));
         discovery_revision_bump_locked();
     }
