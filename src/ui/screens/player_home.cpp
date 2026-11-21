@@ -3811,7 +3811,10 @@ static void player_home_refresh_track(const AudioStateSnapshot *audio_snapshot)
         if (!stream.connected) {
             snprintf(detail, sizeof(detail), "蓝牙接收 · 等待手机连接");
         } else if (stream.negotiated_codec == 0xFFU) {
-            snprintf(detail, sizeof(detail), "蓝牙接收 · 编码协商中");
+            // Audio is not negotiating forever: an already-playing stream with
+            // no codec report indicates a missing/overwritten A2DP CFG event.
+            snprintf(detail, sizeof(detail), "%s",
+                stream.streaming ? "蓝牙接收 · 编码信息缺失" : "蓝牙接收 · 编码协商中");
         } else {
             const uint32_t rate = stream.sample_rate_hz;
             snprintf(detail, sizeof(detail), "蓝牙接收 · %s · %lu.%01lu kHz",

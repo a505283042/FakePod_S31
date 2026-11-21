@@ -354,7 +354,7 @@ static uint16_t detail_row_count_for_page(SettingsPage page)
 {
     switch (page) {
         case SettingsPage::Connection: return 6U;
-        case SettingsPage::Bluetooth: return 6U;
+        case SettingsPage::Bluetooth: return 5U;
         case SettingsPage::Applications: return 5U;
         case SettingsPage::MusicPlayer: return 5U;
         case SettingsPage::ElectronicFlow: return 1U;
@@ -661,10 +661,13 @@ static lv_obj_t *create_row(
         }
     }
 
+    const bool wide_codec_value = title != nullptr && strcmp(title, "音频编码") == 0;
     lv_obj_t *title_label = make_label(row, title, kHeaderRgb);
     if (title_label != nullptr) {
-        // NAS状态/电池值较长，给右侧数值预留独立空间。
+        // Only Bluetooth Audio Codec uses a wider right-hand value. Keep other
+        // settings rows unchanged (especially NAS and battery status).
         lv_obj_set_width(title_label,
+            wide_codec_value ? 128 :
             (icon_id == SettingsDetailIcon::NasSync || icon_id == SettingsDetailIcon::Battery)
                 ? 128 : (icon_dsc != nullptr ? 190 : 220));
         lv_label_set_long_mode(title_label, LV_LABEL_LONG_DOT);
@@ -675,7 +678,8 @@ static lv_obj_t *create_row(
     if (value_label != nullptr) {
         const bool nas_status = icon_id == SettingsDetailIcon::NasSync;
         const bool battery_status = icon_id == SettingsDetailIcon::Battery;
-        lv_obj_set_width(value_label, (nas_status || battery_status) ? 228 : 145);
+        lv_obj_set_width(value_label,
+            wide_codec_value ? 205 : ((nas_status || battery_status) ? 228 : 145));
         // NAS 栏必须同一行显示“4227首·已更新”，不能自动换行。
         lv_label_set_long_mode(value_label, nas_status ? LV_LABEL_LONG_CLIP : LV_LABEL_LONG_DOT);
         if (nas_status) lv_obj_set_style_text_letter_space(value_label, -1, 0);
@@ -1640,23 +1644,6 @@ static void usb_tf_storage_return_click_cb(lv_event_t *event)
     }
 }
 
-// Show startup progress and the last error directly on the 460x460 UI.
-// A2DP init and BLE GATT advertising are asynchronous and can fail independently.
-static void format_ble_mode_value(const BleRemoteSnapshot &ble, char *out, size_t capacity)
-{
-    if (out == nullptr || capacity == 0U) return;
-    if (ble.state == BleRemoteState::Starting) {
-        snprintf(out, capacity, "启动·%s",
-                 ble_remote_service_startup_stage_name(ble.startup_stage));
-    } else if (ble.state == BleRemoteState::RetryWait) {
-        snprintf(out, capacity, "重试·%s 0x%lX",
-                 ble_remote_service_startup_stage_name(ble.startup_stage),
-                 static_cast<unsigned long>(ble.last_error));
-    } else {
-        snprintf(out, capacity, "%s", ble_remote_service_state_name(ble.state));
-    }
-}
-
 static void bluetooth_switch_click_cb(lv_event_t *event)
 {
     if (!click_is_valid(event) || g_page != SettingsPage::Bluetooth) return;
@@ -1836,8 +1823,8 @@ static void bluetooth_codec_click_cb(lv_event_t *event)
         ui_common_show_notice("保存音频编码失败", "请检查NVS状态");
         return;
     }
-    if (g_detail_values[5] != nullptr) {
-        lv_label_set_text(g_detail_values[5],
+    if (g_detail_values[4] != nullptr) {
+        lv_label_set_text(g_detail_values[4],
             device_settings_bluetooth_sink_codec_name(next));
     }
 
@@ -2144,13 +2131,15 @@ static void create_bluetooth_page(const DeviceSettingsSnapshot &settings)
     add_clickable_detail_row(0, "蓝牙开关",
         settings.ble_enabled ? "已开启" : "已关闭",
         SettingsDetailIcon::Bluetooth, bluetooth_switch_click_cb);
-    char ble_value[64] = {};
-    if (!settings.ble_enabled) {
-        snprintf(ble_value, sizeof(ble_value), "已关闭");
-    } else {
-        format_ble_mode_value(ble, ble_value, sizeof(ble_value));
-    }
-    add_detail_row(1, "手机遥控", ble_value, SettingsDetailIcon::Bluetooth);
+
+    // Remote-only directly follows the master switch. It keeps BLE GATT
+    // active but does not start an A2DP Sink/Source profile.
+    const char *remote_only_value = !settings.ble_enabled ? "蓝牙已关闭" :
+        ble.audio_role_switching ? "切换中" :
+        ble.audio_role == DeviceBluetoothAudioRole::Off
+            ? (ble.connected ? "遥控已连接" : "等待APP连接") : "点击切换";
+    add_clickable_detail_row(1, "仅手机遥控", remote_only_value,
+        SettingsDetailIcon::Bluetooth, bluetooth_remote_only_click_cb);
 
     char tx_value[72] = {};
     if (ble.audio_role_switching) snprintf(tx_value, sizeof(tx_value), "切换中");
@@ -2165,16 +2154,12 @@ static void create_bluetooth_page(const DeviceSettingsSnapshot &settings)
     add_clickable_detail_row(3, "音频接收", rx_value,
         SettingsDetailIcon::Bluetooth, bluetooth_receive_click_cb);
 
-    add_clickable_detail_row(4, "仅手机遥控",
-        ble.audio_role_switching ? "切换中" :
-        ble.audio_role == DeviceBluetoothAudioRole::Off ? "已启用" : "点击关闭音频",
-        SettingsDetailIcon::Bluetooth, bluetooth_remote_only_click_cb);
 #if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
-    add_clickable_detail_row(5, "音频编码",
+    add_clickable_detail_row(4, "音频编码",
         device_settings_bluetooth_sink_codec_name(settings.bluetooth_sink_codec),
         SettingsDetailIcon::Bluetooth, bluetooth_codec_click_cb);
 #else
-    add_detail_row(5, "音频编码", "固定SBC", SettingsDetailIcon::Bluetooth, false);
+    add_detail_row(4, "音频编码", "固定SBC", SettingsDetailIcon::Bluetooth, false);
 #endif
 }
 
@@ -2955,10 +2940,11 @@ static void refresh_timer_cb(lv_timer_t *timer)
                 settings.ble_enabled ? "已开启" : "已关闭");
         }
         if (g_detail_values[1] != nullptr) {
-            char ble_value[64] = {};
-            if (!settings.ble_enabled) snprintf(ble_value, sizeof(ble_value), "已关闭");
-            else format_ble_mode_value(ble, ble_value, sizeof(ble_value));
-            lv_label_set_text(g_detail_values[1], ble_value);
+            const char *value = !settings.ble_enabled ? "蓝牙已关闭" :
+                ble.audio_role_switching ? "切换中" :
+                ble.audio_role == DeviceBluetoothAudioRole::Off
+                    ? (ble.connected ? "遥控已连接" : "等待APP连接") : "点击切换";
+            lv_label_set_text(g_detail_values[1], value);
         }
         if (g_detail_values[2] != nullptr) {
             char tx_value[72] = {};
@@ -2974,16 +2960,11 @@ static void refresh_timer_cb(lv_timer_t *timer)
             lv_label_set_text(g_detail_values[3], rx_value);
         }
         if (g_detail_values[4] != nullptr) {
-            lv_label_set_text(g_detail_values[4],
-                ble.audio_role_switching ? "切换中" :
-                ble.audio_role == DeviceBluetoothAudioRole::Off ? "已启用" : "点击关闭音频");
-        }
-        if (g_detail_values[5] != nullptr) {
 #if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
-            lv_label_set_text(g_detail_values[5],
+            lv_label_set_text(g_detail_values[4],
                 device_settings_bluetooth_sink_codec_name(settings.bluetooth_sink_codec));
 #else
-            lv_label_set_text(g_detail_values[5], "固定SBC");
+            lv_label_set_text(g_detail_values[4], "固定SBC");
 #endif
         }
     }

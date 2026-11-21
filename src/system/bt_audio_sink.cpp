@@ -213,7 +213,11 @@ static void a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             portENTER_CRITICAL(&s_mux);
             s_connected = state == ESP_A2D_CONNECTION_STATE_CONNECTED;
             s_streaming = false;
-            s_negotiated_codec = 0xFFU;
+            // Some A2DP peers deliver AUDIO_CFG before CONNECTION_STATE_CONNECTED.
+            // Never overwrite a negotiated codec when the CONNECTED event arrives.
+            // Clear it at the beginning of a new link and on disconnect instead.
+            if (state != ESP_A2D_CONNECTION_STATE_CONNECTED)
+                s_negotiated_codec = 0xFFU;
             flush_locked();
             if (s_connected) {
                 memcpy(s_peer, param->conn_stat.remote_bda, sizeof(s_peer));
@@ -223,12 +227,14 @@ static void a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
                 memset(s_peer, 0, sizeof(s_peer));
                 s_peer_name[0] = '\0';
             }
+            const uint8_t codec_after_state = s_negotiated_codec;
             portEXIT_CRITICAL(&s_mux);
 #if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
             if (state == ESP_A2D_CONNECTION_STATE_DISCONNECTED)
                 bt_a2dp_ext_decoder_stream_state(false);
 #endif
-            ESP_LOGI(TAG, "A2DP Sink connection state=%d", static_cast<int>(state));
+            ESP_LOGI(TAG, "A2DP Sink connection state=%d codec=%s",
+                static_cast<int>(state), bt_audio_sink_codec_name(codec_after_state));
             break;
         }
         case ESP_A2D_AUDIO_CFG_EVT: {
@@ -262,8 +268,13 @@ static void a2dp_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param)
             const bool playing = param->audio_stat.state == ESP_A2D_AUDIO_STATE_STARTED;
             portENTER_CRITICAL(&s_mux);
             s_streaming = playing && s_connected && s_requested;
+            const bool missing_config = s_streaming && s_negotiated_codec == 0xFFU;
             if (!s_streaming) flush_locked();
             portEXIT_CRITICAL(&s_mux);
+            if (missing_config) {
+                ESP_LOGW(TAG, "A2DP audio STARTED without codec config; "
+                    "check missing ESP_A2D_AUDIO_CFG_EVT");
+            }
 #if defined(CONFIG_BT_A2DP_USE_EXTERNAL_CODEC) && CONFIG_BT_A2DP_USE_EXTERNAL_CODEC
             bt_a2dp_ext_decoder_stream_state(playing);
 #endif
