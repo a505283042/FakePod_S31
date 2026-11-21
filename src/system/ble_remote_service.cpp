@@ -57,7 +57,8 @@ namespace {
 
 static constexpr const char *kDeviceName = "FakePod";
 static constexpr TickType_t kRetryDelay = pdMS_TO_TICKS(2000);
-static constexpr TickType_t kStartTimeout = pdMS_TO_TICKS(5000);
+// Dual-mode Controller + A2DP + encrypted GATT may need more than 5 seconds on a busy device.
+static constexpr TickType_t kStartTimeout = pdMS_TO_TICKS(15000);
 static constexpr uint32_t kTransitionTaskStackBytes = 4096U;
 static constexpr UBaseType_t kTransitionTaskPriority = 2U;
 static constexpr BaseType_t kTransitionTaskCore = 1;
@@ -74,6 +75,7 @@ static BleRemoteState g_state = BleRemoteState::Disabled;
 static esp_err_t g_last_error = ESP_OK;
 static TickType_t g_retry_due_tick = 0;
 static TickType_t g_state_since_tick = 0;
+static uint8_t g_startup_stage = 0; // Updated under g_lock, shown on the connection settings page.
 
 #if FAKEPOD_BLE_FOUNDATION_ENABLED
 // 协议层沿用原 NimBLE 的 ATT 错误码命名，这里映射到 Bluedroid 等价状态码。
@@ -227,6 +229,16 @@ static void set_state_locked(BleRemoteState state, esp_err_t error = ESP_OK)
     g_state = state;
     g_last_error = error;
     g_state_since_tick = xTaskGetTickCount();
+}
+
+// Stage markers are intentionally independent of g_state: GATT registers asynchronously.
+// This makes a stuck 'Starting' screen diagnosable without requiring a serial terminal.
+static void set_startup_stage(uint8_t stage, const char *description)
+{
+    portENTER_CRITICAL(&g_lock);
+    g_startup_stage = stage;
+    portEXIT_CRITICAL(&g_lock);
+    ESP_LOGI(TAG, "BLE_START step=%u %s", static_cast<unsigned>(stage), description);
 }
 
 static bool desired_enabled()
@@ -1072,6 +1084,7 @@ static void ble_gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_p
                 g_retry_due_tick = 0;
             }
             portEXIT_CRITICAL(&g_lock);
+            set_startup_stage(10U, "ble_advertising_confirmed");
             ESP_LOGI(TAG, "BLE广播已启动：name=%s interval≈500ms", kDeviceName);
             return;
 
@@ -1775,6 +1788,7 @@ static void ble_gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t ga
             }
             g_gatts_if = gatts_if;
             g_app_registered = true;
+            set_startup_stage(7U, "gatts_registered_creating_attributes");
             if (esp_ble_gatts_create_attr_tab(g_control_attr_db, gatts_if,
                                              kControlAttrCount, 0) != ESP_OK) {
                 retry_advertising_after_failure("create_attr_tab", -1);
@@ -1791,6 +1805,7 @@ static void ble_gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t ga
                     "attr_tab", static_cast<int>(param->add_attr_tab.status));
                 return;
             }
+            set_startup_stage(8U, "gatt_attributes_created");
             memcpy(g_control_handles, param->add_attr_tab.handles, sizeof(g_control_handles));
             if (esp_ble_gatts_start_service(g_control_handles[kIdxService]) != ESP_OK) {
                 retry_advertising_after_failure("start_service", -1);
@@ -1803,6 +1818,7 @@ static void ble_gatts_event_handler(esp_gatts_cb_event_t event, esp_gatt_if_t ga
                 return;
             }
             g_service_started = true;
+            set_startup_stage(9U, "gatt_service_started_starting_advertising");
             ESP_LOGI(TAG, "BLE服务已启动：handle=%u,%u,%u,%u,%u,%u",
                 static_cast<unsigned>(g_control_handles[kIdxService]),
                 static_cast<unsigned>(g_control_handles[kIdxCommandDecl]),
@@ -2112,12 +2128,14 @@ static esp_err_t start_stack()
 #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
     esp_bt_controller_config_t ctrl_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
 #pragma GCC diagnostic pop
+    set_startup_stage(1U, "controller_init");
     esp_err_t ret = esp_bt_controller_init(&ctrl_cfg);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "蓝牙控制器初始化失败：%s", esp_err_to_name(ret));
         return ret == ESP_ERR_NO_MEM ? ESP_ERR_NO_MEM : ESP_FAIL;
     }
 
+    set_startup_stage(2U, "controller_enable");
     ret = esp_bt_controller_enable(BTDM_CONTROLLER_MODE_EFF);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "蓝牙控制器使能失败：%s", esp_err_to_name(ret));
@@ -2125,6 +2143,7 @@ static esp_err_t start_stack()
         return ret == ESP_ERR_NO_MEM ? ESP_ERR_NO_MEM : ESP_FAIL;
     }
 
+    set_startup_stage(3U, "bluedroid_init");
     ret = esp_bluedroid_init();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Bluedroid初始化失败：%s", esp_err_to_name(ret));
@@ -2133,6 +2152,7 @@ static esp_err_t start_stack()
         return ret == ESP_ERR_NO_MEM ? ESP_ERR_NO_MEM : ESP_FAIL;
     }
 
+    set_startup_stage(4U, "bluedroid_enable");
     ret = esp_bluedroid_enable();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Bluedroid使能失败：%s", esp_err_to_name(ret));
@@ -2142,6 +2162,7 @@ static esp_err_t start_stack()
         return ESP_FAIL;
     }
 
+    set_startup_stage(5U, "a2dp_source_init");
     const esp_err_t a2dp_ret = bt_audio_source_host_start();
     if (a2dp_ret != ESP_OK) {
         ESP_LOGW(TAG, "A2DP Source未启动：%s；保留BLE手机遥控", esp_err_to_name(a2dp_ret));
@@ -2184,6 +2205,7 @@ static esp_err_t start_stack()
     g_last_status_packet[4] = 0xFFU;
     write_u32_le(&g_last_status_packet[6], UINT32_MAX);
 
+    set_startup_stage(6U, "ble_gap_gatts_setup");
     ret = esp_ble_gap_register_callback(ble_gap_event_handler);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "BLE GAP回调注册失败：%s", esp_err_to_name(ret));
@@ -2228,6 +2250,7 @@ static esp_err_t start_stack()
     }
 
     init_control_gatt_defs();
+    ESP_LOGI(TAG, "BLE_START registering GATT app, waiting for asynchronous callbacks");
     ret = esp_ble_gatts_app_register(kControlAppId);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "BLE手机控制服务注册失败：%s", esp_err_to_name(ret));
@@ -2275,6 +2298,7 @@ static void transition_task(void *)
         portENTER_CRITICAL(&g_lock);
         set_state_locked(BleRemoteState::Starting);
         portEXIT_CRITICAL(&g_lock);
+        set_startup_stage(0U, "preparing_dual_mode_bluetooth");
         ret = start_stack();
     }
 
@@ -2344,6 +2368,7 @@ esp_err_t ble_remote_service_init()
     g_transition_running = false;
     g_last_error = ESP_OK;
     g_retry_due_tick = 0;
+    g_startup_stage = 0;
 #if FAKEPOD_BLE_FOUNDATION_ENABLED
     set_state_locked(BleRemoteState::Disabled);
 #else
@@ -2516,7 +2541,8 @@ void ble_remote_service_update()
         if (state == BleRemoteState::Stopping) return;
         if (state == BleRemoteState::Starting && !tick_due(now, state_since + kStartTimeout)) return;
         if (state == BleRemoteState::Starting) {
-            ESP_LOGW(TAG, "BLE启动5秒仍未同步，执行完整重启");
+            ESP_LOGW(TAG, "BLE启动15秒仍未同步：stage=%u error=%s，准备完整重启",
+                     static_cast<unsigned>(g_startup_stage), esp_err_to_name(g_last_error));
             portENTER_CRITICAL(&g_lock);
             set_state_locked(BleRemoteState::RetryWait, ESP_ERR_TIMEOUT);
             g_retry_due_tick = now;
@@ -2543,8 +2569,26 @@ bool ble_remote_service_get_snapshot(BleRemoteSnapshot *out_snapshot)
     out_snapshot->connected = g_connected;
     out_snapshot->state = g_state;
     out_snapshot->last_error = g_last_error;
+    out_snapshot->startup_stage = g_startup_stage;
     portEXIT_CRITICAL(&g_lock);
     return out_snapshot->ready;
+}
+
+const char *ble_remote_service_startup_stage_name(uint8_t stage)
+{
+    switch (stage) {
+        case 1: return "初始化控制器";
+        case 2: return "使能控制器";
+        case 3: return "初始化Host";
+        case 4: return "使能Host";
+        case 5: return "初始化A2DP";
+        case 6: return "注册GATT";
+        case 7: return "创建GATT属性";
+        case 8: return "启动GATT服务";
+        case 9: return "配置BLE广播";
+        case 10: return "广播已确认";
+        default: return "准备中";
+    }
 }
 
 const char *ble_remote_service_state_name(BleRemoteState state)
