@@ -1632,6 +1632,23 @@ static void usb_tf_storage_return_click_cb(lv_event_t *event)
     }
 }
 
+// Show startup progress and the last error directly on the 460x460 UI.
+// A2DP init and BLE GATT advertising are asynchronous and can fail independently.
+static void format_ble_mode_value(const BleRemoteSnapshot &ble, char *out, size_t capacity)
+{
+    if (out == nullptr || capacity == 0U) return;
+    if (ble.state == BleRemoteState::Starting) {
+        snprintf(out, capacity, "启动·%s",
+                 ble_remote_service_startup_stage_name(ble.startup_stage));
+    } else if (ble.state == BleRemoteState::RetryWait) {
+        snprintf(out, capacity, "重试·%s 0x%lX",
+                 ble_remote_service_startup_stage_name(ble.startup_stage),
+                 static_cast<unsigned long>(ble.last_error));
+    } else {
+        snprintf(out, capacity, "%s", ble_remote_service_state_name(ble.state));
+    }
+}
+
 static void bluetooth_switch_click_cb(lv_event_t *event)
 {
     if (!click_is_valid(event) || g_page != SettingsPage::Connection) return;
@@ -1949,7 +1966,7 @@ static void create_connection_page(const DeviceSettingsSnapshot &settings)
     if (settings.bluetooth_mode == DeviceBluetoothMode::Off) {
         snprintf(ble_value, sizeof(ble_value), "%s", "关闭");
     } else if (ble_remote_service_get_snapshot(&ble)) {
-        snprintf(ble_value, sizeof(ble_value), "%s", ble_remote_service_state_name(ble.state));
+        format_ble_mode_value(ble, ble_value, sizeof(ble_value));
     } else {
         snprintf(ble_value, sizeof(ble_value), "%s", device_settings_bluetooth_mode_name(settings.bluetooth_mode));
     }
@@ -2725,10 +2742,14 @@ static void refresh_timer_cb(lv_timer_t *timer)
                 lv_label_set_text(g_detail_values[2], "关闭");
             } else {
                 BleRemoteSnapshot ble = {};
-                lv_label_set_text(g_detail_values[2],
-                    ble_remote_service_get_snapshot(&ble)
-                        ? ble_remote_service_state_name(ble.state)
-                        : device_settings_bluetooth_mode_name(settings.bluetooth_mode));
+                if (ble_remote_service_get_snapshot(&ble)) {
+                    char ble_value[64] = {};
+                    format_ble_mode_value(ble, ble_value, sizeof(ble_value));
+                    lv_label_set_text(g_detail_values[2], ble_value);
+                } else {
+                    lv_label_set_text(g_detail_values[2],
+                        device_settings_bluetooth_mode_name(settings.bluetooth_mode));
+                }
             }
         }
         if (g_detail_values[6] != nullptr) {
