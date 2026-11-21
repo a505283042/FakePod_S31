@@ -29,6 +29,7 @@ idf_component_register(
         "system/persistent_state.cpp"
         "system/device_settings.cpp"
         "system/ble_remote_service.cpp"
+        "system/bt_audio_source.cpp"
         "system/gamepad_input_service.cpp"
         "system/wifi_service.cpp"
         "system/wifi_remote_service.cpp"
