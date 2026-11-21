@@ -373,6 +373,16 @@ PlayerLoopMode player_control_get_loop_mode()
 
 PlayerLoopMode player_control_cycle_loop_mode()
 {
+    if (bt_audio_avrc_is_sink_mode()) {
+        BtAudioAvrcSnapshot avrc = {};
+        (void)bt_audio_avrc_get_snapshot(&avrc);
+        // Loop modes on a connected phone must NEVER mutate the local
+        // playlist's loop setting. A mode request is not confirmation.
+        const uint8_t next = static_cast<uint8_t>((avrc.loop_requested_mode + 1U) % 4U);
+        if (bt_audio_avrc_request_loop_mode(next))
+            return static_cast<PlayerLoopMode>(next);
+        return player_transport_get_loop_mode();
+    }
     if (!player_control_lock(pdMS_TO_TICKS(100))) {
         return player_transport_get_loop_mode();
     }
@@ -383,6 +393,9 @@ PlayerLoopMode player_control_cycle_loop_mode()
 
 bool player_control_set_loop_mode(PlayerLoopMode mode)
 {
+    if (bt_audio_avrc_is_sink_mode()) {
+        return bt_audio_avrc_request_loop_mode(static_cast<uint8_t>(mode));
+    }
     if (!player_control_lock(pdMS_TO_TICKS(100))) {
         return false;
     }
