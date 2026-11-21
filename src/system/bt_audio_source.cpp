@@ -369,9 +369,11 @@ static int32_t a2dp_pcm_callback(uint8_t *data, int32_t len)
     if (data == nullptr || len <= 0) return 0;
     memset(data, 0, static_cast<size_t>(len));
     const size_t requested = static_cast<size_t>(len) / 4U;
+    size_t consumed_frames = 0U;
     portENTER_CRITICAL(&s_lock);
     if (s_init_requested && s_streaming && s_pcm_ring != nullptr) {
         const size_t read_frames = requested < s_queued ? requested : s_queued;
+        consumed_frames = read_frames;
         const size_t first = read_frames < (kRingFrames - s_read)
             ? read_frames : kRingFrames - s_read;
         memcpy(data, s_pcm_ring + s_read * 4U, first * 4U);
@@ -383,7 +385,14 @@ static int32_t a2dp_pcm_callback(uint8_t *data, int32_t len)
         s_underrun += static_cast<uint32_t>(requested - read_frames);
     }
     portEXIT_CRITICAL(&s_lock);
+#if FAKEPOD_A2DP_EXTERNAL_CODEC
+    // Worker knows whether its PCM was real or silence padding. The output
+    // remains zero-filled so the encoder always receives a complete frame.
+    return static_cast<int32_t>(consumed_frames * 4U);
+#else
+    // ESP-IDF's legacy built-in SBC callback requires the full byte count.
     return len;
+#endif
 }
 
 static void classic_gap_event(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)

@@ -105,6 +105,7 @@ static void worker(void *)
     uint32_t timestamp = 0U;
     uint32_t sent = 0U, failed = 0U, underrun = 0U;
     uint32_t max_lateness_us = 0U, late_over_40ms = 0U, late_over_80ms = 0U;
+    uint32_t max_encode_us = 0U, max_send_us = 0U;
     const bool ready = open_codec(stream, &encoder, &in_bytes, &out_bytes,
                                   &frames_per_packet);
     if (!ready) {
@@ -147,7 +148,11 @@ static void worker(void *)
             if (now < next_us) {
                 const uint32_t wait_ms = static_cast<uint32_t>(
                     (next_us - now + 999LL) / 1000LL);
-                vTaskDelay(pdMS_TO_TICKS(wait_ms > 0U ? wait_ms : 1U));
+                // At 100Hz RTOS tick, pdMS_TO_TICKS(1..9ms)==0. A P6
+                // zero-tick loop would starve LVGL(P3)/FLAC prefetch(P4)
+                // on Core1. Always block for >= 1 tick when waiting.
+                const TickType_t ticks = pdMS_TO_TICKS(wait_ms);
+                vTaskDelay(ticks > 0 ? ticks : 1);
             } else if (now - next_us > frame_us * 2) {
                 next_us = now;
             }
@@ -171,9 +176,15 @@ static void worker(void *)
             esp_audio_enc_out_frame_t output = {};
             output.buffer = encoded;
             output.len = encoded_size;
+            const int64_t encode_start_us = esp_timer_get_time();
+            // Espressif esp_sbc_enc_process supports multi-frame input.
+            // Keep the negotiated A2DP SBC packet grouping intact.
             esp_audio_err_t status = stream.codec.type == ESP_A2D_MCT_M24
                 ? esp_aac_enc_process(encoder, &input, &output)
                 : esp_sbc_enc_process(encoder, &input, &output);
+            const uint32_t encode_us = static_cast<uint32_t>(
+                esp_timer_get_time() - encode_start_us);
+            if (encode_us > max_encode_us) max_encode_us = encode_us;
             if (status != ESP_AUDIO_ERR_OK || output.encoded_bytes == 0U) {
                 ++failed;
                 timestamp += pcm_frames;
@@ -198,6 +209,7 @@ static void worker(void *)
             packet->timestamp = timestamp;
             memcpy(packet->data, encoded, packet->data_len);
             bool accepted = false;
+            const int64_t send_start_us = esp_timer_get_time();
             for (unsigned tries = 0U; tries < 4U && s_run; ++tries) {
                 const esp_err_t ret = esp_a2d_source_audio_data_send(stream.connection, packet);
                 if (ret == ESP_OK) { accepted = true; break; }
@@ -205,21 +217,29 @@ static void worker(void *)
                     ret == ESP_ERR_INVALID_STATE) break;
                 vTaskDelay(pdMS_TO_TICKS(2));
             }
+            const uint32_t send_us = static_cast<uint32_t>(
+                esp_timer_get_time() - send_start_us);
+            if (send_us > max_send_us) max_send_us = send_us;
             if (accepted) ++sent;
             else { ++failed; esp_a2d_audio_buff_free(packet); }
             timestamp += pcm_frames;
-            if (((sent + failed) % 500U) == 0U && (sent + failed) > 0U)
+            if (((sent + failed) % 500U) == 0U && (sent + failed) > 0U) {
                 ESP_LOGI(TAG,
-                    "A2DP_TX_EXT sent=%lu failed=%lu underrun=%lu late_max=%luus late40=%lu late80=%lu",
+                    "A2DP_TX_EXT sent=%lu failed=%lu short_pcm=%lu late_max=%luus late40=%lu late80=%lu encode_max=%luus send_max=%luus",
                     static_cast<unsigned long>(sent),
                     static_cast<unsigned long>(failed),
                     static_cast<unsigned long>(underrun),
                     static_cast<unsigned long>(max_lateness_us),
                     static_cast<unsigned long>(late_over_40ms),
-                    static_cast<unsigned long>(late_over_80ms));
+                    static_cast<unsigned long>(late_over_80ms),
+                    static_cast<unsigned long>(max_encode_us),
+                    static_cast<unsigned long>(max_send_us));
                 max_lateness_us = 0U;
                 late_over_40ms = 0U;
                 late_over_80ms = 0U;
+                max_encode_us = 0U;
+                max_send_us = 0U;
+            }
         }
     }
 finish:
