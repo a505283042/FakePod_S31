@@ -497,12 +497,14 @@ void bt_audio_source_update()
     }
     portEXIT_CRITICAL(&s_lock);
     if (log_stats) {
-        ESP_LOGI(TAG, "A2DP_TX rate=%luHz queued=%u/%u frames underrun=%lu drop=%lu",
+        ESP_LOGI(TAG, "A2DP_TX rate=%luHz queued=%u/%u frames underrun=%lu drop=%lu DMA_free=%u DMA_largest=%u",
                  static_cast<unsigned long>(rate),
                  static_cast<unsigned>(buffered),
                  static_cast<unsigned>(kRingFrames),
                  static_cast<unsigned long>(underrun),
-                 static_cast<unsigned long>(dropped));
+                 static_cast<unsigned long>(dropped),
+                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_DMA)),
+                 static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_DMA)));
     }
     if (attempt) {
         const esp_err_t err = esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_CHECK_SRC_RDY);
