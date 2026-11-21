@@ -43,6 +43,7 @@ static bool s_release_pending = false;
 static TickType_t s_release_due = 0;
 static TickType_t s_poll_due = 0;
 static TickType_t s_caps_retry_due = 0;
+static TickType_t s_metadata_poll_due = 0;
 static TickType_t s_position_tick = 0;
 static bool s_tg_capabilities_configured = false;
 
@@ -76,6 +77,10 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
     case ESP_AVRC_CT_PROF_STATE_EVT: {
         portENTER_CRITICAL(&s_lock);
         s_ct_ready = param->avrc_ct_init_stat.state == ESP_AVRC_INIT_SUCCESS && s_active;
+        if (s_ct_ready && s_connected) {
+            s_metadata_needed = true;
+            s_status_needed = true;
+        }
         if (param->avrc_ct_init_stat.state == ESP_AVRC_DEINIT_SUCCESS)
             s_ct_stopped = true;
         portEXIT_CRITICAL(&s_lock);
@@ -87,6 +92,9 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
         s_connected = connected && s_active;
         s_snapshot.connected = s_connected;
         s_snapshot.playback_known = false;
+        s_snapshot.absolute_volume_supported = false;
+        s_volume_registered = false;
+        s_volume_interim_pending = false;
         s_snapshot.metadata_valid = false;
         s_snapshot.title[0] = '\0';
         s_snapshot.artist[0] = '\0';
@@ -97,6 +105,7 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
         ++s_snapshot.playback_revision;
         s_capabilities_known = false;
         s_caps_retry_due = 0;
+        s_metadata_poll_due = 0;
         s_position_tick = 0;
         s_peer_events = 0U;
         s_metadata_needed = connected;
@@ -146,8 +155,10 @@ static void ct_callback(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *pa
             s_snapshot.playback_known = true;
             s_snapshot.playing =
                 param->play_status_rsp.play_status == ESP_AVRC_PLAYBACK_PLAYING;
-            s_snapshot.position_ms = param->play_status_rsp.song_position;
-            s_position_tick = xTaskGetTickCount();
+            const bool known_position = param->play_status_rsp.song_position != UINT32_MAX;
+            if (known_position)
+                s_snapshot.position_ms = param->play_status_rsp.song_position;
+            s_position_tick = known_position ? xTaskGetTickCount() : 0U;
             if (param->play_status_rsp.song_length != UINT32_MAX)
                 s_snapshot.duration_ms = param->play_status_rsp.song_length;
             ++s_snapshot.playback_revision;
@@ -202,6 +213,16 @@ static void tg_callback(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *pa
             s_tg_stopped = true;
         portEXIT_CRITICAL(&s_lock);
         break;
+    case ESP_AVRC_TG_CONNECTION_STATE_EVT: {
+        portENTER_CRITICAL(&s_lock);
+        if (!param->conn_stat.connected) {
+            s_volume_registered = false;
+            s_volume_interim_pending = false;
+            s_snapshot.absolute_volume_supported = false;
+        }
+        portEXIT_CRITICAL(&s_lock);
+        break;
+    }
     case ESP_AVRC_TG_SET_ABSOLUTE_VOLUME_CMD_EVT: {
         const uint8_t raw = param->set_abs_vol.volume > 127U
             ? 127U : param->set_abs_vol.volume;
@@ -249,6 +270,7 @@ static void reset_state()
     s_release_pending = false;
     s_poll_due = 0;
     s_caps_retry_due = 0;
+    s_metadata_poll_due = 0;
     s_position_tick = 0;
     s_tg_capabilities_configured = false;
     s_snapshot = {};
@@ -397,10 +419,18 @@ void bt_audio_avrc_update()
         s_local_volume_changed = false;
         s_volume_registered = false;
     }
-    need_meta = s_metadata_needed;
-    need_status = s_status_needed;
-    s_metadata_needed = false;
-    s_status_needed = false;
+    need_meta = connected && ct_ready && s_metadata_needed;
+    need_status = connected && ct_ready && s_status_needed;
+    if (need_meta) s_metadata_needed = false;
+    if (need_status) s_status_needed = false;
+    if (connected && ct_ready &&
+        (s_metadata_poll_due == 0U ||
+         static_cast<int32_t>(now - s_metadata_poll_due) >= 0)) {
+        // Some phones don't advertise track-change notifications. Periodic
+        // metadata fallback is low-rate and does not touch the PCM path.
+        need_meta = true;
+        s_metadata_poll_due = now + pdMS_TO_TICKS(15000);
+    }
     need_caps = connected && !s_capabilities_known &&
         (s_caps_retry_due == 0U ||
          static_cast<int32_t>(now - s_caps_retry_due) >= 0);
@@ -453,9 +483,8 @@ void bt_audio_avrc_update()
         if (cap_ret != ESP_OK) {
             ESP_LOGW(TAG, "AVRCP Target volume notification registration: %s",
                 esp_err_to_name(cap_ret));
-            portENTER_CRITICAL(&s_lock);
-            s_tg_capabilities_configured = false;
-            portEXIT_CRITICAL(&s_lock);
+            // One warning is sufficient; keep the local DAC-volume fallback
+            // when a phone or stack does not support AVRCP absolute volume.
         }
     }
     if (tg_ready && (volume_interim || volume_changed)) {
